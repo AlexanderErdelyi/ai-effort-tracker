@@ -9,6 +9,9 @@ export interface CopilotDaySummary {
   totalLinesAccepted: number;
   totalActiveUsers: number;
   byLanguage: LanguageBreakdown[];
+  // IDE chat / premium requests (Claude, GPT-4, etc.)
+  chatTurns: number;
+  chatByModel: { model: string; turns: number }[];
 }
 
 export interface LanguageBreakdown {
@@ -169,6 +172,21 @@ export class GitHubService {
       }
     }
 
+    // Extract IDE chat / premium requests per model
+    const chatModelMap: Record<string, number> = {};
+    let chatTurns = 0;
+    for (const editor of (d.copilot_ide_chat?.editors ?? [])) {
+      for (const model of (editor.models ?? [])) {
+        const turns = model.total_chat_turns ?? 0;
+        chatTurns += turns;
+        const name = model.name ?? 'unknown';
+        chatModelMap[name] = (chatModelMap[name] ?? 0) + turns;
+      }
+    }
+    const chatByModel = Object.entries(chatModelMap)
+      .map(([model, turns]) => ({ model, turns }))
+      .sort((a, b) => b.turns - a.turns);
+
     return {
       date: d.date,
       totalSuggestionsCount: d.total_suggestions_count ?? totalSugg,
@@ -176,7 +194,9 @@ export class GitHubService {
       totalLinesSuggested: d.total_lines_suggested ?? totalLinesSugg,
       totalLinesAccepted: d.total_lines_accepted ?? totalLinesAcc,
       totalActiveUsers: d.total_active_users ?? 0,
-      byLanguage: Object.values(langMap).sort((a, b) => b.totalLinesAccepted - a.totalLinesAccepted)
+      byLanguage: Object.values(langMap).sort((a, b) => b.totalLinesAccepted - a.totalLinesAccepted),
+      chatTurns,
+      chatByModel
     };
   }
 
@@ -236,6 +256,17 @@ interface RawMetricsDay {
           total_code_lines_suggested?: number;
           total_code_lines_accepted?: number;
         }>;
+      }>;
+    }>;
+  };
+  copilot_ide_chat?: {
+    editors?: Array<{
+      name?: string;
+      models?: Array<{
+        name?: string;
+        total_chat_turns?: number;
+        total_chat_copy_events?: number;
+        total_chat_insertion_events?: number;
       }>;
     }>;
   };

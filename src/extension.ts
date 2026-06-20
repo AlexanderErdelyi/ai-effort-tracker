@@ -68,7 +68,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   );
 
   const branch = await GitTracker.getCurrentBranch() ?? 'unknown';
-  const ghMetrics = await ghService.getCopilotMetrics();
+  let ghMetrics = null;
+  try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics);
 
   // Push live updates every 5 seconds; refresh GitHub metrics every 5 minutes
@@ -79,7 +80,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
 
     let ghData = ghMetrics;
     if (Date.now() - lastGhFetch > 5 * 60 * 1000) {
-      ghData = await ghService.getCopilotMetrics(true);
+      try { ghData = await ghService.getCopilotMetrics(true); } catch { /* ignore */ }
       lastGhFetch = Date.now();
     }
 

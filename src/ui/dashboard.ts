@@ -101,8 +101,14 @@ function renderGhMetrics(){
   var totAcc=days.reduce(function(a,d){return a+d.totalAcceptancesCount;},0);
   var totLinesAcc=days.reduce(function(a,d){return a+d.totalLinesAccepted;},0);
   var totLinesSugg=days.reduce(function(a,d){return a+d.totalLinesSuggested;},0);
+  var totChat=days.reduce(function(a,d){return a+(d.chatTurns||0);},0);
   var accRate=totSugg>0?((totAcc/totSugg)*100).toFixed(1):0;
   var lineAccRate=totLinesSugg>0?((totLinesAcc/totLinesSugg)*100).toFixed(1):0;
+
+  // Aggregate chat by model across all days
+  var modelMap={};
+  days.forEach(function(d){(d.chatByModel||[]).forEach(function(m){modelMap[m.model]=(modelMap[m.model]||0)+m.turns;});});
+  var modelRows=Object.entries(modelMap).sort(function(a,b){return b[1]-a[1];}).map(function(e){return'<tr><td><span class="extb">'+e[0]+'</span></td><td>'+e[1]+'</td></tr>';}).join('')||'<tr><td colspan="2" style="color:var(--vscode-descriptionForeground)">No chat data yet</td></tr>';
 
   // Combine local tracker totals for comparison
   var localAiLines=allData.reduce(function(a,d){return a+d.linesAiAdded;},0);
@@ -114,11 +120,12 @@ function renderGhMetrics(){
 
   var langRows=topLangs.map(function(e){var n=e[0],s=e[1],r=s.sugg>0?((s.acc/s.sugg)*100).toFixed(0):0;return'<tr><td><span class="extb">'+n+'</span></td><td>'+s.sugg+'</td><td>'+s.acc+'</td><td><span class="badge '+(r>50?'ba':'bh')+'">'+r+'%</span></td><td>+'+s.linesAcc+'</td></tr>';}).join('');
 
-  el.innerHTML='<div class="sg" style="grid-template-columns:repeat(4,1fr)">'
+  el.innerHTML='<div class="sg" style="grid-template-columns:repeat(5,1fr)">'
     +'<div class="st"><div class="lbl">Suggestions (14d)</div><div class="val">'+totSugg+'</div></div>'
     +'<div class="st"><div class="lbl">Acceptances (14d)</div><div class="val" style="color:var(--human)">'+totAcc+'</div></div>'
     +'<div class="st"><div class="lbl">Acceptance Rate</div><div class="val" style="color:var(--ai)">'+accRate+'%</div></div>'
     +'<div class="st"><div class="lbl">Lines Accepted (14d)</div><div class="val" style="color:var(--ai)">'+totLinesAcc+'</div></div>'
+    +'<div class="st"><div class="lbl">&#x1F4AC; Chat Turns (14d)</div><div class="val" style="color:var(--review)">'+totChat+'</div></div>'
     +'</div>'
     +'<div class="cr">'
     +'<div class="card"><h3>Daily Accepted Lines (14d)</h3><div class="cw"><canvas id="cGhDaily"></canvas></div></div>'
@@ -129,9 +136,14 @@ function renderGhMetrics(){
     +'<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>Line acceptance rate</span><strong style="color:var(--human)">'+lineAccRate+'%</strong></div>'
     +'<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>Source</span><strong>'+ghMetrics.scopeName+' ('+ghMetrics.source+')</strong></div>'
     +'</div></div></div>'
+    +'<div class="cr">'
+    +'<div class="card"><h3>&#x1F4AC; Chat Turns by Model (14d) &mdash; Premium Requests</h3>'
+    +'<table><thead><tr><th>Model</th><th>Chat Turns</th></tr></thead>'
+    +'<tbody>'+modelRows+'</tbody></table></div>'
     +'<div class="card"><h3>By Language (14d)</h3>'
     +'<table><thead><tr><th>Language</th><th>Suggestions</th><th>Accepted</th><th>Accept %</th><th>Lines Accepted</th></tr></thead>'
-    +'<tbody>'+langRows+'</tbody></table></div>';
+    +'<tbody>'+langRows+'</tbody></table></div>'
+    +'</div>';
 
   dc('ghDaily');
   charts.ghDaily=new Chart(document.getElementById('cGhDaily'),{type:'bar',
