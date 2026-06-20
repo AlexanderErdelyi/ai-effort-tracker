@@ -24,6 +24,7 @@ export interface CopilotMetrics {
   fetchedAt: number;
   source: 'org' | 'repo' | 'user';
   scopeName: string;
+  error?: string;
 }
 
 export class GitHubService {
@@ -61,10 +62,23 @@ export class GitHubService {
       );
     }
 
-    if (result) {
-      this.cache = result;
-      this.cacheExpiresAt = Date.now() + this.CACHE_TTL_MS;
+    // Token is set but neither org nor repo was provided
+    if (!result && !org && !repo) {
+      return {
+        days: [], fetchedAt: Date.now(), source: 'user', scopeName: '',
+        error: 'needs-scope'
+      };
     }
+
+    // Token+scope set but API returned nothing (wrong permissions, 404, etc.)
+    if (!result) {
+      return {
+        days: [], fetchedAt: Date.now(), source: org ? 'org' : 'repo', scopeName: org || repo,
+        error: 'api-error'
+      };
+    }
+    this.cache = result;
+    this.cacheExpiresAt = Date.now() + this.CACHE_TTL_MS;
     return result;
   }
 

@@ -77,7 +77,15 @@ function dc(k){if(charts[k]){charts[k].destroy();delete charts[k];}}
 function renderGhMetrics(){
   const el=document.getElementById('ghview');
   if(!ghMetrics){
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">Configure your GitHub token and org/repo in settings to load official Copilot metrics.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Required settings: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope), <code>aiEffortTracker.githubOrg</code> or <code>aiEffortTracker.githubRepo</code>.</p></div>';
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">Configure your GitHub token in settings to load official Copilot metrics.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Required: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope)</p></div>';
+    return;
+  }
+  if(ghMetrics.error==='needs-scope'){
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x2705; Token configured! Also set one of these settings:</p><ul style="margin-top:10px;padding-left:20px;font-size:.9em;line-height:2"><li><code>aiEffortTracker.githubOrg</code> &mdash; your org name (e.g. <code>mycompany</code>)</li><li><code>aiEffortTracker.githubRepo</code> &mdash; your repo (e.g. <code>myorg/myrepo</code>)</li></ul></div>';
+    return;
+  }
+  if(ghMetrics.error==='api-error'){
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">&#x26A0;&#xFE0F; API request failed for <strong>'+ghMetrics.scopeName+'</strong>.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Check that your token has the <code>manage_billing:copilot</code> scope (classic) or <em>GitHub Copilot Business: Read</em> permission (fine-grained), and that the org/repo name is correct.</p></div>';
     return;
   }
   var days=ghMetrics.days.slice(-14);
