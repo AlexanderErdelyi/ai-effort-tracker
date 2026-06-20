@@ -1,15 +1,18 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { Database } from './store/database';
 import { StatusBarManager } from './ui/statusBar';
+import { renderDashboardHtml } from './ui/dashboard';
 
 let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
 let copilotTracker: CopilotTracker;
 let db: Database;
 let statusBar: StatusBarManager;
+let dashboardPanel: vscode.WebviewPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   db = new Database(context.globalStorageUri.fsPath);
@@ -20,7 +23,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
-      showSummary(db, timeTracker)
+      openDashboard(db, timeTracker, context)
     ),
     vscode.commands.registerCommand('aiEffortTracker.startSession', () => {
       timeTracker.startTracking();
@@ -48,18 +51,38 @@ export function deactivate() {
   timeTracker?.stopTracking();
 }
 
-async function showSummary(db: Database, tracker: TimeTracker) {
-  const branch = await GitTracker.getCurrentBranch();
-  const summary = db.getSummaryForBranch(branch ?? 'unknown');
+async function openDashboard(db: Database, tracker: TimeTracker, context: vscode.ExtensionContext) {
+  if (dashboardPanel) {
+    dashboardPanel.reveal(vscode.ViewColumn.One);
+    return;
+  }
 
-  const panel = vscode.window.createWebviewPanel(
+  const nonce = crypto.randomBytes(16).toString('hex');
+  dashboardPanel = vscode.window.createWebviewPanel(
     'aiEffortTracker',
-    `Effort Summary: ${branch ?? 'unknown'}`,
+    'AI Effort Tracker',
     vscode.ViewColumn.One,
-    { enableScripts: false }
+    { enableScripts: true, retainContextWhenHidden: true }
   );
 
-  panel.webview.html = renderSummaryHtml(summary, branch ?? 'unknown');
+  const branch = await GitTracker.getCurrentBranch() ?? 'unknown';
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce);
+
+  // Push live updates every 5 seconds
+  const refreshInterval = setInterval(async () => {
+    if (!dashboardPanel) { clearInterval(refreshInterval); return; }
+    const currentBranch = await GitTracker.getCurrentBranch() ?? 'unknown';
+    dashboardPanel.webview.postMessage({
+      type: 'update',
+      summaries: db.getAllBranchesSummaries(),
+      currentBranch
+    });
+  }, 5000);
+
+  dashboardPanel.onDidDispose(() => {
+    clearInterval(refreshInterval);
+    dashboardPanel = undefined;
+  });
 }
 
 async function exportReport(db: Database, tracker: TimeTracker) {
@@ -77,45 +100,3 @@ async function exportReport(db: Database, tracker: TimeTracker) {
   }
 }
 
-function renderSummaryHtml(summary: ReturnType<Database['getSummaryForBranch']>, branch: string): string {
-  const fmt = (ms: number) => {
-    const totalSec = Math.floor(ms / 1000);
-    const h = Math.floor(totalSec / 3600);
-    const m = Math.floor((totalSec % 3600) / 60);
-    const s = totalSec % 60;
-    return `${h}h ${m}m ${s}s`;
-  };
-
-  const totalMs = summary.humanCodingMs + summary.aiGeneratingMs + summary.reviewingMs;
-  const pct = (ms: number) => totalMs > 0 ? ((ms / totalMs) * 100).toFixed(1) : '0.0';
-
-  return `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><style>
-  body { font-family: var(--vscode-font-family); padding: 20px; color: var(--vscode-foreground); }
-  h1 { font-size: 1.4em; }
-  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--vscode-panel-border); }
-  th { background: var(--vscode-editor-lineHighlightBackground); }
-  .cost { color: var(--vscode-charts-yellow); font-weight: bold; }
-</style></head>
-<body>
-  <h1>📊 Effort Summary — <code>${branch}</code></h1>
-  <p>Work Item: <strong>${summary.workItemId ?? 'n/a'}</strong></p>
-  <table>
-    <tr><th>Mode</th><th>Duration</th><th>%</th></tr>
-    <tr><td>⌨️ Human Coding</td><td>${fmt(summary.humanCodingMs)}</td><td>${pct(summary.humanCodingMs)}%</td></tr>
-    <tr><td>🤖 AI Generating</td><td>${fmt(summary.aiGeneratingMs)}</td><td>${pct(summary.aiGeneratingMs)}%</td></tr>
-    <tr><td>👀 Reviewing</td><td>${fmt(summary.reviewingMs)}</td><td>${pct(summary.reviewingMs)}%</td></tr>
-    <tr><td>☕ Idle</td><td>${fmt(summary.idleMs)}</td><td>—</td></tr>
-  </table>
-  <table style="margin-top:16px">
-    <tr><th>Metric</th><th>Value</th></tr>
-    <tr><td>Lines Human</td><td>${summary.linesHuman}</td></tr>
-    <tr><td>Lines AI (Copilot)</td><td>${summary.linesAi}</td></tr>
-    <tr><td>AI %</td><td>${summary.linesHuman + summary.linesAi > 0 ? ((summary.linesAi / (summary.linesHuman + summary.linesAi)) * 100).toFixed(1) : 0}%</td></tr>
-    <tr><td>Copilot Completions Accepted</td><td>${summary.copilotAcceptances}</td></tr>
-    <tr><td class="cost">Estimated AI Cost</td><td class="cost">$${summary.estimatedCostUsd.toFixed(4)}</td></tr>
-  </table>
-</body></html>`;
-}

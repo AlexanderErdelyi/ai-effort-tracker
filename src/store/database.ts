@@ -104,4 +104,8 @@ export class Database {
   getAllBranches(): string[] {
     return Object.keys(this.store).sort();
   }
+
+  getAllBranchesSummaries(): BranchSummary[] {
+    return this.getAllBranches().map(b => this.getSummaryForBranch(b));
+  }
 }
