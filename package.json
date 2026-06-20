@@ -49,7 +49,17 @@
         "aiEffortTracker.githubToken": {
           "type": "string",
           "default": "",
-          "description": "GitHub personal access token for fetching issue/PR metadata"
+          "description": "GitHub personal access token (needs 'manage_billing:copilot' scope for Copilot Metrics API)"
+        },
+        "aiEffortTracker.githubOrg": {
+          "type": "string",
+          "default": "",
+          "description": "GitHub organization name for Copilot Metrics API (e.g. 'myorg')"
+        },
+        "aiEffortTracker.githubRepo": {
+          "type": "string",
+          "default": "",
+          "description": "GitHub repo in 'owner/repo' format for repo-level Copilot Metrics (e.g. 'myorg/myrepo')"
         }
       }
     }

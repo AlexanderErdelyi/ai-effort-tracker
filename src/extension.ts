@@ -6,6 +6,7 @@ import { CopilotTracker } from './trackers/copilotTracker';
 import { Database } from './store/database';
 import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
+import { GitHubService } from './services/githubService';
 
 let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
@@ -13,6 +14,7 @@ let copilotTracker: CopilotTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
+const ghService = new GitHubService();
 
 export function activate(context: vscode.ExtensionContext) {
   db = new Database(context.globalStorageUri.fsPath);
@@ -66,16 +68,26 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   );
 
   const branch = await GitTracker.getCurrentBranch() ?? 'unknown';
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce);
+  const ghMetrics = await ghService.getCopilotMetrics();
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics);
 
-  // Push live updates every 5 seconds
+  // Push live updates every 5 seconds; refresh GitHub metrics every 5 minutes
+  let lastGhFetch = Date.now();
   const refreshInterval = setInterval(async () => {
     if (!dashboardPanel) { clearInterval(refreshInterval); return; }
     const currentBranch = await GitTracker.getCurrentBranch() ?? 'unknown';
+
+    let ghData = ghMetrics;
+    if (Date.now() - lastGhFetch > 5 * 60 * 1000) {
+      ghData = await ghService.getCopilotMetrics(true);
+      lastGhFetch = Date.now();
+    }
+
     dashboardPanel.webview.postMessage({
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
-      currentBranch
+      currentBranch,
+      ghMetrics: ghData
     });
   }, 5000);
 
@@ -99,4 +111,5 @@ async function exportReport(db: Database, tracker: TimeTracker) {
     vscode.window.showInformationMessage(`Report saved to ${uri.fsPath}`);
   }
 }
+
 

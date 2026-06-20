@@ -1,14 +1,17 @@
 import type { BranchSummary } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
+import type { CopilotMetrics } from '../services/githubService';
 
 export function renderDashboardHtml(
   summaries: BranchSummary[],
   currentBranch: string,
-  nonce: string
+  nonce: string,
+  ghMetrics: CopilotMetrics | null = null
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
   const catLabels = JSON.stringify(CATEGORY_LABELS);
+  const ghData = JSON.stringify(ghMetrics);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -57,6 +60,7 @@ const vscode=acquireVsCodeApi();
 let allData=${data};
 let currentBranch=${current};
 const CAT=${catLabels};
+let ghMetrics=${ghData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -70,6 +74,61 @@ function pp(n,c){return n>0?'<span class="badge '+c+'">+'+n+'</span>':'';}
 function pm(n){return n>0?'<span class="badge bd">-'+n+'</span>':'';}
 function dc(k){if(charts[k]){charts[k].destroy();delete charts[k];}}
 
+function renderGhMetrics(){
+  const el=document.getElementById('ghview');
+  if(!ghMetrics){
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">Configure your GitHub token and org/repo in settings to load official Copilot metrics.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Required settings: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope), <code>aiEffortTracker.githubOrg</code> or <code>aiEffortTracker.githubRepo</code>.</p></div>';
+    return;
+  }
+  var days=ghMetrics.days.slice(-14);
+  var totSugg=days.reduce(function(a,d){return a+d.totalSuggestionsCount;},0);
+  var totAcc=days.reduce(function(a,d){return a+d.totalAcceptancesCount;},0);
+  var totLinesAcc=days.reduce(function(a,d){return a+d.totalLinesAccepted;},0);
+  var totLinesSugg=days.reduce(function(a,d){return a+d.totalLinesSuggested;},0);
+  var accRate=totSugg>0?((totAcc/totSugg)*100).toFixed(1):0;
+  var lineAccRate=totLinesSugg>0?((totLinesAcc/totLinesSugg)*100).toFixed(1):0;
+
+  // Combine local tracker totals for comparison
+  var localAiLines=allData.reduce(function(a,d){return a+d.linesAiAdded;},0);
+
+  // Top languages from last 14 days
+  var langMap={};
+  days.forEach(function(d){d.byLanguage.forEach(function(l){if(!langMap[l.name])langMap[l.name]={sugg:0,acc:0,linesSugg:0,linesAcc:0};langMap[l.name].sugg+=l.totalSuggestionsCount;langMap[l.name].acc+=l.totalAcceptancesCount;langMap[l.name].linesSugg+=l.totalLinesSuggested;langMap[l.name].linesAcc+=l.totalLinesAccepted;});});
+  var topLangs=Object.entries(langMap).sort(function(a,b){return b[1].linesAcc-a[1].linesAcc;}).slice(0,8);
+
+  var langRows=topLangs.map(function(e){var n=e[0],s=e[1],r=s.sugg>0?((s.acc/s.sugg)*100).toFixed(0):0;return'<tr><td><span class="extb">'+n+'</span></td><td>'+s.sugg+'</td><td>'+s.acc+'</td><td><span class="badge '+(r>50?'ba':'bh')+'">'+r+'%</span></td><td>+'+s.linesAcc+'</td></tr>';}).join('');
+
+  el.innerHTML='<div class="sg" style="grid-template-columns:repeat(4,1fr)">'
+    +'<div class="st"><div class="lbl">Suggestions (14d)</div><div class="val">'+totSugg+'</div></div>'
+    +'<div class="st"><div class="lbl">Acceptances (14d)</div><div class="val" style="color:var(--human)">'+totAcc+'</div></div>'
+    +'<div class="st"><div class="lbl">Acceptance Rate</div><div class="val" style="color:var(--ai)">'+accRate+'%</div></div>'
+    +'<div class="st"><div class="lbl">Lines Accepted (14d)</div><div class="val" style="color:var(--ai)">'+totLinesAcc+'</div></div>'
+    +'</div>'
+    +'<div class="cr">'
+    +'<div class="card"><h3>Daily Accepted Lines (14d)</h3><div class="cw"><canvas id="cGhDaily"></canvas></div></div>'
+    +'<div class="card"><h3>Local Heuristic vs Official</h3>'
+    +'<div style="display:flex;flex-direction:column;gap:10px;margin-top:8px">'
+    +'<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>Official lines accepted (14d)</span><strong style="color:var(--ai)">'+totLinesAcc+'</strong></div>'
+    +'<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>Our heuristic AI lines</span><strong style="color:var(--review)">'+localAiLines+'</strong></div>'
+    +'<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>Line acceptance rate</span><strong style="color:var(--human)">'+lineAccRate+'%</strong></div>'
+    +'<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>Source</span><strong>'+ghMetrics.scopeName+' ('+ghMetrics.source+')</strong></div>'
+    +'</div></div></div>'
+    +'<div class="card"><h3>By Language (14d)</h3>'
+    +'<table><thead><tr><th>Language</th><th>Suggestions</th><th>Accepted</th><th>Accept %</th><th>Lines Accepted</th></tr></thead>'
+    +'<tbody>'+langRows+'</tbody></table></div>';
+
+  dc('ghDaily');
+  charts.ghDaily=new Chart(document.getElementById('cGhDaily'),{type:'bar',
+    data:{labels:days.map(function(d){return d.date.slice(5);}),
+      datasets:[
+        {label:'Lines Accepted',data:days.map(function(d){return d.totalLinesAccepted;}),backgroundColor:'rgba(197,134,192,.7)',yAxisID:'y'},
+        {label:'Accept Rate %',data:days.map(function(d){return d.totalSuggestionsCount>0?((d.totalAcceptancesCount/d.totalSuggestionsCount)*100).toFixed(1):0;}),backgroundColor:'rgba(78,201,176,.4)',type:'line',yAxisID:'y2',borderColor:'rgba(78,201,176,.9)',borderWidth:2,pointRadius:3}
+      ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},
+      scales:{x:{ticks:{color:dfg()},grid:{color:gc}},
+        y:{ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'lines',color:dfg()},position:'left'},
+        y2:{ticks:{color:dfg(),callback:function(v){return v+'%';}},grid:{display:false},max:100,position:'right'}}}});
+}
 function renderOverview(){
   const el=document.getElementById('overview');
   const T=allData.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
@@ -122,13 +181,19 @@ function showTab(name){
   document.querySelectorAll('.view').forEach(function(v){v.classList.remove('active');});
   document.getElementById(name).classList.add('active');
   if(name==='overview'){document.querySelectorAll('.tab')[0].classList.add('active');renderOverview();}
+  else if(name==='ghview'){document.querySelectorAll('.tab')[2].classList.add('active');renderGhMetrics();}
   else document.querySelectorAll('.tab')[1].classList.add('active');
 }
 
 window.addEventListener('message',function(e){
   var msg=e.data;
-  if(msg.type==='update'){allData=msg.summaries;currentBranch=msg.currentBranch;
-    var av=document.querySelector('.view.active');if(av&&av.id==='overview')renderOverview();}
+  if(msg.type==='update'){
+    allData=msg.summaries;currentBranch=msg.currentBranch;
+    if(msg.ghMetrics!==undefined)ghMetrics=msg.ghMetrics;
+    var av=document.querySelector('.view.active');
+    if(av&&av.id==='overview')renderOverview();
+    else if(av&&av.id==='ghview')renderGhMetrics();
+  }
 });
 
 renderOverview();`;
@@ -146,9 +211,11 @@ renderOverview();`;
     '<div class="tabs">',
     '  <button class="tab active" onclick="showTab(\'overview\')">Overview</button>',
     '  <button class="tab" onclick="showTab(\'detail\')" id="dtab" style="display:none">Branch Detail</button>',
+    '  <button class="tab" onclick="showTab(\'ghview\')">🐙 Copilot Metrics</button>',
     '</div>',
     '<div id="overview" class="view active"></div>',
     '<div id="detail" class="view"></div>',
+    '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,
     `<script nonce="${nonce}">${js}</script>`,
     '</body></html>'
