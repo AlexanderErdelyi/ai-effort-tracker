@@ -83,9 +83,10 @@ export class GitHubService {
 
     // Token is set but neither org nor repo was provided
     if (!result && !org && !repo) {
+      const isAdo = await this.isAzureDevOpsRemote();
       return {
         days: [], fetchedAt: Date.now(), source: 'user', scopeName: '',
-        error: 'needs-scope'
+        error: isAdo ? 'needs-scope-ado' : 'needs-scope'
       };
     }
 
@@ -188,8 +189,22 @@ export class GitHubService {
     return new Promise(resolve => {
       exec('git remote get-url origin', { cwd }, (_err: Error | null, stdout: string) => {
         if (_err || !stdout) { resolve(null); return; }
-        const m = stdout.trim().match(/github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?$/);
+        const url = stdout.trim();
+        const m = url.match(/github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?$/);
         resolve(m ? { owner: m[1], repo: m[2] } : null);
+      });
+    });
+  }
+
+  async isAzureDevOpsRemote(): Promise<boolean> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) { return false; }
+    const cwd = folders[0].uri.fsPath;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { exec } = require('child_process') as typeof import('child_process');
+    return new Promise(resolve => {
+      exec('git remote get-url origin', { cwd }, (_err: Error | null, stdout: string) => {
+        resolve(!_err && /dev\.azure\.com|visualstudio\.com/.test(stdout));
       });
     });
   }

@@ -80,6 +80,14 @@ function renderGhMetrics(){
     el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">Configure your GitHub token in settings to load official Copilot metrics.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Required: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope)</p></div>';
     return;
   }
+  if(ghMetrics.error==='needs-scope-ado'){
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3>'
+      +'<p style="margin-top:8px">&#x2705; Signed in &nbsp;|&nbsp; &#x1F4E6; Azure DevOps repo detected</p>'
+      +'<p style="margin-top:10px;font-size:.9em;color:var(--vscode-descriptionForeground)">Copilot metrics live on <strong>GitHub</strong>, not Azure DevOps. Set your <strong>GitHub org name</strong> in settings:</p>'
+      +'<p style="margin-top:8px;font-family:monospace;font-size:.9em">aiEffortTracker.githubOrg = <em>your-github-org</em></p>'
+      +'<p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">(This is the GitHub organisation where your Copilot licences are managed &mdash; not your Azure DevOps org.)</p></div>';
+    return;
+  }
   if(ghMetrics.error==='needs-scope'){
     el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x2705; Signed in to GitHub! Could not detect a GitHub remote in the current workspace.</p><p style="margin-top:10px;font-size:.9em;color:var(--vscode-descriptionForeground)">Open a GitHub repository in VS Code, or manually set <code>aiEffortTracker.githubOrg</code> or <code>aiEffortTracker.githubRepo</code> in settings.</p></div>';
     return;
