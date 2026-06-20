@@ -134,7 +134,7 @@ function renderOverview(){
   const T=allData.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
   var rows=allData.map(function(d){
     var tot=tms(d),hp=tot>0?d.humanCodingMs/tot*100:0,ap=tot>0?d.aiGeneratingMs/tot*100:0,rp=tot>0?d.reviewingMs/tot*100:0,isCur=d.branch===currentBranch;
-    return '<tr class="'+(isCur?'cur':'')+'" onclick="showDetail(\\''+d.branch+'\\')"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+d.branch+'</strong></td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
+    return '<tr class="'+(isCur?'cur':'')+'" style="cursor:pointer" data-action="detail" data-value="'+d.branch+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+d.branch+'</strong></td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
   }).join('');
   el.innerHTML='<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\U0001f916 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\U0001f440 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\U0001f4b0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div><div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table>';
   var labels=allData.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
@@ -148,14 +148,14 @@ function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
   if(!d) return;
   var tab=document.getElementById('dtab');
-  tab.style.display='';
-  tab.textContent=branch.length>22?branch.slice(0,20)+'\\u2026':branch;
+  tab.textContent=branch.length>22?branch.slice(0,20)+'\u2026':branch;
+  tab.dataset.branch=branch;
   showTab('detail');
   var extRows=Object.entries(d.byExt||{}).sort(function(a,b){return(b[1].human.added+b[1].ai.added)-(a[1].human.added+a[1].ai.added);}).map(function(e){var ext=e[0],s=e[1],ta=s.human.added+s.ai.added,pct=ta>0?((s.ai.added/ta)*100).toFixed(0):0;return'<tr><td><span class="extb">.'+ext+'</span></td><td class="dc">'+pp(s.human.added,'bp')+' '+pm(s.human.deleted)+'</td><td class="dc">'+pp(s.ai.added,'ba')+' '+pm(s.ai.deleted)+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';}).join('')||'<tr><td colspan="4" style="color:var(--vscode-descriptionForeground)">No changes recorded yet</td></tr>';
   var catRows=Object.entries(d.byCategory||{}).map(function(e){var cat=e[0],s=e[1],ta=s.human.added+s.ai.added,pct=ta>0?((s.ai.added/ta)*100).toFixed(0):0;return'<tr><td>'+(CAT[cat]||cat)+'</td><td class="dc">'+pp(s.human.added,'bp')+' '+pm(s.human.deleted)+'</td><td class="dc">'+pp(s.ai.added,'ba')+' '+pm(s.ai.deleted)+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';}).join('');
   var tot=tms(d);
   var timeRows=[['\\u2328\\ufe0f Human Coding',d.humanCodingMs,'var(--human)'],['\\U0001f916 AI Generating',d.aiGeneratingMs,'var(--ai)'],['\\U0001f440 Reviewing',d.reviewingMs,'var(--review)'],['\\u2615 Idle',d.idleMs,'var(--idle)']].map(function(r){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>'+r[0]+'</span><strong style="color:'+r[2]+'">'+fmt(r[1])+'</strong></div>';}).join('');
-  document.getElementById('detail').innerHTML='<button class="back" onclick="showTab(\\'overview\\')">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div class="dtabs"><button class="dtab active" onclick="showDS(\\'time\\',this)">\\u23f1 Time</button><button class="dtab" onclick="showDS(\\'lines\\',this)">\\U0001f4dd Lines</button><button class="dtab" onclick="showDS(\\'types\\',this)">\\U0001f4c1 File Types</button></div><div id="ds-time" class="ds active"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>';
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div class="dtabs"><button class="dtab active" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\U0001f4dd Lines</button><button class="dtab" data-action="ds" data-value="types">\\U0001f4c1 File Types</button></div><div id="ds-time" class="ds active"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>';
   dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
@@ -180,9 +180,9 @@ function showTab(name){
   document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active');});
   document.querySelectorAll('.view').forEach(function(v){v.classList.remove('active');});
   document.getElementById(name).classList.add('active');
-  if(name==='overview'){document.querySelectorAll('.tab')[0].classList.add('active');renderOverview();}
-  else if(name==='ghview'){document.querySelectorAll('.tab')[2].classList.add('active');renderGhMetrics();}
-  else document.querySelectorAll('.tab')[1].classList.add('active');
+  if(name==='overview'){document.getElementById('tab-overview').classList.add('active');renderOverview();}
+  else if(name==='ghview'){document.getElementById('tab-ghview').classList.add('active');renderGhMetrics();}
+  else{document.getElementById('dtab').classList.add('active');}
 }
 
 window.addEventListener('message',function(e){
@@ -196,7 +196,22 @@ window.addEventListener('message',function(e){
   }
 });
 
-renderOverview();`;
+renderOverview();
+// Wire up tab buttons (CSP blocks inline onclick — use addEventListener instead)
+document.getElementById('tab-overview').addEventListener('click',function(){showTab('overview');});
+document.getElementById('tab-ghview').addEventListener('click',function(){showTab('ghview');});
+document.getElementById('dtab').addEventListener('click',function(){
+  var br=this.dataset.branch||currentBranch;showDetail(br);
+});
+// Event delegation for dynamically generated content (branch rows, back button, detail sub-tabs)
+document.addEventListener('click',function(e){
+  var t=e.target.closest('[data-action]');
+  if(!t)return;
+  var a=t.dataset.action,v=t.dataset.value;
+  if(a==='detail')showDetail(v);
+  else if(a==='tab')showTab(v);
+  else if(a==='ds')showDS(v,t);
+});`;
 
   return [
     '<!DOCTYPE html><html lang="en"><head>',
@@ -209,9 +224,9 @@ renderOverview();`;
     '<h1>\u{1F4CA} AI Effort Tracker</h1>',
     '<p class="sub"><span class="ld"></span>Live tracking \u00b7 refreshes every 5s</p>',
     '<div class="tabs">',
-    '  <button class="tab active" onclick="showTab(\'overview\')">Overview</button>',
-    '  <button class="tab" onclick="showTab(\'detail\')" id="dtab" style="display:none">Branch Detail</button>',
-    '  <button class="tab" onclick="showTab(\'ghview\')">🐙 Copilot Metrics</button>',
+    '  <button class="tab active" id="tab-overview">Overview</button>',
+    '  <button class="tab" id="dtab">Branch Detail</button>',
+    '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
     '<div id="overview" class="view active"></div>',
     '<div id="detail" class="view"></div>',
