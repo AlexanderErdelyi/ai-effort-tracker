@@ -1,6 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { TrackingMode } from '../trackers/timeTracker';
+import type { FileCategory } from '../util/fileTypes';
+
+export interface LineStats {
+  added: number;
+  deleted: number;
+}
+
+export interface ExtStats {
+  human: LineStats;
+  ai: LineStats;
+}
 
 export interface BranchSummary {
   branch: string;
@@ -9,25 +20,30 @@ export interface BranchSummary {
   aiGeneratingMs: number;
   reviewingMs: number;
   idleMs: number;
-  linesHuman: number;
-  linesAi: number;
+  // Aggregated line totals
+  linesHumanAdded: number;
+  linesHumanDeleted: number;
+  linesAiAdded: number;
+  linesAiDeleted: number;
   copilotAcceptances: number;
   estimatedCostUsd: number;
+  // Breakdown by file extension: { "al": { human: {...}, ai: {...} }, ... }
+  byExt: Record<string, ExtStats>;
+  // Breakdown by category (code/spec/config/other)
+  byCategory: Record<FileCategory, { human: LineStats; ai: LineStats }>;
 }
 
 interface BranchData {
   workItemId: string | null;
-  time: Record<TrackingMode, number>; // accumulated ms per mode
-  linesAi: number;
+  time: Record<TrackingMode, number>;
   copilotAcceptances: number;
+  // line changes keyed by ext → source → { added, deleted }
+  lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
 
 type Store = Record<string, BranchData>;
 
-// Rough cost estimate: ~$0.00003 per accepted AI line (conservative Copilot proxy)
 const COST_PER_AI_LINE_USD = 0.00003;
-// Rough human lines estimate: ~20 lines/minute of active coding
-const HUMAN_LINES_PER_MIN = 20;
 
 export class Database {
   private filePath: string;
@@ -56,9 +72,13 @@ export class Database {
       this.store[branch] = {
         workItemId: null,
         time: { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0 },
-        linesAi: 0,
-        copilotAcceptances: 0
+        copilotAcceptances: 0,
+        lineChanges: {}
       };
+    }
+    // Migrate old records missing lineChanges
+    if (!this.store[branch].lineChanges) {
+      this.store[branch].lineChanges = {};
     }
     return this.store[branch];
   }
@@ -69,10 +89,23 @@ export class Database {
     this.save();
   }
 
-  recordCopilotAcceptance(branch: string, linesAdded: number) {
+  recordLineChange(
+    branch: string,
+    ext: string,
+    source: 'human' | 'ai',
+    linesAdded: number,
+    linesDeleted: number
+  ) {
     const data = this.ensureBranch(branch);
-    data.linesAi += linesAdded;
-    data.copilotAcceptances += 1;
+    if (!data.lineChanges[ext]) {
+      data.lineChanges[ext] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+    }
+    data.lineChanges[ext][source].added += linesAdded;
+    data.lineChanges[ext][source].deleted += linesDeleted;
+
+    if (source === 'ai') {
+      data.copilotAcceptances += 1;
+    }
     this.save();
   }
 
@@ -84,20 +117,45 @@ export class Database {
 
   getSummaryForBranch(branch: string): BranchSummary {
     const data = this.ensureBranch(branch);
-    const humanCodingMs = data.time.humanCoding ?? 0;
-    const linesHuman = Math.round((humanCodingMs / 60000) * HUMAN_LINES_PER_MIN);
+    const { categorizeExt } = require('../util/fileTypes');
+
+    let linesHumanAdded = 0, linesHumanDeleted = 0;
+    let linesAiAdded = 0, linesAiDeleted = 0;
+    const byCategory: Record<FileCategory, { human: LineStats; ai: LineStats }> = {
+      code: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
+      spec: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
+      config: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
+      other: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } }
+    };
+
+    for (const [ext, stats] of Object.entries(data.lineChanges)) {
+      linesHumanAdded += stats.human.added;
+      linesHumanDeleted += stats.human.deleted;
+      linesAiAdded += stats.ai.added;
+      linesAiDeleted += stats.ai.deleted;
+
+      const cat: FileCategory = categorizeExt(ext);
+      byCategory[cat].human.added += stats.human.added;
+      byCategory[cat].human.deleted += stats.human.deleted;
+      byCategory[cat].ai.added += stats.ai.added;
+      byCategory[cat].ai.deleted += stats.ai.deleted;
+    }
 
     return {
       branch,
       workItemId: data.workItemId,
-      humanCodingMs,
+      humanCodingMs: data.time.humanCoding ?? 0,
       aiGeneratingMs: data.time.aiGenerating ?? 0,
       reviewingMs: data.time.reviewing ?? 0,
       idleMs: data.time.idle ?? 0,
-      linesHuman,
-      linesAi: data.linesAi,
+      linesHumanAdded,
+      linesHumanDeleted,
+      linesAiAdded,
+      linesAiDeleted,
       copilotAcceptances: data.copilotAcceptances,
-      estimatedCostUsd: data.linesAi * COST_PER_AI_LINE_USD
+      estimatedCostUsd: linesAiAdded * COST_PER_AI_LINE_USD,
+      byExt: data.lineChanges,
+      byCategory
     };
   }
 
