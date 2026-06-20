@@ -1,0 +1,72 @@
+{
+  "name": "ai-effort-tracker",
+  "displayName": "AI Effort Tracker",
+  "description": "Track human vs AI effort, time, and cost per work item / branch",
+  "version": "0.1.0",
+  "publisher": "AlexanderErdelyi",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "keywords": ["copilot", "productivity", "time-tracking", "ai", "metrics"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiEffortTracker.showSummary",
+        "title": "AI Effort Tracker: Show Session Summary"
+      },
+      {
+        "command": "aiEffortTracker.startSession",
+        "title": "AI Effort Tracker: Start Tracking Session"
+      },
+      {
+        "command": "aiEffortTracker.stopSession",
+        "title": "AI Effort Tracker: Stop Tracking Session"
+      },
+      {
+        "command": "aiEffortTracker.exportReport",
+        "title": "AI Effort Tracker: Export Report (JSON)"
+      }
+    ],
+    "configuration": {
+      "title": "AI Effort Tracker",
+      "properties": {
+        "aiEffortTracker.idleThresholdSeconds": {
+          "type": "number",
+          "default": 120,
+          "description": "Seconds of inactivity before switching to idle mode"
+        },
+        "aiEffortTracker.reviewThresholdSeconds": {
+          "type": "number",
+          "default": 10,
+          "description": "Seconds of no-keystroke (but focus) before switching to review mode"
+        },
+        "aiEffortTracker.azureDevOpsOrg": {
+          "type": "string",
+          "default": "",
+          "description": "Azure DevOps organization URL (e.g. https://dev.azure.com/myorg)"
+        },
+        "aiEffortTracker.githubToken": {
+          "type": "string",
+          "default": "",
+          "description": "GitHub personal access token for fetching issue/PR metadata"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {}
+}
