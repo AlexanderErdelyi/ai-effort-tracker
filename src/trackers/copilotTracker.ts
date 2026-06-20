@@ -17,7 +17,6 @@ export class CopilotTracker implements vscode.Disposable {
 
   private onDocChange(event: vscode.TextDocumentChangeEvent) {
     if (!event.contentChanges.length) return;
-    // Ignore output channels, git, extension internals
     const scheme = event.document.uri.scheme;
     if (scheme !== 'file' && scheme !== 'untitled') return;
 
@@ -29,18 +28,24 @@ export class CopilotTracker implements vscode.Disposable {
       const linesAdded = (change.text.match(/\n/g) ?? []).length;
       const linesDeleted = change.range.end.line - change.range.start.line;
 
-      if (linesAdded === 0 && linesDeleted === 0) continue; // single-line char edit, skip
+      if (linesAdded === 0 && linesDeleted === 0 && change.text.length < 2) {
+        continue; // ignore single-char keystrokes
+      }
 
-      // Attribution heuristic:
-      // AI if: currently in aiGenerating mode, OR multi-line insert at a single cursor point (Copilot inline)
-      const isAiInline =
-        linesAdded >= 2 &&
-        linesDeleted === 0 &&
+      // A Copilot inline completion accepted via Tab has these characteristics:
+      //   1. Zero-width range (cursor position, not a selection replacement)
+      //   2. Multi-line insert (linesAdded >= 1) — clear Copilot signal
+      //   OR large single-line insert (> 15 chars) at cursor — likely completion
+      // This can happen regardless of the current tracking mode (user was just typing).
+      const isCursorInsert =
         change.range.start.line === change.range.end.line &&
-        mode !== 'humanCoding';
+        change.range.start.character === change.range.end.character;
+
+      const isInlineCompletion =
+        isCursorInsert && (linesAdded >= 1 || change.text.length > 15);
 
       const source: 'human' | 'ai' =
-        mode === 'aiGenerating' || isAiInline ? 'ai' : 'human';
+        mode === 'aiGenerating' || isInlineCompletion ? 'ai' : 'human';
 
       this.db.recordLineChange(branch, ext, source, linesAdded, linesDeleted);
     }
