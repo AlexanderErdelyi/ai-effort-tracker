@@ -37,16 +37,35 @@ export class GitHubService {
       return this.cache;
     }
 
-    const token = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ?? '';
+    // 1. Try manual token setting first
+    let token = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ?? '';
+
+    // 2. Fall back to VS Code's built-in GitHub authentication (same account as Copilot)
+    if (!token) {
+      try {
+        const session = await vscode.authentication.getSession(
+          'github', ['read:org', 'repo'], { createIfNone: false }
+        );
+        token = session?.accessToken ?? '';
+      } catch { /* auth extension not available */ }
+    }
+
     if (!token) return null;
 
-    const org = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubOrg') ?? '';
-    const repo = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubRepo') ?? '';
+    let org = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubOrg') ?? '';
+    let repo = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubRepo') ?? '';
 
-    // Try repo-level first, then org-level
+    // 3. Auto-detect org/repo from workspace git remote if not manually configured
+    if (!org && !repo) {
+      const detected = await this.detectGitHubRemote();
+      if (detected) {
+        org = detected.owner;
+        repo = `${detected.owner}/${detected.repo}`;
+      }
+    }
+
     const since = this.daysAgo(28);
     const until = this.daysAgo(0);
-
     let result: CopilotMetrics | null = null;
 
     if (org && repo) {
@@ -158,6 +177,21 @@ export class GitHubService {
       totalActiveUsers: d.total_active_users ?? 0,
       byLanguage: Object.values(langMap).sort((a, b) => b.totalLinesAccepted - a.totalLinesAccepted)
     };
+  }
+
+  private async detectGitHubRemote(): Promise<{ owner: string; repo: string } | null> {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) { return null; }
+    const cwd = folders[0].uri.fsPath;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { exec } = require('child_process') as typeof import('child_process');
+    return new Promise(resolve => {
+      exec('git remote get-url origin', { cwd }, (_err: Error | null, stdout: string) => {
+        if (_err || !stdout) { resolve(null); return; }
+        const m = stdout.trim().match(/github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?$/);
+        resolve(m ? { owner: m[1], repo: m[2] } : null);
+      });
+    });
   }
 
   private daysAgo(n: number): string {

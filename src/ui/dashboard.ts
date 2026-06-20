@@ -81,7 +81,7 @@ function renderGhMetrics(){
     return;
   }
   if(ghMetrics.error==='needs-scope'){
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x2705; Token configured! Also set one of these settings:</p><ul style="margin-top:10px;padding-left:20px;font-size:.9em;line-height:2"><li><code>aiEffortTracker.githubOrg</code> &mdash; your org name (e.g. <code>mycompany</code>)</li><li><code>aiEffortTracker.githubRepo</code> &mdash; your repo (e.g. <code>myorg/myrepo</code>)</li></ul></div>';
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x2705; Signed in to GitHub! Could not detect a GitHub remote in the current workspace.</p><p style="margin-top:10px;font-size:.9em;color:var(--vscode-descriptionForeground)">Open a GitHub repository in VS Code, or manually set <code>aiEffortTracker.githubOrg</code> or <code>aiEffortTracker.githubRepo</code> in settings.</p></div>';
     return;
   }
   if(ghMetrics.error==='api-error'){
