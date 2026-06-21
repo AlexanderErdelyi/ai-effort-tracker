@@ -20,8 +20,8 @@ export class StatusBarManager implements vscode.Disposable {
 
   constructor() {
     this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    this.item.command = 'aiEffortTracker.showSummary';
-    this.item.tooltip = 'AI Effort Tracker — click to view summary';
+    this.item.command = 'aiEffortTracker.setMode';
+    this.item.tooltip = 'AI Effort Tracker — click to switch mode';
     this.item.show();
     this.update('idle', 0, 0);
   }

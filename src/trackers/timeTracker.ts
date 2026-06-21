@@ -48,6 +48,17 @@ export class TimeTracker implements vscode.Disposable {
     this.statusBar.update(mode, 0, 0);
   }
 
+  /** Manual override — locks mode for 60s so auto-detection doesn't immediately flip it back */
+  setModeManual(mode: TrackingMode) {
+    clearTimeout(this.activityTimer);
+    this.flushCurrentMode();
+    this.mode = mode;
+    this.modeStartedAt = Date.now();
+    this.statusBar.update(mode, 0, 0);
+    // After 60s, resume normal auto-detection on next keystroke
+    this.activityTimer = setTimeout(() => { /* no-op, just prevents auto-flip for 60s */ }, 60_000);
+  }
+
   /** Called by CopilotTracker when AI generation starts/ends */
   setAiGenerating(active: boolean) {
     if (!this.isTracking) return;

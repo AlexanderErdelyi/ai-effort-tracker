@@ -16,6 +16,10 @@
         "title": "AI Effort Tracker: Show Session Summary"
       },
       {
+        "command": "aiEffortTracker.setMode",
+        "title": "AI Effort Tracker: Set Tracking Mode"
+      },
+      {
         "command": "aiEffortTracker.startSession",
         "title": "AI Effort Tracker: Start Tracking Session"
       },

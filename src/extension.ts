@@ -27,6 +27,15 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
       openDashboard(db, timeTracker, context)
     ),
+    vscode.commands.registerCommand('aiEffortTracker.setMode', async () => {
+      const picked = await vscode.window.showQuickPick([
+        { label: '⌨️  Coding',    description: 'Human coding',        mode: 'humanCoding'  as const },
+        { label: '🤖  AI Gen',    description: 'AI is generating',    mode: 'aiGenerating' as const },
+        { label: '👀  Reviewing', description: 'Reading / reviewing', mode: 'reviewing'    as const },
+        { label: '☕  Idle',      description: 'Taking a break',      mode: 'idle'         as const },
+      ], { placeHolder: `Current mode: ${timeTracker.getMode()} — pick a mode to switch` });
+      if (picked) { timeTracker.setModeManual(picked.mode); }
+    }),
     vscode.commands.registerCommand('aiEffortTracker.startSession', () => {
       timeTracker.startTracking();
       vscode.window.showInformationMessage('AI Effort Tracker: Tracking started.');
