@@ -28,13 +28,20 @@ export function activate(context: vscode.ExtensionContext) {
       openDashboard(db, timeTracker, context)
     ),
     vscode.commands.registerCommand('aiEffortTracker.setMode', async () => {
-      const picked = await vscode.window.showQuickPick([
-        { label: '⌨️  Coding',    description: 'Human coding',        mode: 'humanCoding'  as const },
-        { label: '🤖  AI Gen',    description: 'AI is generating',    mode: 'aiGenerating' as const },
-        { label: '👀  Reviewing', description: 'Reading / reviewing', mode: 'reviewing'    as const },
-        { label: '☕  Idle',      description: 'Taking a break',      mode: 'idle'         as const },
-      ], { placeHolder: `Current mode: ${timeTracker.getMode()} — pick a mode to switch` });
-      if (picked) { timeTracker.setModeManual(picked.mode); }
+      type ModeItem = vscode.QuickPickItem & { mode: 'humanCoding' | 'aiGenerating' | 'reviewing' | 'idle' };
+      const items: ModeItem[] = [
+        { label: 'Coding',    description: 'Human coding — typing, editing',  mode: 'humanCoding'  },
+        { label: 'AI Gen',    description: 'AI is generating code',            mode: 'aiGenerating' },
+        { label: 'Reviewing', description: 'Reading, reviewing, navigating',   mode: 'reviewing'    },
+        { label: 'Idle',      description: 'Away / taking a break',            mode: 'idle'         },
+      ];
+      const cur = items.find(i => i.mode === timeTracker.getMode());
+      if (cur) { cur.label = '▶ ' + cur.label; cur.description += ' (current)'; }
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Switch tracking mode' });
+      if (picked) {
+        timeTracker.setModeManual(picked.mode);
+        vscode.window.showInformationMessage(`AI Effort Tracker: mode set to ${picked.mode}`);
+      }
     }),
     vscode.commands.registerCommand('aiEffortTracker.startSession', () => {
       timeTracker.startTracking();
