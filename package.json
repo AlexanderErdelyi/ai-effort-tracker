@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "AlexanderErdelyi",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],

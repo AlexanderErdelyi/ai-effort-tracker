@@ -28,7 +28,12 @@ export interface CopilotMetrics {
   source: 'org' | 'repo' | 'user';
   scopeName: string;
   error?: string;
+  errorDetail?: string;
 }
+
+type FetchResult =
+  | { ok: true; metrics: CopilotMetrics }
+  | { ok: false; status: number; message: string };
 
 export class GitHubService {
   private cache: CopilotMetrics | null = null;
@@ -70,18 +75,21 @@ export class GitHubService {
     const since = this.daysAgo(28);
     const until = this.daysAgo(0);
     let result: CopilotMetrics | null = null;
+    let lastFail: { status: number; message: string } | null = null;
 
     if (org && repo) {
-      result = await this.fetchMetrics(
+      const r = await this.fetchMetrics(
         `/repos/${org}/${repo}/copilot/metrics?since=${since}&until=${until}`,
         token, 'repo', `${org}/${repo}`
       );
+      if (r.ok) result = r.metrics; else lastFail = r;
     }
     if (!result && org) {
-      result = await this.fetchMetrics(
+      const r = await this.fetchMetrics(
         `/orgs/${org}/copilot/metrics?since=${since}&until=${until}`,
         token, 'org', org
       );
+      if (r.ok) result = r.metrics; else lastFail = r;
     }
 
     // Token is set but neither org nor repo was provided
@@ -93,11 +101,12 @@ export class GitHubService {
       };
     }
 
-    // Token+scope set but API returned nothing (wrong permissions, 404, etc.)
+    // Token+scope set but API returned an error — surface the real status/message
     if (!result) {
       return {
         days: [], fetchedAt: Date.now(), source: org ? 'org' : 'repo', scopeName: org || repo,
-        error: 'api-error'
+        error: 'api-error',
+        errorDetail: lastFail ? this.explainStatus(lastFail.status, lastFail.message) : undefined
       };
     }
     this.cache = result;
@@ -105,12 +114,29 @@ export class GitHubService {
     return result;
   }
 
+  /** Turn an HTTP status + GitHub message into an actionable explanation. */
+  private explainStatus(status: number, message: string): string {
+    const base = message ? ` GitHub said: "${message}".` : '';
+    switch (status) {
+      case 401:
+        return `401 Unauthorized — the token is invalid or expired.${base} Generate a new token and paste it into aiEffortTracker.githubToken.`;
+      case 403:
+        return `403 Forbidden — the token lacks permission, or SSO isn't authorized for this org. For a classic PAT add the manage_billing:copilot scope; for a fine-grained PAT grant the org "GitHub Copilot Business: Read" permission, then authorize the token for the org (SSO).${base}`;
+      case 404:
+        return `404 Not Found — the org wasn't found, you're not an owner/billing-manager, or the Copilot Metrics API isn't enabled for this org (an org owner must enable the "Copilot Metrics API access" policy in org settings → Copilot).${base}`;
+      case 422:
+        return `422 — the metrics API needs at least 5 members with active Copilot in the period; smaller orgs return no data.${base}`;
+      default:
+        return `HTTP ${status}.${base}`;
+    }
+  }
+
   private fetchMetrics(
     path: string,
     token: string,
     source: 'org' | 'repo' | 'user',
     scopeName: string
-  ): Promise<CopilotMetrics | null> {
+  ): Promise<FetchResult> {
     return new Promise(resolve => {
       const options = {
         hostname: 'api.github.com',
@@ -128,21 +154,30 @@ export class GitHubService {
         let body = '';
         res.on('data', chunk => body += chunk);
         res.on('end', () => {
-          if (res.statusCode !== 200) { resolve(null); return; }
+          const status = res.statusCode ?? 0;
+          if (status !== 200) {
+            let message = '';
+            try { message = (JSON.parse(body) as { message?: string }).message ?? ''; } catch { /* non-JSON */ }
+            resolve({ ok: false, status, message });
+            return;
+          }
           try {
             const raw: RawMetricsDay[] = JSON.parse(body);
             resolve({
-              source,
-              scopeName,
-              fetchedAt: Date.now(),
-              days: raw.map(d => this.mapDay(d))
+              ok: true,
+              metrics: {
+                source,
+                scopeName,
+                fetchedAt: Date.now(),
+                days: raw.map(d => this.mapDay(d))
+              }
             });
           } catch {
-            resolve(null);
+            resolve({ ok: false, status: 200, message: 'Response was not valid JSON.' });
           }
         });
       });
-      req.on('error', () => resolve(null));
+      req.on('error', err => resolve({ ok: false, status: 0, message: err.message }));
       req.end();
     });
   }

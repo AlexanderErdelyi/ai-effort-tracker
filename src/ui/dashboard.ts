@@ -93,7 +93,8 @@ function renderGhMetrics(){
     return;
   }
   if(ghMetrics.error==='api-error'){
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">&#x26A0;&#xFE0F; API request failed for <strong>'+ghMetrics.scopeName+'</strong>.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Check that your token has the <code>manage_billing:copilot</code> scope (classic) or <em>GitHub Copilot Business: Read</em> permission (fine-grained), and that the org/repo name is correct.</p></div>';
+    var detail=ghMetrics.errorDetail?'<p style="margin-top:10px;padding:10px;background:rgba(244,113,116,.1);border-left:3px solid var(--deleted);border-radius:4px;font-size:.85em;line-height:1.5">'+ghMetrics.errorDetail+'</p>':'';
+    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x26A0;&#xFE0F; Could not load metrics for <strong>'+ghMetrics.scopeName+'</strong>.</p>'+detail+'<p style="margin-top:10px;font-size:.85em;color:var(--vscode-descriptionForeground)">Note: this endpoint is <strong>org/enterprise only</strong> &mdash; personal Copilot subscriptions have no metrics API.</p></div>';
     return;
   }
   var days=ghMetrics.days.slice(-14);
