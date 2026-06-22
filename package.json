@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "AlexanderErdelyi",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -38,12 +38,17 @@
         "aiEffortTracker.idleThresholdSeconds": {
           "type": "number",
           "default": 120,
-          "description": "Seconds of inactivity before switching to idle mode"
+          "description": "While VS Code is focused, switch to Idle after this many seconds with no editor activity (typing, cursor moves, AI writes)."
         },
-        "aiEffortTracker.reviewThresholdSeconds": {
+        "aiEffortTracker.codingActiveSeconds": {
           "type": "number",
-          "default": 10,
-          "description": "Seconds of no-keystroke (but focus) before switching to review mode"
+          "default": 5,
+          "description": "Keep counting 'Human Coding' for this many seconds after your last keystroke."
+        },
+        "aiEffortTracker.aiActiveSeconds": {
+          "type": "number",
+          "default": 5,
+          "description": "Keep counting 'AI Generating' for this many seconds after the last Copilot/agent write."
         },
         "aiEffortTracker.azureDevOpsOrg": {
           "type": "string",
