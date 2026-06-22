@@ -53,6 +53,9 @@ export class CopilotTracker implements vscode.Disposable {
       const relPath = vscode.workspace.asRelativePath(event.document.uri, false);
       this.db.recordLineChange(branch, ext, source, insertedLines, deletedLines, relPath);
     }
+    if (insertedChars > 0) {
+      this.db.recordChars(branch, source, insertedChars);
+    }
     this.timeTracker.markEdit(source);
   }
 

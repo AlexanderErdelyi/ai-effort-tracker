@@ -29,6 +29,10 @@ export interface BranchSummary {
   estimatedCostUsd: number;
   chatCharsHuman: number;
   chatTurnsHuman: number;
+  humanChars: number;
+  aiChars: number;
+  humanKeystrokes: number;
+  aiInserts: number;
   creditsTotal: number;
   creditsByModel: { model: string; credits: number; turns: number }[];
   // Breakdown by file extension: { "al": { human: {...}, ai: {...} }, ... }
@@ -135,6 +139,10 @@ interface BranchData {
   copilotAcceptances: number;
   chatCharsHuman?: number;
   chatTurnsHuman?: number;
+  humanCharsInserted?: number;
+  aiCharsInserted?: number;
+  humanKeystrokes?: number;
+  aiInserts?: number;
   creditsLog?: CreditEntry[];
   daily?: Record<string, DailyBucket>;
   focusSessions?: FocusSession[];
@@ -325,6 +333,20 @@ export class Database {
     this.save();
   }
 
+  /** Record inserted characters by source — feeds keystroke ratio + token estimate. */
+  recordChars(branch: string, source: 'human' | 'ai', chars: number) {
+    if (chars <= 0) return;
+    const data = this.ensureBranch(branch);
+    if (source === 'ai') {
+      data.aiCharsInserted = (data.aiCharsInserted ?? 0) + chars;
+      data.aiInserts = (data.aiInserts ?? 0) + 1;
+    } else {
+      data.humanCharsInserted = (data.humanCharsInserted ?? 0) + chars;
+      data.humanKeystrokes = (data.humanKeystrokes ?? 0) + 1;
+    }
+    this.save();
+  }
+
   recordChatChars(branch: string, chars: number) {
     const data = this.ensureBranch(branch);
     data.chatCharsHuman = (data.chatCharsHuman ?? 0) + chars;
@@ -393,6 +415,10 @@ export class Database {
       estimatedCostUsd: linesAiAdded * COST_PER_AI_LINE_USD,
       chatCharsHuman: data.chatCharsHuman ?? 0,
       chatTurnsHuman: data.chatTurnsHuman ?? 0,
+      humanChars: data.humanCharsInserted ?? 0,
+      aiChars: data.aiCharsInserted ?? 0,
+      humanKeystrokes: data.humanKeystrokes ?? 0,
+      aiInserts: data.aiInserts ?? 0,
       creditsTotal: (data.creditsLog ?? []).reduce((a, e) => a + e.credits, 0),
       creditsByModel: this.aggregateCredits(data.creditsLog ?? []),
       byExt: data.lineChanges,
