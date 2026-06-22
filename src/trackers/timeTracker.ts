@@ -57,8 +57,19 @@ export class TimeTracker implements vscode.Disposable {
         this.focused = s.focused;
         if (s.focused) this.lastActivityAt = Date.now();
       }),
-      vscode.window.onDidChangeTextEditorSelection(() => { this.lastActivityAt = Date.now(); }),
-      vscode.window.onDidChangeActiveTextEditor(() => { this.lastActivityAt = Date.now(); })
+      // Clicks, cursor moves, keyboard navigation (selection changes).
+      vscode.window.onDidChangeTextEditorSelection(() => { this.markActivity(); }),
+      // Scrolling through code — the key "reading / reviewing" signal.
+      vscode.window.onDidChangeTextEditorVisibleRanges(() => { this.markActivity(); }),
+      // Switching files / split editors / opening-closing tabs.
+      vscode.window.onDidChangeActiveTextEditor(() => { this.markActivity(); }),
+      vscode.window.onDidChangeVisibleTextEditors(() => { this.markActivity(); }),
+      vscode.window.onDidChangeTextEditorViewColumn(() => { this.markActivity(); }),
+      // Working in the integrated terminal.
+      vscode.window.onDidChangeActiveTerminal(() => { this.markActivity(); }),
+      vscode.window.onDidOpenTerminal(() => { this.markActivity(); }),
+      // Editing documents (also drives human/AI split via CopilotTracker.markEdit).
+      vscode.workspace.onDidChangeTextDocument(() => { this.markActivity(); })
     );
 
     this.ticker = setInterval(() => this.tick(), TICK_MS);
@@ -79,6 +90,11 @@ export class TimeTracker implements vscode.Disposable {
     const now = Date.now();
     this.lastActivityAt = now;
     if (source === 'ai') this.lastAiAt = now; else this.lastEditAt = now;
+  }
+
+  /** Any non-edit interaction in VS Code (click, scroll, file switch, terminal). */
+  private markActivity() {
+    this.lastActivityAt = Date.now();
   }
 
   setMode(mode: TrackingMode) {
