@@ -48,6 +48,9 @@ const COST_PER_AI_LINE_USD = 0.00003;
 export class Database {
   private filePath: string;
   private store: Store;
+  private saveTimer: NodeJS.Timeout | undefined;
+  private dirty = false;
+  private writing = false;
 
   constructor(storagePath: string) {
     fs.mkdirSync(storagePath, { recursive: true });
@@ -63,8 +66,46 @@ export class Database {
     }
   }
 
+  /**
+   * Debounced, asynchronous save. Editor events fire extremely frequently
+   * (every keystroke, cursor move, and during language-server symbol loading),
+   * so we must NEVER block the extension host thread with a synchronous write.
+   * Writes are coalesced and flushed at most once every 2s, off the hot path.
+   */
   private save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.store, null, 2), 'utf8');
+    this.dirty = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      void this.flushAsync();
+    }, 2000);
+  }
+
+  private async flushAsync(): Promise<void> {
+    if (this.writing || !this.dirty) return;
+    this.writing = true;
+    this.dirty = false;
+    const data = JSON.stringify(this.store, null, 2);
+    try {
+      await fs.promises.writeFile(this.filePath, data, 'utf8');
+    } catch {
+      this.dirty = true; // retry on next save
+    } finally {
+      this.writing = false;
+    }
+  }
+
+  /** Synchronous flush — only for extension deactivation. */
+  flushSync(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    if (!this.dirty) return;
+    this.dirty = false;
+    try {
+      fs.writeFileSync(this.filePath, JSON.stringify(this.store, null, 2), 'utf8');
+    } catch { /* ignore */ }
   }
 
   private ensureBranch(branch: string): BranchData {

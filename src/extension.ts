@@ -67,6 +67,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   timeTracker?.stopTracking();
+  db?.flushSync();
 }
 
 async function openDashboard(db: Database, tracker: TimeTracker, context: vscode.ExtensionContext) {
