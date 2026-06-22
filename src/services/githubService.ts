@@ -31,6 +31,27 @@ export interface CopilotMetrics {
   errorDetail?: string;
 }
 
+export interface BillingItem {
+  sku: string;
+  quantity: number;
+  unit: string;
+  grossUsd: number;
+  netUsd: number;
+}
+
+export interface BillingUsage {
+  ok: boolean;
+  scope: string;
+  period: string;
+  premiumRequests: number;
+  grossUsd: number;
+  netUsd: number;
+  items: BillingItem[];
+  fetchedAt: number;
+  error?: 'no-token' | 'http' | 'no-copilot';
+  errorDetail?: string;
+}
+
 type FetchResult =
   | { ok: true; metrics: CopilotMetrics }
   | { ok: false; status: number; message: string };
@@ -38,7 +59,137 @@ type FetchResult =
 export class GitHubService {
   private cache: CopilotMetrics | null = null;
   private cacheExpiresAt = 0;
+  private billingCache: BillingUsage | null = null;
+  private billingExpiresAt = 0;
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+  /** Resolve a token: manual setting first, then VS Code's GitHub session. */
+  private async resolveToken(): Promise<string> {
+    let token = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ?? '';
+    if (!token) {
+      try {
+        const session = await vscode.authentication.getSession(
+          'github', ['read:org', 'repo'], { createIfNone: false }
+        );
+        token = session?.accessToken ?? '';
+      } catch { /* auth extension not available */ }
+    }
+    return token;
+  }
+
+  /** Raw authenticated GET returning status + parsed/!parsed body. */
+  private apiGet(path: string, token: string): Promise<{ status: number; body: string }> {
+    return new Promise(resolve => {
+      const req = https.request({
+        hostname: 'api.github.com', path, method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'ai-effort-tracker-vscode'
+        }
+      }, res => {
+        let body = '';
+        res.on('data', c => body += c);
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.on('error', err => resolve({ status: 0, body: JSON.stringify({ message: err.message }) }));
+      req.end();
+    });
+  }
+
+  /**
+   * Pull real Copilot premium-request usage from the enhanced billing API.
+   * Personal scope: /users/{login}/settings/billing/usage.
+   * Falls back to the configured org if the personal call fails.
+   */
+  async getBillingUsage(forceRefresh = false): Promise<BillingUsage> {
+    if (!forceRefresh && this.billingCache && Date.now() < this.billingExpiresAt) {
+      return this.billingCache;
+    }
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    const period = `${year}-${String(month).padStart(2, '0')}`;
+    const fail = (error: BillingUsage['error'], detail?: string): BillingUsage => ({
+      ok: false, scope: '', period, premiumRequests: 0, grossUsd: 0, netUsd: 0,
+      items: [], fetchedAt: Date.now(), error, errorDetail: detail
+    });
+
+    const token = await this.resolveToken();
+    if (!token) return fail('no-token');
+
+    // Resolve the authenticated user's login.
+    let login = '';
+    const me = await this.apiGet('/user', token);
+    if (me.status === 200) {
+      try { login = (JSON.parse(me.body) as { login?: string }).login ?? ''; } catch { /* ignore */ }
+    }
+
+    const org = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubOrg') ?? '';
+    const attempts: { path: string; scope: string }[] = [];
+    if (login) attempts.push({ path: `/users/${login}/settings/billing/usage?year=${year}&month=${month}`, scope: `user:${login}` });
+    if (org) attempts.push({ path: `/organizations/${org}/settings/billing/usage?year=${year}&month=${month}`, scope: `org:${org}` });
+    if (!attempts.length) return fail('no-token', 'Could not resolve your GitHub login from the token.');
+
+    let lastStatus = 0, lastMsg = '';
+    for (const a of attempts) {
+      const r = await this.apiGet(a.path, token);
+      if (r.status === 200) {
+        const usage = this.parseBilling(r.body, a.scope, period);
+        if (usage.error === 'no-copilot') { lastStatus = 200; lastMsg = 'no copilot items'; continue; }
+        this.billingCache = usage;
+        this.billingExpiresAt = Date.now() + this.CACHE_TTL_MS;
+        return usage;
+      }
+      lastStatus = r.status;
+      try { lastMsg = (JSON.parse(r.body) as { message?: string }).message ?? ''; } catch { /* ignore */ }
+    }
+    return fail('http', this.explainBilling(lastStatus, lastMsg));
+  }
+
+  private parseBilling(body: string, scope: string, period: string): BillingUsage {
+    let items: RawUsageItem[] = [];
+    try {
+      const parsed = JSON.parse(body) as { usageItems?: RawUsageItem[] };
+      items = parsed.usageItems ?? [];
+    } catch { /* ignore */ }
+    const copilot = items.filter(i => /copilot/i.test(i.product ?? '') || /copilot/i.test(i.sku ?? ''));
+    if (!copilot.length) {
+      return { ok: false, scope, period, premiumRequests: 0, grossUsd: 0, netUsd: 0, items: [], fetchedAt: Date.now(), error: 'no-copilot' };
+    }
+    const bySku: Record<string, BillingItem> = {};
+    let premiumRequests = 0, grossUsd = 0, netUsd = 0;
+    for (const i of copilot) {
+      const sku = i.sku ?? i.product ?? 'Copilot';
+      if (!bySku[sku]) bySku[sku] = { sku, quantity: 0, unit: i.unitType ?? '', grossUsd: 0, netUsd: 0 };
+      bySku[sku].quantity += i.quantity ?? 0;
+      bySku[sku].grossUsd += i.grossAmount ?? 0;
+      bySku[sku].netUsd += i.netAmount ?? 0;
+      grossUsd += i.grossAmount ?? 0;
+      netUsd += i.netAmount ?? 0;
+      if (/premium|request/i.test(sku)) premiumRequests += i.quantity ?? 0;
+    }
+    if (premiumRequests === 0) {
+      premiumRequests = copilot.reduce((a, i) => a + (i.quantity ?? 0), 0);
+    }
+    return {
+      ok: true, scope, period, premiumRequests,
+      grossUsd: +grossUsd.toFixed(2), netUsd: +netUsd.toFixed(2),
+      items: Object.values(bySku).sort((a, b) => b.quantity - a.quantity),
+      fetchedAt: Date.now()
+    };
+  }
+
+  private explainBilling(status: number, message: string): string {
+    const base = message ? ` GitHub said: "${message}".` : '';
+    switch (status) {
+      case 401: return `401 Unauthorized — token invalid/expired.${base}`;
+      case 403: return `403 Forbidden — the token can't read billing. Use a fine-grained PAT with the "Plan: Read-only" account permission (for org usage: the org's "Administration: Read"), set it as aiEffortTracker.githubToken, and authorize SSO if required.${base}`;
+      case 404: return `404 Not Found — the billing usage endpoint isn't available for this account, or the login/org is wrong.${base}`;
+      default: return `HTTP ${status}.${base}`;
+    }
+  }
 
   async getCopilotMetrics(forceRefresh = false): Promise<CopilotMetrics | null> {
     if (!forceRefresh && this.cache && Date.now() < this.cacheExpiresAt) {
@@ -272,6 +423,20 @@ export class GitHubService {
 }
 
 // Raw GitHub API response types
+interface RawUsageItem {
+  date?: string;
+  product?: string;
+  sku?: string;
+  quantity?: number;
+  unitType?: string;
+  pricePerUnit?: number;
+  grossAmount?: number;
+  discountAmount?: number;
+  netAmount?: number;
+  organizationName?: string;
+  repositoryName?: string;
+}
+
 interface RawMetricsDay {
   date: string;
   total_suggestions_count?: number;

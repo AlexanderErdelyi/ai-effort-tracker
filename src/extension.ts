@@ -6,7 +6,7 @@ import { CopilotTracker } from './trackers/copilotTracker';
 import { Database } from './store/database';
 import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
-import { GitHubService } from './services/githubService';
+import { GitHubService, BillingUsage } from './services/githubService';
 
 let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
@@ -14,6 +14,7 @@ let copilotTracker: CopilotTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
+let lastBilling: BillingUsage | null = null;
 const ghService = new GitHubService();
 
 interface InsightsConfig {
@@ -106,6 +107,26 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
+    vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Fetching Copilot premium-request usage…' },
+        async () => {
+          lastBilling = await ghService.getBillingUsage(true);
+        }
+      );
+      if (lastBilling?.ok) {
+        vscode.window.showInformationMessage(
+          `Copilot usage (${lastBilling.period}, ${lastBilling.scope}): ${lastBilling.premiumRequests} premium requests · $${lastBilling.netUsd.toFixed(2)} net.`
+        );
+      } else if (lastBilling?.error === 'no-token') {
+        vscode.window.showWarningMessage('No GitHub token. Set aiEffortTracker.githubToken or sign in to GitHub in VS Code.');
+      } else if (lastBilling?.error === 'no-copilot') {
+        vscode.window.showInformationMessage('No Copilot premium-request usage found for this billing period.');
+      } else {
+        vscode.window.showErrorMessage('Could not fetch Copilot usage. ' + (lastBilling?.errorDetail ?? ''));
+      }
+      refreshDashboard();
+    }),
     vscode.commands.registerCommand('aiEffortTracker.startSession', () => {
       timeTracker.startTracking();
       vscode.window.showInformationMessage('AI Effort Tracker: Tracking started.');
@@ -150,7 +171,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   const branch = await GitTracker.getCurrentBranch() ?? 'unknown';
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics());
+  try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
@@ -177,7 +199,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       currentBranch,
       ghMetrics: ghData,
       config: getInsightsConfig(),
-      analytics: getAnalytics()
+      analytics: getAnalytics(),
+      billing: lastBilling
     });
   }, 5000);
 
@@ -196,7 +219,8 @@ function refreshDashboard() {
       summaries: db.getAllBranchesSummaries(),
       currentBranch: b ?? 'unknown',
       config: getInsightsConfig(),
-      analytics: getAnalytics()
+      analytics: getAnalytics(),
+      billing: lastBilling
     });
   });
 }

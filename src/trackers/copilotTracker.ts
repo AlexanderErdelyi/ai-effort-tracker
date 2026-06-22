@@ -56,6 +56,16 @@ export class CopilotTracker implements vscode.Disposable {
     if (insertedChars > 0) {
       this.db.recordChars(branch, source, insertedChars);
     }
+    if (source === 'ai' && insertedChars > 0) {
+      // Inline completion = one contiguous insert, no deletion, into the editor
+      // you're actively looking at, modest size. Everything else (multi-region,
+      // replacements, background file writes) is a chat/agent apply.
+      const activeUri = vscode.window.activeTextEditor?.document.uri.toString();
+      const isActiveDoc = activeUri === event.document.uri.toString();
+      const looksInline =
+        changeCount === 1 && deletedChars === 0 && isActiveDoc && insertedLines <= 8;
+      this.db.recordAiSplit(branch, looksInline ? 'inline' : 'chat', insertedLines, insertedChars);
+    }
     this.timeTracker.markEdit(source);
   }
 

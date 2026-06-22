@@ -33,6 +33,10 @@ export interface BranchSummary {
   aiChars: number;
   humanKeystrokes: number;
   aiInserts: number;
+  aiInlineLines: number;
+  aiChatLines: number;
+  aiInlineChars: number;
+  aiChatChars: number;
   creditsTotal: number;
   creditsByModel: { model: string; credits: number; turns: number }[];
   // Breakdown by file extension: { "al": { human: {...}, ai: {...} }, ... }
@@ -143,6 +147,10 @@ interface BranchData {
   aiCharsInserted?: number;
   humanKeystrokes?: number;
   aiInserts?: number;
+  aiInlineLines?: number;
+  aiChatLines?: number;
+  aiInlineChars?: number;
+  aiChatChars?: number;
   creditsLog?: CreditEntry[];
   daily?: Record<string, DailyBucket>;
   focusSessions?: FocusSession[];
@@ -347,6 +355,19 @@ export class Database {
     this.save();
   }
 
+  /** Split AI insertions into inline completions vs chat/agent edits. */
+  recordAiSplit(branch: string, kind: 'inline' | 'chat', lines: number, chars: number) {
+    const data = this.ensureBranch(branch);
+    if (kind === 'inline') {
+      data.aiInlineLines = (data.aiInlineLines ?? 0) + lines;
+      data.aiInlineChars = (data.aiInlineChars ?? 0) + chars;
+    } else {
+      data.aiChatLines = (data.aiChatLines ?? 0) + lines;
+      data.aiChatChars = (data.aiChatChars ?? 0) + chars;
+    }
+    this.save();
+  }
+
   recordChatChars(branch: string, chars: number) {
     const data = this.ensureBranch(branch);
     data.chatCharsHuman = (data.chatCharsHuman ?? 0) + chars;
@@ -419,6 +440,10 @@ export class Database {
       aiChars: data.aiCharsInserted ?? 0,
       humanKeystrokes: data.humanKeystrokes ?? 0,
       aiInserts: data.aiInserts ?? 0,
+      aiInlineLines: data.aiInlineLines ?? 0,
+      aiChatLines: data.aiChatLines ?? 0,
+      aiInlineChars: data.aiInlineChars ?? 0,
+      aiChatChars: data.aiChatChars ?? 0,
       creditsTotal: (data.creditsLog ?? []).reduce((a, e) => a + e.credits, 0),
       creditsByModel: this.aggregateCredits(data.creditsLog ?? []),
       byExt: data.lineChanges,

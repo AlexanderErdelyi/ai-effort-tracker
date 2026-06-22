@@ -1,6 +1,6 @@
 import type { BranchSummary } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
-import type { CopilotMetrics } from '../services/githubService';
+import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 
 export interface InsightsConfig {
   baselineLocPerMinute: number;
@@ -30,7 +30,8 @@ export function renderDashboardHtml(
   nonce: string,
   ghMetrics: CopilotMetrics | null = null,
   config: InsightsConfig = { baselineLocPerMinute: 5, hourlyRateUsd: 80, usdPerCredit: 0.04, dailyActiveGoalMinutes: 240 },
-  analytics: DashboardAnalytics = { daily: [], heatmap: [], focus: { sessionsToday: 0, sessionsWeek: 0, totalFocusMsToday: 0, totalFocusMsWeek: 0, longestMs: 0, avgMs: 0, goalProgressPct: 0 } }
+  analytics: DashboardAnalytics = { daily: [], heatmap: [], focus: { sessionsToday: 0, sessionsWeek: 0, totalFocusMsToday: 0, totalFocusMsWeek: 0, longestMs: 0, avgMs: 0, goalProgressPct: 0 } },
+  billing: BillingUsage | null = null
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
@@ -38,6 +39,7 @@ export function renderDashboardHtml(
   const ghData = JSON.stringify(ghMetrics);
   const cfgData = JSON.stringify(config);
   const anData = JSON.stringify(analytics);
+  const blData = JSON.stringify(billing);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -99,6 +101,7 @@ const CAT=${catLabels};
 let ghMetrics=${ghData};
 let CFG=${cfgData};
 let AN=${anData};
+let BL=${blData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -130,14 +133,34 @@ function insights(d){
 function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
 function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
 
+function billingHtml(){
+  var imp='<button class="dtab" data-action="cmd" data-value="importCredits" style="margin-top:10px">\\u21bb Import / refresh usage</button>';
+  if(!BL){
+    return'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDCB3 Copilot Premium Requests &mdash; real usage</h3><p style="margin-top:8px;color:var(--vscode-descriptionForeground)">Pull your real billed premium-request usage from GitHub\\u2019s billing API.</p>'+imp+'</div>';
+  }
+  if(!BL.ok){
+    var msg=BL.error==='no-token'?'No GitHub token \\u2014 set <code>aiEffortTracker.githubToken</code> (fine-grained PAT with <strong>Plan: Read-only</strong>) or sign in to GitHub.':BL.error==='no-copilot'?'No Copilot premium-request usage found for '+BL.period+' yet.':(BL.errorDetail||'Could not load billing usage.');
+    return'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDCB3 Copilot Premium Requests &mdash; real usage</h3><p style="margin-top:8px;color:var(--vscode-descriptionForeground)">'+msg+'</p>'+imp+'</div>';
+  }
+  var rows=(BL.items||[]).map(function(i){return'<tr><td>'+i.sku+'</td><td>'+i.quantity.toLocaleString()+(i.unit?' '+i.unit:'')+'</td><td>$'+i.grossUsd.toFixed(2)+'</td><td>$'+i.netUsd.toFixed(2)+'</td></tr>';}).join('')||'<tr><td colspan="4" style="color:var(--vscode-descriptionForeground)">No line items</td></tr>';
+  return'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDCB3 Copilot Premium Requests &mdash; real usage ('+BL.period+' \\u00b7 '+BL.scope+')</h3>'
+    +'<div class="sg" style="grid-template-columns:repeat(3,1fr);margin-top:8px">'
+    +'<div class="st"><div class="lbl">Premium Requests</div><div class="val" style="color:var(--ai)">'+BL.premiumRequests.toLocaleString()+'</div></div>'
+    +'<div class="st"><div class="lbl">Gross</div><div class="val">$'+BL.grossUsd.toFixed(2)+'</div></div>'
+    +'<div class="st"><div class="lbl">Net (billed)</div><div class="val" style="color:var(--cost)">$'+BL.netUsd.toFixed(2)+'</div></div>'
+    +'</div>'
+    +'<table style="margin-top:8px"><thead><tr><th>SKU</th><th>Quantity</th><th>Gross</th><th>Net</th></tr></thead><tbody>'+rows+'</tbody></table>'
+    +'<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">Net = amount billed beyond your included allowance. This is GitHub\\u2019s authoritative usage, unlike the heuristic estimates on the Overview tab.</p>'+imp+'</div>';
+}
 function renderGhMetrics(){
   const el=document.getElementById('ghview');
+  var bh=billingHtml();
   if(!ghMetrics){
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">Configure your GitHub token in settings to load official Copilot metrics.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Required: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope)</p></div>';
+    el.innerHTML=bh+'<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="color:var(--vscode-descriptionForeground);margin-top:8px">Configure your GitHub token in settings to load official Copilot metrics.</p><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Required: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope)</p></div>';
     return;
   }
   if(ghMetrics.error==='needs-scope-ado'){
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3>'
+    el.innerHTML=bh+'<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3>'
       +'<p style="margin-top:8px">&#x2705; Signed in &nbsp;|&nbsp; &#x1F4E6; Azure DevOps repo detected</p>'
       +'<p style="margin-top:10px;font-size:.9em;color:var(--vscode-descriptionForeground)">Copilot metrics live on <strong>GitHub</strong>, not Azure DevOps. Set your <strong>GitHub org name</strong> in settings:</p>'
       +'<p style="margin-top:8px;font-family:monospace;font-size:.9em">aiEffortTracker.githubOrg = <em>your-github-org</em></p>'
@@ -145,12 +168,12 @@ function renderGhMetrics(){
     return;
   }
   if(ghMetrics.error==='needs-scope'){
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x2705; Signed in to GitHub! Could not detect a GitHub remote in the current workspace.</p><p style="margin-top:10px;font-size:.9em;color:var(--vscode-descriptionForeground)">Open a GitHub repository in VS Code, or manually set <code>aiEffortTracker.githubOrg</code> or <code>aiEffortTracker.githubRepo</code> in settings.</p></div>';
+    el.innerHTML=bh+'<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x2705; Signed in to GitHub! Could not detect a GitHub remote in the current workspace.</p><p style="margin-top:10px;font-size:.9em;color:var(--vscode-descriptionForeground)">Open a GitHub repository in VS Code, or manually set <code>aiEffortTracker.githubOrg</code> or <code>aiEffortTracker.githubRepo</code> in settings.</p></div>';
     return;
   }
   if(ghMetrics.error==='api-error'){
     var detail=ghMetrics.errorDetail?'<p style="margin-top:10px;padding:10px;background:rgba(244,113,116,.1);border-left:3px solid var(--deleted);border-radius:4px;font-size:.85em;line-height:1.5">'+ghMetrics.errorDetail+'</p>':'';
-    el.innerHTML='<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x26A0;&#xFE0F; Could not load metrics for <strong>'+ghMetrics.scopeName+'</strong>.</p>'+detail+'<p style="margin-top:10px;font-size:.85em;color:var(--vscode-descriptionForeground)">Note: this endpoint is <strong>org/enterprise only</strong> &mdash; personal Copilot subscriptions have no metrics API.</p></div>';
+    el.innerHTML=bh+'<div class="card" style="margin-top:16px"><h3>GitHub Copilot Metrics API</h3><p style="margin-top:8px">&#x26A0;&#xFE0F; Could not load metrics for <strong>'+ghMetrics.scopeName+'</strong>.</p>'+detail+'<p style="margin-top:10px;font-size:.85em;color:var(--vscode-descriptionForeground)">Note: this endpoint is <strong>org/enterprise only</strong> &mdash; personal Copilot subscriptions have no metrics API.</p></div>';
     return;
   }
   var days=ghMetrics.days.slice(-14);
@@ -177,7 +200,7 @@ function renderGhMetrics(){
 
   var langRows=topLangs.map(function(e){var n=e[0],s=e[1],r=s.sugg>0?((s.acc/s.sugg)*100).toFixed(0):0;return'<tr><td><span class="extb">'+n+'</span></td><td>'+s.sugg+'</td><td>'+s.acc+'</td><td><span class="badge '+(r>50?'ba':'bh')+'">'+r+'%</span></td><td>+'+s.linesAcc+'</td></tr>';}).join('');
 
-  el.innerHTML='<div class="sg" style="grid-template-columns:repeat(5,1fr)">'
+  el.innerHTML=bh+'<div class="sg" style="grid-template-columns:repeat(5,1fr)">'
     +'<div class="st"><div class="lbl">Suggestions (14d)</div><div class="val">'+totSugg+'</div></div>'
     +'<div class="st"><div class="lbl">Acceptances (14d)</div><div class="val" style="color:var(--human)">'+totAcc+'</div></div>'
     +'<div class="st"><div class="lbl">Acceptance Rate</div><div class="val" style="color:var(--ai)">'+accRate+'%</div></div>'
@@ -213,6 +236,21 @@ function renderGhMetrics(){
       scales:{x:{ticks:{color:dfg()},grid:{color:gc}},
         y:{ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'lines',color:dfg()},position:'left'},
         y2:{ticks:{color:dfg(),callback:function(v){return v+'%';}},grid:{display:false},max:100,position:'right'}}}});
+}
+function aiSplitHtml(){
+  var sF=function(k){return allData.reduce(function(a,d){return a+(d[k]||0);},0);};
+  var inC=sF('aiInlineChars'),chC=sF('aiChatChars'),inL=sF('aiInlineLines'),chL=sF('aiChatLines');
+  var nf=function(n){return Math.round(n).toLocaleString();};
+  var tot=inC+chC;
+  if(tot===0)return'';
+  var iP=tot>0?inC/tot*100:0,cP=tot>0?chC/tot*100:0;
+  return'<div style="margin-top:6px;padding-top:14px;border-top:1px solid var(--vscode-panel-border)">'
+    +'<div style="font-size:.8em;text-transform:uppercase;letter-spacing:.05em;color:var(--vscode-descriptionForeground);margin-bottom:8px">\\uD83E\\uDD16 AI source split \\u2014 inline completions vs chat / agent</div>'
+    +'<div class="mb" style="width:100%;height:10px;margin-bottom:8px"><span style="width:'+iP+'%;background:var(--ai)" title="Inline completions"></span><span style="width:'+cP+'%;background:var(--review)" title="Chat / agent"></span></div>'
+    +'<div style="display:flex;gap:18px;font-size:.85em;flex-wrap:wrap">'
+    +'<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--ai);margin-right:5px"></span>Inline completions: <strong>'+iP.toFixed(0)+'%</strong> \\u00b7 '+nf(inC)+' chars \\u00b7 +'+nf(inL)+' lines</span>'
+    +'<span><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:var(--review);margin-right:5px"></span>Chat / agent: <strong>'+cP.toFixed(0)+'%</strong> \\u00b7 '+nf(chC)+' chars \\u00b7 +'+nf(chL)+' lines</span>'
+    +'</div></div>';
 }
 function renderOverview(){
   const el=document.getElementById('overview');
@@ -263,6 +301,7 @@ function renderOverview(){
     +scd('\\uD83D\\uDCAC Chat tokens','~'+nf(chTok),'prompts typed','var(--review)')
     +scd('\\uD83D\\uDD22 Total tokens','~'+nf(totTok),'~'+CPT+' chars/token','var(--cost)')
     +'</div>'
+    +aiSplitHtml()
     +'<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">Token estimates use a ~'+CPT+'-chars-per-token heuristic on inserted text \\u2014 a rough proxy for prompt/output size, not billed credits.</p></div>';
   el.innerHTML=hdr+'<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div><div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>    '+rows+'</tbody></table>'+hot+kt;
   var labels=allData.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
@@ -463,6 +502,7 @@ window.addEventListener('message',function(e){
     if(msg.ghMetrics!==undefined)ghMetrics=msg.ghMetrics;
     if(msg.config!==undefined&&msg.config)CFG=msg.config;
     if(msg.analytics!==undefined&&msg.analytics)AN=msg.analytics;
+    if(msg.billing!==undefined)BL=msg.billing;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();

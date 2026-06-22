@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "publisher": "AlexanderErdelyi",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -46,6 +46,10 @@
       {
         "command": "aiEffortTracker.exportCsv",
         "title": "AI Effort Tracker: Export Daily Activity (CSV)"
+      },
+      {
+        "command": "aiEffortTracker.importCredits",
+        "title": "AI Effort Tracker: Import Copilot Premium-Request Usage"
       }
     ],
     "configuration": {
