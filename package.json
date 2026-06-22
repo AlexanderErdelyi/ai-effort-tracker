@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "AlexanderErdelyi",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -18,6 +18,14 @@
       {
         "command": "aiEffortTracker.setMode",
         "title": "AI Effort Tracker: Set Tracking Mode"
+      },
+      {
+        "command": "aiEffortTracker.logCredits",
+        "title": "AI Effort Tracker: Log Credits Used"
+      },
+      {
+        "command": "aiEffortTracker.logChatTurn",
+        "title": "AI Effort Tracker: Log a Chat Turn"
       },
       {
         "command": "aiEffortTracker.startSession",
@@ -49,6 +57,21 @@
           "type": "number",
           "default": 5,
           "description": "Keep counting 'AI Generating' for this many seconds after the last Copilot/agent write."
+        },
+        "aiEffortTracker.baselineLocPerMinute": {
+          "type": "number",
+          "default": 5,
+          "description": "Your baseline hand-coding speed (lines of code per minute) used to estimate time saved by AI."
+        },
+        "aiEffortTracker.hourlyRateUsd": {
+          "type": "number",
+          "default": 80,
+          "description": "Developer hourly cost in USD, used to value the time saved (ROI)."
+        },
+        "aiEffortTracker.usdPerCredit": {
+          "type": "number",
+          "default": 0.04,
+          "description": "USD cost per Copilot premium request (credit), used to estimate AI spend."
         },
         "aiEffortTracker.azureDevOpsOrg": {
           "type": "string",

@@ -16,6 +16,26 @@ let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
 const ghService = new GitHubService();
 
+interface InsightsConfig {
+  baselineLocPerMinute: number;
+  hourlyRateUsd: number;
+  usdPerCredit: number;
+}
+
+function getInsightsConfig(): InsightsConfig {
+  const c = vscode.workspace.getConfiguration('aiEffortTracker');
+  return {
+    baselineLocPerMinute: c.get<number>('baselineLocPerMinute') ?? 5,
+    hourlyRateUsd: c.get<number>('hourlyRateUsd') ?? 80,
+    usdPerCredit: c.get<number>('usdPerCredit') ?? 0.04,
+  };
+}
+
+const KNOWN_MODELS = [
+  'Claude Opus 4.8', 'Claude Sonnet 4.6', 'GPT-5', 'GPT-4o',
+  'o1', 'Gemini 2.5 Pro', 'Other'
+];
+
 export function activate(context: vscode.ExtensionContext) {
   db = new Database(context.globalStorageUri.fsPath);
   statusBar = new StatusBarManager();
@@ -42,6 +62,30 @@ export function activate(context: vscode.ExtensionContext) {
         timeTracker.setModeManual(picked.mode);
         vscode.window.showInformationMessage(`AI Effort Tracker: mode set to ${picked.mode}`);
       }
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.logCredits', async () => {
+      const branch = await GitTracker.getCurrentBranch() ?? timeTracker.getBranch();
+      const model = await vscode.window.showQuickPick(KNOWN_MODELS, {
+        placeHolder: 'Which model did you use?'
+      });
+      if (!model) return;
+      const input = await vscode.window.showInputBox({
+        prompt: `Credits used on "${branch}" with ${model} (number shown in the chat response)`,
+        placeHolder: 'e.g. 272.3',
+        validateInput: v => (v && !isNaN(parseFloat(v))) ? null : 'Enter a number'
+      });
+      if (input == null) return;
+      const credits = parseFloat(input);
+      db.recordCredits(branch, model, credits);
+      vscode.window.showInformationMessage(
+        `Logged ${credits} credits (${model}) on ${branch}.`
+      );
+      refreshDashboard();
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.logChatTurn', async () => {
+      const branch = await GitTracker.getCurrentBranch() ?? timeTracker.getBranch();
+      db.recordChatTurn(branch);
+      refreshDashboard();
     }),
     vscode.commands.registerCommand('aiEffortTracker.startSession', () => {
       timeTracker.startTracking();
@@ -87,7 +131,14 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   const branch = await GitTracker.getCurrentBranch() ?? 'unknown';
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig());
+
+  dashboardPanel.webview.onDidReceiveMessage(async (m) => {
+    if (m?.type === 'cmd' && m.value) {
+      await vscode.commands.executeCommand('aiEffortTracker.' + m.value);
+      refreshDashboard();
+    }
+  });
 
   // Push live updates every 5 seconds; refresh GitHub metrics every 5 minutes
   let lastGhFetch = Date.now();
@@ -105,13 +156,27 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
       currentBranch,
-      ghMetrics: ghData
+      ghMetrics: ghData,
+      config: getInsightsConfig()
     });
   }, 5000);
 
   dashboardPanel.onDidDispose(() => {
     clearInterval(refreshInterval);
     dashboardPanel = undefined;
+  });
+}
+
+/** Push an immediate refresh to the dashboard (e.g. after logging credits). */
+function refreshDashboard() {
+  if (!dashboardPanel) return;
+  GitTracker.getCurrentBranch().then(b => {
+    dashboardPanel?.webview.postMessage({
+      type: 'update',
+      summaries: db.getAllBranchesSummaries(),
+      currentBranch: b ?? 'unknown',
+      config: getInsightsConfig()
+    });
   });
 }
 

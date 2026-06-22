@@ -2,16 +2,24 @@ import type { BranchSummary } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics } from '../services/githubService';
 
+export interface InsightsConfig {
+  baselineLocPerMinute: number;
+  hourlyRateUsd: number;
+  usdPerCredit: number;
+}
+
 export function renderDashboardHtml(
   summaries: BranchSummary[],
   currentBranch: string,
   nonce: string,
-  ghMetrics: CopilotMetrics | null = null
+  ghMetrics: CopilotMetrics | null = null,
+  config: InsightsConfig = { baselineLocPerMinute: 5, hourlyRateUsd: 80, usdPerCredit: 0.04 }
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
   const catLabels = JSON.stringify(CATEGORY_LABELS);
   const ghData = JSON.stringify(ghMetrics);
+  const cfgData = JSON.stringify(config);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -61,6 +69,7 @@ let allData=${data};
 let currentBranch=${current};
 const CAT=${catLabels};
 let ghMetrics=${ghData};
+let CFG=${cfgData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -73,6 +82,24 @@ function tms(d){return d.humanCodingMs+d.aiGeneratingMs+d.reviewingMs;}
 function pp(n,c){return n>0?'<span class="badge '+c+'">+'+n+'</span>':'';}
 function pm(n){return n>0?'<span class="badge bd">-'+n+'</span>':'';}
 function dc(k){if(charts[k]){charts[k].destroy();delete charts[k];}}
+function insights(d){
+  var activeMs=d.humanCodingMs+d.aiGeneratingMs+d.reviewingMs;
+  var activeMin=activeMs/60000;
+  var aiNet=d.linesAiAdded||0, humanNet=d.linesHumanAdded||0;
+  var totalNet=aiNet+humanNet;
+  var aiShare=totalNet>0?(aiNet/totalNet*100):0;
+  var velocity=activeMin>0?(totalNet/activeMin):0;
+  var base=CFG.baselineLocPerMinute>0?CFG.baselineLocPerMinute:5;
+  var manualEquivMin=totalNet/base;
+  var timeSavedMin=manualEquivMin-activeMin;
+  var credits=d.creditsTotal||0;
+  var aiCost=credits*CFG.usdPerCredit;
+  var savedValue=(timeSavedMin/60)*CFG.hourlyRateUsd;
+  var roi=savedValue-aiCost;
+  return {activeMin:activeMin,totalNet:totalNet,aiNet:aiNet,humanNet:humanNet,aiShare:aiShare,velocity:velocity,manualEquivMin:manualEquivMin,timeSavedMin:timeSavedMin,credits:credits,aiCost:aiCost,savedValue:savedValue,roi:roi,chatTurns:d.chatTurnsHuman||0,chatChars:d.chatCharsHuman||0};
+}
+function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
+function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
 
 function renderGhMetrics(){
   const el=document.getElementById('ghview');
@@ -184,8 +211,37 @@ function showDetail(branch){
   var catRows=Object.entries(d.byCategory||{}).map(function(e){var cat=e[0],s=e[1],ta=s.human.added+s.ai.added,pct=ta>0?((s.ai.added/ta)*100).toFixed(0):0;return'<tr><td>'+(CAT[cat]||cat)+'</td><td class="dc">'+pp(s.human.added,'bp')+' '+pm(s.human.deleted)+'</td><td class="dc">'+pp(s.ai.added,'ba')+' '+pm(s.ai.deleted)+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';}).join('');
   var tot=tms(d);
   var timeRows=[['\\u2328\\ufe0f Human Coding',d.humanCodingMs,'var(--human)'],['\\uD83E\\uDD16 AI Generating',d.aiGeneratingMs,'var(--ai)'],['\\uD83D\\uDC40 Reviewing',d.reviewingMs,'var(--review)'],['\\u2615 Idle',d.idleMs,'var(--idle)']].map(function(r){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>'+r[0]+'</span><strong style="color:'+r[2]+'">'+fmt(r[1])+'</strong></div>';}).join('');
-  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div class="dtabs"><button class="dtab active" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-time" class="ds active"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>';
-  dc('donut');
+  var I=insights(d);
+  var byModel=d.creditsByModel||[];
+  var modelRows=byModel.map(function(r){return'<tr><td>'+r.model+'</td><td class="dc">'+r.credits.toFixed(1)+'</td><td class="dc">$'+(r.credits*CFG.usdPerCredit).toFixed(2)+'</td></tr>';}).join('')||'<tr><td colspan="3" style="color:var(--vscode-descriptionForeground)">No credits logged yet \\u2014 use \\u201cAI Effort Tracker: Log Credits Used\\u201d</td></tr>';
+  var savedColor=I.timeSavedMin>=0?'var(--added)':'var(--deleted)';
+  var roiColor=I.roi>=0?'var(--added)':'var(--deleted)';
+  var insHtml='<div class="sg">'
+    +sc('AI Share of Lines',I.aiShare.toFixed(0)+'%','var(--ai)')
+    +sc('Velocity',I.velocity.toFixed(1)+' loc/min','var(--human)')
+    +sc('Net Lines',(I.totalNet>=0?'+':'')+I.totalNet,'var(--vscode-foreground)')
+    +sc('Active Time',fmtMin(I.activeMin),'var(--review)')
+    +'</div>'
+    +'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDE80 Productivity Story</h3>'
+    +'<p style="line-height:1.7;margin-top:8px">In <strong>'+fmtMin(I.activeMin)+'</strong> of active work you produced <strong>'+I.totalNet+'</strong> net lines '
+    +'(<strong style="color:var(--ai)">'+I.aiShare.toFixed(0)+'%</strong> from AI) at <strong>'+I.velocity.toFixed(1)+' loc/min</strong>. '
+    +'At a manual baseline of <strong>'+CFG.baselineLocPerMinute+' loc/min</strong> the same output would take <strong>'+fmtMin(I.manualEquivMin)+'</strong>, '
+    +'so AI saved about <strong style="color:'+savedColor+'">'+fmtMin(I.timeSavedMin)+'</strong>.</p></div>'
+    +'<div class="sg" style="margin-top:16px">'
+    +sc('Manual-Equiv Time',fmtMin(I.manualEquivMin),'var(--review)')
+    +sc('Time Saved',fmtMin(I.timeSavedMin),savedColor)
+    +sc('Value of Time Saved','$'+I.savedValue.toFixed(2),savedColor)
+    +sc('Chat Turns',String(I.chatTurns),'var(--human)')
+    +'</div>'
+    +'<div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><h3>\\uD83D\\uDCB0 Credits & Cost</h3><button class="dtab" data-action="cmd" data-value="logCredits">+ Log Credits</button></div>'
+    +'<div class="sg" style="margin-top:12px">'
+    +sc('Credits Used',I.credits.toFixed(1),'var(--cost)')
+    +sc('AI Spend','$'+I.aiCost.toFixed(2),'var(--cost)')
+    +sc('Net ROI','$'+I.roi.toFixed(2),roiColor)
+    +'</div>'
+    +'<table style="margin-top:14px"><thead><tr><th>Model</th><th>Credits</th><th>Cost</th></tr></thead><tbody>'+modelRows+'</tbody></table>'
+    +'<p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">ROI = (value of time saved) \\u2212 (AI spend). Tune <code>baselineLocPerMinute</code>, <code>hourlyRateUsd</code>, <code>usdPerCredit</code> in settings.</p></div>';
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>';  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
 }
@@ -203,6 +259,7 @@ function showDS(id,btn){
   document.getElementById('ds-'+id).classList.add('active');
   btn.classList.add('active');
   if(id==='lines'){var bn=document.getElementById('dtab').textContent;var d=allData.find(function(x){return x.branch===bn||bn.startsWith(x.branch.slice(0,16));});if(d)renderLinesChart(d);}
+  if(id==='time'&&charts.donut)charts.donut.resize();
 }
 
 function showTab(name){
@@ -219,9 +276,11 @@ window.addEventListener('message',function(e){
   if(msg.type==='update'){
     allData=msg.summaries;currentBranch=msg.currentBranch;
     if(msg.ghMetrics!==undefined)ghMetrics=msg.ghMetrics;
+    if(msg.config!==undefined&&msg.config)CFG=msg.config;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='ghview')renderGhMetrics();
+    else if(av&&av.id==='detail'){var dt=document.getElementById('dtab');if(dt&&dt.dataset.branch)showDetail(dt.dataset.branch);}
   }
 });
 
@@ -240,6 +299,7 @@ document.addEventListener('click',function(e){
   if(a==='detail')showDetail(v);
   else if(a==='tab')showTab(v);
   else if(a==='ds')showDS(v,t);
+  else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
 });`;
 
   return [

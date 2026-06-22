@@ -28,10 +28,20 @@ export interface BranchSummary {
   copilotAcceptances: number;
   estimatedCostUsd: number;
   chatCharsHuman: number;
+  chatTurnsHuman: number;
+  creditsTotal: number;
+  creditsByModel: { model: string; credits: number; turns: number }[];
   // Breakdown by file extension: { "al": { human: {...}, ai: {...} }, ... }
   byExt: Record<string, ExtStats>;
   // Breakdown by category (code/spec/config/other)
   byCategory: Record<FileCategory, { human: LineStats; ai: LineStats }>;
+}
+
+export interface CreditEntry {
+  ts: number;
+  model: string;
+  credits: number;
+  note?: string;
 }
 
 interface BranchData {
@@ -39,6 +49,8 @@ interface BranchData {
   time: Record<TrackingMode, number>;
   copilotAcceptances: number;
   chatCharsHuman?: number;
+  chatTurnsHuman?: number;
+  creditsLog?: CreditEntry[];
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
@@ -158,6 +170,21 @@ export class Database {
     this.save();
   }
 
+  /** A "chat turn" = one human message sent to the AI (interaction count). */
+  recordChatTurn(branch: string) {
+    const data = this.ensureBranch(branch);
+    data.chatTurnsHuman = (data.chatTurnsHuman ?? 0) + 1;
+    this.save();
+  }
+
+  recordCredits(branch: string, model: string, credits: number, note?: string) {
+    const data = this.ensureBranch(branch);
+    if (!data.creditsLog) data.creditsLog = [];
+    data.creditsLog.push({ ts: Date.now(), model, credits, note });
+    data.chatTurnsHuman = (data.chatTurnsHuman ?? 0) + 1;
+    this.save();
+  }
+
   setWorkItemForBranch(branch: string, workItemId: string) {
     const data = this.ensureBranch(branch);
     data.workItemId = workItemId;
@@ -204,6 +231,9 @@ export class Database {
       copilotAcceptances: data.copilotAcceptances,
       estimatedCostUsd: linesAiAdded * COST_PER_AI_LINE_USD,
       chatCharsHuman: data.chatCharsHuman ?? 0,
+      chatTurnsHuman: data.chatTurnsHuman ?? 0,
+      creditsTotal: (data.creditsLog ?? []).reduce((a, e) => a + e.credits, 0),
+      creditsByModel: this.aggregateCredits(data.creditsLog ?? []),
       byExt: data.lineChanges,
       byCategory
     };
@@ -215,5 +245,17 @@ export class Database {
 
   getAllBranchesSummaries(): BranchSummary[] {
     return this.getAllBranches().map(b => this.getSummaryForBranch(b));
+  }
+
+  private aggregateCredits(log: CreditEntry[]): { model: string; credits: number; turns: number }[] {
+    const map: Record<string, { credits: number; turns: number }> = {};
+    for (const e of log) {
+      if (!map[e.model]) map[e.model] = { credits: 0, turns: 0 };
+      map[e.model].credits += e.credits;
+      map[e.model].turns += 1;
+    }
+    return Object.entries(map)
+      .map(([model, v]) => ({ model, credits: v.credits, turns: v.turns }))
+      .sort((a, b) => b.credits - a.credits);
   }
 }
