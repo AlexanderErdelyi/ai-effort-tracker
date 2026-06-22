@@ -17,36 +17,64 @@ export class CopilotTracker implements vscode.Disposable {
   private onDocChange(event: vscode.TextDocumentChangeEvent) {
     if (!event.contentChanges.length) return;
     const scheme = event.document.uri.scheme;
-    if (scheme !== 'file' && scheme !== 'untitled') return;
+
+    // Chat / non-file editors: count what the human types into chat, not code.
+    if (scheme !== 'file' && scheme !== 'untitled') {
+      this.maybeRecordChat(event);
+      return;
+    }
 
     const ext = getFileExt(event.document.fileName);
     const branch = this.timeTracker.getBranch();
     const mode = this.timeTracker.getMode();
 
-    let eventIsAi = mode === 'aiGenerating';
-
+    // Aggregate the whole event. A human types ONE small edit at a time;
+    // an agent / Copilot accept / paste arrives as a big or multi-region edit.
+    let insertedChars = 0, insertedLines = 0, deletedLines = 0, deletedChars = 0;
     for (const change of event.contentChanges) {
-      const linesAdded = (change.text.match(/\n/g) ?? []).length;
-      const linesDeleted = change.range.end.line - change.range.start.line;
-
-      // A human types one character per change event. Any single change that
-      // inserts a whole line (or >15 chars at once) is a Copilot inline accept,
-      // an agent/WorkspaceEdit write, or a paste — i.e. not hand-typed.
-      const isAiLike = linesAdded >= 1 || change.text.length > 15;
-      if (isAiLike) eventIsAi = true;
-
-      if (linesAdded === 0 && linesDeleted === 0 && change.text.length < 2) {
-        continue; // ignore single-char keystrokes for line stats
-      }
-
-      const source: 'human' | 'ai' =
-        mode === 'aiGenerating' || isAiLike ? 'ai' : 'human';
-
-      this.db.recordLineChange(branch, ext, source, linesAdded, linesDeleted);
+      insertedChars += change.text.length;
+      insertedLines += (change.text.match(/\n/g) ?? []).length;
+      deletedLines += change.range.end.line - change.range.start.line;
+      deletedChars += change.rangeLength;
     }
+    const changeCount = event.contentChanges.length;
 
-    // Drive the time-mode: every edit is activity; classify the whole event.
-    this.timeTracker.markEdit(eventIsAi ? 'ai' : 'human');
+    // Hand typing = exactly one edit, single line, at most one char in/out
+    // (covers a keystroke and a backspace). Everything else is AI/agent/paste.
+    const looksHandTyped =
+      changeCount === 1 &&
+      insertedLines === 0 && deletedLines === 0 &&
+      insertedChars <= 1 && deletedChars <= 1;
+
+    const source: 'human' | 'ai' =
+      looksHandTyped && mode !== 'aiGenerating' ? 'human' : 'ai';
+
+    if (insertedLines > 0 || deletedLines > 0) {
+      this.db.recordLineChange(branch, ext, source, insertedLines, deletedLines);
+    }
+    this.timeTracker.markEdit(source);
+  }
+
+  /** Best-effort: count characters the human types into the Copilot chat input. */
+  private maybeRecordChat(event: vscode.TextDocumentChangeEvent) {
+    const doc = event.document;
+    const looksLikeChat =
+      doc.languageId === 'github-copilot' ||
+      doc.languageId === 'prompt' ||
+      /chat|copilot|comment|input/i.test(doc.uri.scheme);
+    if (!looksLikeChat) return;
+
+    let typed = 0;
+    for (const change of event.contentChanges) {
+      // Only count net human typing (ignore programmatic clears/inserts)
+      if (change.text.length > 0 && change.text.length <= 4 && !change.text.includes('\n')) {
+        typed += change.text.length;
+      }
+    }
+    if (typed > 0) {
+      this.db.recordChatChars(this.timeTracker.getBranch(), typed);
+      this.timeTracker.markEdit('human');
+    }
   }
 
   dispose() {

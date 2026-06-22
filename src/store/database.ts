@@ -27,6 +27,7 @@ export interface BranchSummary {
   linesAiDeleted: number;
   copilotAcceptances: number;
   estimatedCostUsd: number;
+  chatCharsHuman: number;
   // Breakdown by file extension: { "al": { human: {...}, ai: {...} }, ... }
   byExt: Record<string, ExtStats>;
   // Breakdown by category (code/spec/config/other)
@@ -37,6 +38,7 @@ interface BranchData {
   workItemId: string | null;
   time: Record<TrackingMode, number>;
   copilotAcceptances: number;
+  chatCharsHuman?: number;
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
@@ -150,6 +152,12 @@ export class Database {
     this.save();
   }
 
+  recordChatChars(branch: string, chars: number) {
+    const data = this.ensureBranch(branch);
+    data.chatCharsHuman = (data.chatCharsHuman ?? 0) + chars;
+    this.save();
+  }
+
   setWorkItemForBranch(branch: string, workItemId: string) {
     const data = this.ensureBranch(branch);
     data.workItemId = workItemId;
@@ -195,6 +203,7 @@ export class Database {
       linesAiDeleted,
       copilotAcceptances: data.copilotAcceptances,
       estimatedCostUsd: linesAiAdded * COST_PER_AI_LINE_USD,
+      chatCharsHuman: data.chatCharsHuman ?? 0,
       byExt: data.lineChanges,
       byCategory
     };
