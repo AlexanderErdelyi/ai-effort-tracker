@@ -20,6 +20,8 @@ export interface DashboardAnalytics {
   streak?: { current: number; longest: number };
   week?: { thisWeek: { activeMs: number; lines: number; aiShare: number }; lastWeek: { activeMs: number; lines: number; aiShare: number } };
   todayActiveMs?: number;
+  topFiles?: { path: string; human: number; ai: number; edits: number; total: number; aiShare: number; lastTs: number }[];
+  timeline?: { humanCoding: number[]; aiGenerating: number[]; reviewing: number[] };
 }
 
 export function renderDashboardHtml(
@@ -231,7 +233,14 @@ function renderOverview(){
     +scd('This Week Lines','+'+wk.thisWeek.lines,dlt(wk.thisWeek.lines,wk.lastWeek.lines)+' vs last','var(--human)')
     +scd('This Week AI Share',wk.thisWeek.aiShare.toFixed(0)+'%',dlt(wk.thisWeek.aiShare,wk.lastWeek.aiShare)+' vs last','var(--ai)')
     +'</div>';
-  el.innerHTML=hdr+'<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div><div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  var tf=(AN&&AN.topFiles)||[];
+  var hotRows=tf.map(function(f){
+    var p=f.path.length>48?'\\u2026'+f.path.slice(-46):f.path;
+    var pct=f.aiShare.toFixed(0);
+    return'<tr><td title="'+f.path+'" style="font-family:monospace;font-size:.85em">'+p+'</td><td>'+f.edits+'</td><td class="dc">'+pp(f.human,'bp')+'</td><td class="dc">'+pp(f.ai,'ba')+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';
+  }).join('')||'<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No file edits recorded yet</td></tr>';
+  var hot='<div class="card" style="margin-top:24px"><h3>\\uD83D\\uDD25 Most-Edited Files (hotspots)</h3><table style="margin-top:8px"><thead><tr><th>File</th><th>Edits</th><th>Human +</th><th>AI +</th><th>AI %</th></tr></thead><tbody>'+hotRows+'</tbody></table></div>';
+  el.innerHTML=hdr+'<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div><div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>  '+rows+'</tbody></table>'+hot;
   var labels=allData.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
   dc('bar');
   charts.bar=new Chart(document.getElementById('cBar'),{type:'bar',data:{labels:labels,datasets:[{label:'Human',data:allData.map(function(d){return Math.round(d.humanCodingMs/60000);}),backgroundColor:'rgba(78,201,176,.7)'},{label:'AI Gen',data:allData.map(function(d){return Math.round(d.aiGeneratingMs/60000);}),backgroundColor:'rgba(197,134,192,.7)'},{label:'Review',data:allData.map(function(d){return Math.round(d.reviewingMs/60000);}),backgroundColor:'rgba(220,220,170,.7)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()}}}}});
@@ -322,6 +331,7 @@ function renderFocus(){
     +'<div class="cr" style="margin-top:8px"><div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center"><h3>Daily Focus Goal</h3>'+ring
     +'<p style="margin-top:14px;text-align:center;font-size:.9em">'+goalDoneMin+' min of '+goal+' min goal</p></div>'
     +'<div class="card"><h3>Most Productive Hours (all history)</h3><div class="cw" style="height:200px"><canvas id="cHours"></canvas></div></div></div>'
+    +'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDCC5 Today\\u2019s Timeline &mdash; activity by hour</h3><div class="cw" style="height:160px"><canvas id="cTimeline"></canvas></div><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Active minutes per hour today, split by Human / AI / Review.</p></div>'
     +'<div class="card" style="margin-top:16px"><h3>This Week</h3><div class="sg" style="margin-top:4px">'
     +sc('Focus Time (7d)',fmt(f.totalFocusMsWeek||0),'var(--human)')
     +sc('Sessions (7d)',String(f.sessionsWeek||0),'var(--vscode-foreground)')
@@ -336,6 +346,17 @@ function renderFocus(){
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
       scales:{x:{ticks:{color:dfg()},grid:{display:false},title:{display:true,text:'hour of day',color:dfg()}},
         y:{ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'min',color:dfg()}}}}});
+  var tl=AN.timeline||{humanCoding:[],aiGenerating:[],reviewing:[]};
+  var toMin=function(arr){return(arr||[]).map(function(v){return +((v||0)/60000).toFixed(1);});};
+  dc('timeline');
+  charts.timeline=new Chart(document.getElementById('cTimeline'),{type:'bar',
+    data:{labels:Array.from({length:24},function(_,h){return h;}),
+      datasets:[{label:'Human',data:toMin(tl.humanCoding),backgroundColor:'rgba(78,201,176,.8)'},
+        {label:'AI',data:toMin(tl.aiGenerating),backgroundColor:'rgba(197,134,192,.8)'},
+        {label:'Review',data:toMin(tl.reviewing),backgroundColor:'rgba(220,220,170,.8)'}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},
+      scales:{x:{stacked:true,ticks:{color:dfg()},grid:{display:false},title:{display:true,text:'hour of day',color:dfg()}},
+        y:{stacked:true,ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'min',color:dfg()}}}}});
 }
 
 function showDetail(branch){

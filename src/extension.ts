@@ -43,6 +43,8 @@ function getAnalytics() {
     streak: db.getStreak(),
     week: db.getWeekComparison(),
     todayActiveMs: db.getTodayActiveMs(),
+    topFiles: db.getTopFiles(12),
+    timeline: db.getTodayTimeline(),
   };
 }
 

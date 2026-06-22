@@ -54,6 +54,18 @@ export interface DailyBucket {
   linesAi: number;
   /** Active ms per hour-of-day (0-23) — drives the activity heatmap. */
   hours: number[];
+  /** Active ms per hour-of-day split by mode — drives the today timeline. */
+  hoursByMode?: { humanCoding: number[]; aiGenerating: number[]; reviewing: number[] };
+}
+
+/** Cumulative edit stats for a single file (hotspots). */
+export interface FileStat {
+  humanAdded: number;
+  humanDeleted: number;
+  aiAdded: number;
+  aiDeleted: number;
+  edits: number;
+  lastTs: number;
 }
 
 /** A completed uninterrupted focus/flow session. */
@@ -101,6 +113,22 @@ export interface WeekComparison {
   lastWeek: WeekAgg;
 }
 
+export interface TopFile {
+  path: string;
+  human: number;
+  ai: number;
+  edits: number;
+  total: number;
+  aiShare: number;
+  lastTs: number;
+}
+
+export interface TodayTimeline {
+  humanCoding: number[];
+  aiGenerating: number[];
+  reviewing: number[];
+}
+
 interface BranchData {
   workItemId: string | null;
   time: Record<TrackingMode, number>;
@@ -110,6 +138,7 @@ interface BranchData {
   creditsLog?: CreditEntry[];
   daily?: Record<string, DailyBucket>;
   focusSessions?: FocusSession[];
+  files?: Record<string, FileStat>;
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
@@ -127,7 +156,12 @@ function dayKey(ts: number = Date.now()): string {
 function emptyBucket(): DailyBucket {
   return {
     humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0,
-    linesHuman: 0, linesAi: 0, hours: new Array(24).fill(0)
+    linesHuman: 0, linesAi: 0, hours: new Array(24).fill(0),
+    hoursByMode: {
+      humanCoding: new Array(24).fill(0),
+      aiGenerating: new Array(24).fill(0),
+      reviewing: new Array(24).fill(0)
+    }
   };
 }
 
@@ -217,6 +251,13 @@ export class Database {
     if (!data.daily[key]) data.daily[key] = emptyBucket();
     const b = data.daily[key];
     if (!b.hours || b.hours.length !== 24) b.hours = new Array(24).fill(0);
+    if (!b.hoursByMode) {
+      b.hoursByMode = {
+        humanCoding: new Array(24).fill(0),
+        aiGenerating: new Array(24).fill(0),
+        reviewing: new Array(24).fill(0)
+      };
+    }
     return b;
   }
 
@@ -229,6 +270,8 @@ export class Database {
     if (mode !== 'idle') {
       const hour = new Date(now).getHours();
       bucket.hours[hour] = (bucket.hours[hour] ?? 0) + durationMs;
+      const hbm = bucket.hoursByMode![mode];
+      if (hbm) hbm[hour] = (hbm[hour] ?? 0) + durationMs;
     }
     this.save();
   }
@@ -250,7 +293,8 @@ export class Database {
     ext: string,
     source: 'human' | 'ai',
     linesAdded: number,
-    linesDeleted: number
+    linesDeleted: number,
+    filePath?: string
   ) {
     const data = this.ensureBranch(branch);
     if (!data.lineChanges[ext]) {
@@ -265,6 +309,18 @@ export class Database {
       bucket.linesAi += linesAdded;
     } else {
       bucket.linesHuman += linesAdded;
+    }
+
+    if (filePath) {
+      if (!data.files) data.files = {};
+      if (!data.files[filePath]) {
+        data.files[filePath] = { humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: 0 };
+      }
+      const f = data.files[filePath];
+      if (source === 'ai') { f.aiAdded += linesAdded; f.aiDeleted += linesDeleted; }
+      else { f.humanAdded += linesAdded; f.humanDeleted += linesDeleted; }
+      f.edits += 1;
+      f.lastTs = Date.now();
     }
     this.save();
   }
@@ -477,6 +533,48 @@ export class Database {
       return { activeMs: active, lines, aiShare: lines > 0 ? (la / lines) * 100 : 0 };
     };
     return { thisWeek: agg(series.slice(cut)), lastWeek: agg(series.slice(0, cut)) };
+  }
+
+  /** Most-edited files across all branches (hotspots), ranked by lines touched. */
+  getTopFiles(limit: number = 12): TopFile[] {
+    const map: Record<string, FileStat> = {};
+    for (const branch of Object.values(this.store)) {
+      for (const [p, f] of Object.entries(branch.files ?? {})) {
+        if (!map[p]) map[p] = { humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: 0 };
+        const m = map[p];
+        m.humanAdded += f.humanAdded; m.humanDeleted += f.humanDeleted;
+        m.aiAdded += f.aiAdded; m.aiDeleted += f.aiDeleted;
+        m.edits += f.edits;
+        if (f.lastTs > m.lastTs) m.lastTs = f.lastTs;
+      }
+    }
+    return Object.entries(map)
+      .map(([path, f]) => {
+        const human = f.humanAdded, ai = f.aiAdded, total = human + ai;
+        return { path, human, ai, edits: f.edits, total, aiShare: total > 0 ? (ai / total) * 100 : 0, lastTs: f.lastTs };
+      })
+      .sort((a, b) => b.total - a.total)
+      .slice(0, limit);
+  }
+
+  /** Today's active ms per hour, split by mode — drives the timeline ribbon. */
+  getTodayTimeline(): TodayTimeline {
+    const key = dayKey();
+    const out: TodayTimeline = {
+      humanCoding: new Array(24).fill(0),
+      aiGenerating: new Array(24).fill(0),
+      reviewing: new Array(24).fill(0)
+    };
+    for (const branch of Object.values(this.store)) {
+      const b = branch.daily?.[key];
+      if (!b?.hoursByMode) continue;
+      for (let h = 0; h < 24; h++) {
+        out.humanCoding[h] += b.hoursByMode.humanCoding?.[h] ?? 0;
+        out.aiGenerating[h] += b.hoursByMode.aiGenerating?.[h] ?? 0;
+        out.reviewing[h] += b.hoursByMode.reviewing?.[h] ?? 0;
+      }
+    }
+    return out;
   }
 
   private aggregateCredits(log: CreditEntry[]): { model: string; credits: number; turns: number }[] {
