@@ -37,6 +37,7 @@ export class TimeTracker implements vscode.Disposable {
   private focusMs = 0;
   private focusHumanMs = 0;
   private focusAiMs = 0;
+  private statusTick = 0;
 
   constructor(private db: Database, private statusBar: StatusBarManager) {}
 
@@ -142,6 +143,12 @@ export class TimeTracker implements vscode.Disposable {
       this.endFocusSession();
     }
     this.setMode(this.computeMode(now));
+
+    // Refresh the "today / goal" status bar item every ~5s (cheap aggregation).
+    if (++this.statusTick % 5 === 0) {
+      const goal = vscode.workspace.getConfiguration('aiEffortTracker').get<number>('dailyActiveGoalMinutes') ?? 240;
+      this.statusBar.updateToday(this.db.getTodayActiveMs(), goal);
+    }
   }
 
   /** Accrue continuous active time; flush a focus session when work pauses. */

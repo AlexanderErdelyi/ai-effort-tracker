@@ -40,6 +40,9 @@ function getAnalytics() {
     daily: db.getDailySeries(90),
     heatmap: db.getHourHeatmap(),
     focus: db.getFocusStats(goal),
+    streak: db.getStreak(),
+    week: db.getWeekComparison(),
+    todayActiveMs: db.getTodayActiveMs(),
   };
 }
 
@@ -99,6 +102,8 @@ export function activate(context: vscode.ExtensionContext) {
       db.recordChatTurn(branch);
       refreshDashboard();
     }),
+    vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
+    vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
     vscode.commands.registerCommand('aiEffortTracker.startSession', () => {
       timeTracker.startTracking();
       vscode.window.showInformationMessage('AI Effort Tracker: Tracking started.');
@@ -192,6 +197,93 @@ function refreshDashboard() {
       analytics: getAnalytics()
     });
   });
+}
+
+function fmtDuration(ms: number): string {
+  const min = Math.round(ms / 60000);
+  const h = Math.floor(min / 60);
+  return h > 0 ? `${h}h ${min % 60}m` : `${min}m`;
+}
+
+function pctDelta(now: number, prev: number): string {
+  if (prev === 0) return now > 0 ? '▲ new' : '–';
+  const d = ((now - prev) / prev) * 100;
+  const arrow = d > 0 ? '▲' : d < 0 ? '▼' : '–';
+  return `${arrow} ${Math.abs(d).toFixed(0)}%`;
+}
+
+async function generateWeeklyReport(db: Database) {
+  const w = db.getWeekComparison();
+  const focus = db.getFocusStats(getInsightsConfig().dailyActiveGoalMinutes);
+  const streak = db.getStreak();
+  const series = db.getDailySeries(7);
+  const summaries = db.getAllBranchesSummaries();
+  const cfg = getInsightsConfig();
+
+  const totLinesAi = summaries.reduce((a, s) => a + s.linesAiAdded, 0);
+  const totLinesHuman = summaries.reduce((a, s) => a + s.linesHumanAdded, 0);
+  const credits = summaries.reduce((a, s) => a + (s.creditsTotal || 0), 0);
+
+  const lines: string[] = [];
+  lines.push('# AI Effort Tracker — Weekly Report');
+  lines.push('');
+  lines.push(`_Generated ${new Date().toLocaleString()}_`);
+  lines.push('');
+  lines.push('## This Week vs Last Week');
+  lines.push('');
+  lines.push('| Metric | This Week | Last Week | Change |');
+  lines.push('| --- | --- | --- | --- |');
+  lines.push(`| Active time | ${fmtDuration(w.thisWeek.activeMs)} | ${fmtDuration(w.lastWeek.activeMs)} | ${pctDelta(w.thisWeek.activeMs, w.lastWeek.activeMs)} |`);
+  lines.push(`| Lines written | ${w.thisWeek.lines} | ${w.lastWeek.lines} | ${pctDelta(w.thisWeek.lines, w.lastWeek.lines)} |`);
+  lines.push(`| AI share | ${w.thisWeek.aiShare.toFixed(0)}% | ${w.lastWeek.aiShare.toFixed(0)}% | ${pctDelta(w.thisWeek.aiShare, w.lastWeek.aiShare)} |`);
+  lines.push('');
+  lines.push('## Focus & Consistency');
+  lines.push('');
+  lines.push(`- **Coding streak:** ${streak.current} day(s) (longest ${streak.longest})`);
+  lines.push(`- **Focus this week:** ${fmtDuration(focus.totalFocusMsWeek)} across ${focus.sessionsWeek} session(s)`);
+  lines.push(`- **Longest focus session:** ${fmtDuration(focus.longestMs)}`);
+  lines.push('');
+  lines.push('## Daily Active Time (last 7 days)');
+  lines.push('');
+  lines.push('| Day | Active | Lines | AI % |');
+  lines.push('| --- | --- | --- | --- |');
+  for (const d of series) {
+    const active = d.humanCoding + d.aiGenerating + d.reviewing;
+    const lns = d.linesHuman + d.linesAi;
+    const ai = lns > 0 ? Math.round((d.linesAi / lns) * 100) : 0;
+    lines.push(`| ${d.date} | ${fmtDuration(active)} | ${lns} | ${ai}% |`);
+  }
+  lines.push('');
+  lines.push('## AI Contribution');
+  lines.push('');
+  const totLines = totLinesAi + totLinesHuman;
+  const aiShareAll = totLines > 0 ? Math.round((totLinesAi / totLines) * 100) : 0;
+  lines.push(`- **AI-written lines (all time):** ${totLinesAi} (${aiShareAll}% of ${totLines})`);
+  lines.push(`- **Human-written lines (all time):** ${totLinesHuman}`);
+  lines.push(`- **Credits logged:** ${credits.toFixed(1)} (~$${(credits * cfg.usdPerCredit).toFixed(2)})`);
+  lines.push('');
+
+  const doc = await vscode.workspace.openTextDocument({ content: lines.join('\n'), language: 'markdown' });
+  await vscode.window.showTextDocument(doc);
+}
+
+async function exportCsv(db: Database) {
+  const series = db.getDailySeries(90);
+  const rows = ['date,human_ms,ai_ms,review_ms,idle_ms,active_ms,lines_human,lines_ai,ai_share_pct'];
+  for (const d of series) {
+    const active = d.humanCoding + d.aiGenerating + d.reviewing;
+    const lns = d.linesHuman + d.linesAi;
+    const ai = lns > 0 ? ((d.linesAi / lns) * 100).toFixed(1) : '0';
+    rows.push([d.date, d.humanCoding, d.aiGenerating, d.reviewing, d.idle, active, d.linesHuman, d.linesAi, ai].join(','));
+  }
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file('ai-effort-daily.csv'),
+    filters: { CSV: ['csv'] }
+  });
+  if (uri) {
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(rows.join('\n'), 'utf8'));
+    vscode.window.showInformationMessage(`Daily activity exported to ${uri.fsPath}`);
+  }
 }
 
 async function exportReport(db: Database, tracker: TimeTracker) {

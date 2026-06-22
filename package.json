@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "AlexanderErdelyi",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -38,6 +38,14 @@
       {
         "command": "aiEffortTracker.exportReport",
         "title": "AI Effort Tracker: Export Report (JSON)"
+      },
+      {
+        "command": "aiEffortTracker.weeklyReport",
+        "title": "AI Effort Tracker: Weekly Report (Markdown)"
+      },
+      {
+        "command": "aiEffortTracker.exportCsv",
+        "title": "AI Effort Tracker: Export Daily Activity (CSV)"
       }
     ],
     "configuration": {

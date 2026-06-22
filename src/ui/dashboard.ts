@@ -17,6 +17,9 @@ export interface DashboardAnalytics {
     totalFocusMsToday: number; totalFocusMsWeek: number;
     longestMs: number; avgMs: number; goalProgressPct: number;
   };
+  streak?: { current: number; longest: number };
+  week?: { thisWeek: { activeMs: number; lines: number; aiShare: number }; lastWeek: { activeMs: number; lines: number; aiShare: number } };
+  todayActiveMs?: number;
 }
 
 export function renderDashboardHtml(
@@ -216,7 +219,19 @@ function renderOverview(){
     var tot=tms(d),hp=tot>0?d.humanCodingMs/tot*100:0,ap=tot>0?d.aiGeneratingMs/tot*100:0,rp=tot>0?d.reviewingMs/tot*100:0,isCur=d.branch===currentBranch;
     return '<tr class="'+(isCur?'cur':'')+'" style="cursor:pointer" data-action="detail" data-value="'+d.branch+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+d.branch+'</strong></td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
   }).join('');
-  el.innerHTML='<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div><div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  var AS=AN||{};var stk=AS.streak||{current:0,longest:0};var wk=AS.week||{thisWeek:{activeMs:0,lines:0,aiShare:0},lastWeek:{activeMs:0,lines:0,aiShare:0}};
+  function dlt(n,p){if(p===0)return n>0?'<span style="color:var(--added)">\\u25b2 new</span>':'';var d=(n-p)/p*100;var up=d>=0;return'<span style="color:'+(up?'var(--added)':'var(--deleted)')+'">'+(up?'\\u25b2':'\\u25bc')+' '+Math.abs(d).toFixed(0)+'%</span>';}
+  function scd(lbl,val,sub,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div><div style="font-size:.75em;margin-top:2px">'+sub+'</div></div>';}
+  var hdr='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px">'
+    +'<div class="sub" style="margin:0">This week vs last week \\u00b7 streak \\u00b7 totals</div>'
+    +'<div style="display:flex;gap:6px"><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>'
+    +'<div class="sg">'
+    +scd('\\uD83D\\uDD25 Streak',stk.current+'d','longest '+stk.longest+'d','var(--cost)')
+    +scd('This Week Active',fmt(wk.thisWeek.activeMs),dlt(wk.thisWeek.activeMs,wk.lastWeek.activeMs)+' vs last','var(--review)')
+    +scd('This Week Lines','+'+wk.thisWeek.lines,dlt(wk.thisWeek.lines,wk.lastWeek.lines)+' vs last','var(--human)')
+    +scd('This Week AI Share',wk.thisWeek.aiShare.toFixed(0)+'%',dlt(wk.thisWeek.aiShare,wk.lastWeek.aiShare)+' vs last','var(--ai)')
+    +'</div>';
+  el.innerHTML=hdr+'<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div><div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table>';
   var labels=allData.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
   dc('bar');
   charts.bar=new Chart(document.getElementById('cBar'),{type:'bar',data:{labels:labels,datasets:[{label:'Human',data:allData.map(function(d){return Math.round(d.humanCodingMs/60000);}),backgroundColor:'rgba(78,201,176,.7)'},{label:'AI Gen',data:allData.map(function(d){return Math.round(d.aiGeneratingMs/60000);}),backgroundColor:'rgba(197,134,192,.7)'},{label:'Review',data:allData.map(function(d){return Math.round(d.reviewingMs/60000);}),backgroundColor:'rgba(220,220,170,.7)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()}}}}});
@@ -243,6 +258,7 @@ function renderTrends(){
     +sc('Lines ('+trendRange+'d)','+'+totLines,'var(--ai)')
     +'</div>'
     +'<div class="card" style="margin-top:8px"><h3>Daily Activity &mdash; Human vs AI vs Review</h3><div class="cw" style="height:240px"><canvas id="cTrend"></canvas></div></div>'
+    +'<div class="card" style="margin-top:16px"><h3>\\uD83E\\uDD16 AI Dependency Trend &mdash; AI % of lines per day</h3><div class="cw" style="height:200px"><canvas id="cTrendAi"></canvas></div></div>'
     +'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDD25 Activity Heatmap &mdash; when you work (all history)</h3><div id="heat" style="margin-top:12px"></div><p style="margin-top:10px;font-size:.78em;color:var(--vscode-descriptionForeground)">Darker = more active minutes in that hour. Local time.</p></div>';
   dc('trend');
   charts.trend=new Chart(document.getElementById('cTrend'),{type:'bar',
@@ -257,6 +273,12 @@ function renderTrends(){
       scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},
         y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()},position:'left'},
         y2:{ticks:{color:dfg()},grid:{display:false},title:{display:true,text:'lines',color:dfg()},position:'right'}}}});
+  dc('trendAi');
+  charts.trendAi=new Chart(document.getElementById('cTrendAi'),{type:'line',
+    data:{labels:days.map(function(d){return d.date.slice(5);}),
+      datasets:[{label:'AI % of lines',data:days.map(function(d){var l=d.linesHuman+d.linesAi;return l>0?+((d.linesAi/l)*100).toFixed(0):null;}),borderColor:'rgba(197,134,192,.9)',backgroundColor:'rgba(197,134,192,.25)',borderWidth:2,pointRadius:2,fill:true,spanGaps:true,tension:.25}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:dfg()},grid:{color:gc}},y:{ticks:{color:dfg(),callback:function(v){return v+'%';}},grid:{color:gc},min:0,max:100,title:{display:true,text:'AI share',color:dfg()}}}}});
   renderHeatmap();
 }
 function renderHeatmap(){

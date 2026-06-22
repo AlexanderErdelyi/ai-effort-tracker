@@ -85,6 +85,22 @@ export interface FocusStats {
   goalProgressPct: number;
 }
 
+export interface StreakStats {
+  current: number;
+  longest: number;
+}
+
+export interface WeekAgg {
+  activeMs: number;
+  lines: number;
+  aiShare: number;
+}
+
+export interface WeekComparison {
+  thisWeek: WeekAgg;
+  lastWeek: WeekAgg;
+}
+
 interface BranchData {
   workItemId: string | null;
   time: Record<TrackingMode, number>;
@@ -404,6 +420,63 @@ export class Database {
       avgMs: countAll > 0 ? totalAll / countAll : 0,
       goalProgressPct: Math.min(100, (totalToday / goalMs) * 100)
     };
+  }
+
+  /** Active ms (human + ai + review) accrued today, across all branches. */
+  getTodayActiveMs(): number {
+    const key = dayKey();
+    let ms = 0;
+    for (const branch of Object.values(this.store)) {
+      const b = branch.daily?.[key];
+      if (b) ms += (b.humanCoding ?? 0) + (b.aiGenerating ?? 0) + (b.reviewing ?? 0);
+    }
+    return ms;
+  }
+
+  /** Consecutive-day coding streak (current run ending today/yesterday) + longest ever. */
+  getStreak(): StreakStats {
+    const active = new Set<string>();
+    for (const branch of Object.values(this.store)) {
+      for (const [k, b] of Object.entries(branch.daily ?? {})) {
+        if (((b.humanCoding ?? 0) + (b.aiGenerating ?? 0) + (b.reviewing ?? 0)) > 0) active.add(k);
+      }
+    }
+    // Current run: start today; if today has no activity yet, start at yesterday
+    // so a fresh morning doesn't read as a broken streak.
+    let start = new Date(); start.setHours(0, 0, 0, 0);
+    if (!active.has(dayKey(start.getTime()))) start = new Date(start.getTime() - 86400000);
+    let current = 0;
+    let cur = new Date(start.getTime());
+    while (active.has(dayKey(cur.getTime()))) { current++; cur = new Date(cur.getTime() - 86400000); }
+    // Longest run across all recorded days.
+    const keys = [...active].sort();
+    let longest = 0, run = 0;
+    let prev: string | null = null;
+    for (const k of keys) {
+      if (prev) {
+        const diff = (Date.parse(k + 'T00:00:00') - Date.parse(prev + 'T00:00:00')) / 86400000;
+        run = diff === 1 ? run + 1 : 1;
+      } else { run = 1; }
+      if (run > longest) longest = run;
+      prev = k;
+    }
+    return { current, longest: Math.max(longest, current) };
+  }
+
+  /** This-week (last 7 days) vs prior 7 days: active time, lines, AI share. */
+  getWeekComparison(): WeekComparison {
+    const series = this.getDailySeries(14);
+    const cut = series.length - 7;
+    const agg = (arr: DailyPoint[]): WeekAgg => {
+      let active = 0, lh = 0, la = 0;
+      for (const d of arr) {
+        active += d.humanCoding + d.aiGenerating + d.reviewing;
+        lh += d.linesHuman; la += d.linesAi;
+      }
+      const lines = lh + la;
+      return { activeMs: active, lines, aiShare: lines > 0 ? (la / lines) * 100 : 0 };
+    };
+    return { thisWeek: agg(series.slice(cut)), lastWeek: agg(series.slice(0, cut)) };
   }
 
   private aggregateCredits(log: CreditEntry[]): { model: string; credits: number; turns: number }[] {
