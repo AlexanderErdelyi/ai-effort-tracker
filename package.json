@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "AlexanderErdelyi",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -72,6 +72,11 @@
           "type": "number",
           "default": 0.04,
           "description": "USD cost per Copilot premium request (credit), used to estimate AI spend."
+        },
+        "aiEffortTracker.dailyActiveGoalMinutes": {
+          "type": "number",
+          "default": 240,
+          "description": "Your daily focus goal in minutes, shown as a progress ring on the Focus tab."
         },
         "aiEffortTracker.azureDevOpsOrg": {
           "type": "string",

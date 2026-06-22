@@ -44,6 +44,47 @@ export interface CreditEntry {
   note?: string;
 }
 
+/** One calendar day of activity for a branch (key = YYYY-MM-DD, local time). */
+export interface DailyBucket {
+  humanCoding: number;
+  aiGenerating: number;
+  reviewing: number;
+  idle: number;
+  linesHuman: number;
+  linesAi: number;
+  /** Active ms per hour-of-day (0-23) — drives the activity heatmap. */
+  hours: number[];
+}
+
+/** A completed uninterrupted focus/flow session. */
+export interface FocusSession {
+  ts: number;      // end timestamp
+  ms: number;      // duration of continuous active work
+  humanMs: number; // portion spent human-coding
+  aiMs: number;    // portion spent with AI generating
+}
+
+/** Aggregated point for the daily trend chart (across all branches). */
+export interface DailyPoint {
+  date: string;
+  humanCoding: number;
+  aiGenerating: number;
+  reviewing: number;
+  idle: number;
+  linesHuman: number;
+  linesAi: number;
+}
+
+export interface FocusStats {
+  sessionsToday: number;
+  sessionsWeek: number;
+  totalFocusMsToday: number;
+  totalFocusMsWeek: number;
+  longestMs: number;
+  avgMs: number;
+  goalProgressPct: number;
+}
+
 interface BranchData {
   workItemId: string | null;
   time: Record<TrackingMode, number>;
@@ -51,11 +92,28 @@ interface BranchData {
   chatCharsHuman?: number;
   chatTurnsHuman?: number;
   creditsLog?: CreditEntry[];
+  daily?: Record<string, DailyBucket>;
+  focusSessions?: FocusSession[];
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
 
 type Store = Record<string, BranchData>;
+
+function dayKey(ts: number = Date.now()): string {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function emptyBucket(): DailyBucket {
+  return {
+    humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0,
+    linesHuman: 0, linesAi: 0, hours: new Array(24).fill(0)
+  };
+}
 
 const COST_PER_AI_LINE_USD = 0.00003;
 
@@ -138,9 +196,36 @@ export class Database {
     return this.store[branch];
   }
 
+  private ensureBucket(data: BranchData, key: string): DailyBucket {
+    if (!data.daily) data.daily = {};
+    if (!data.daily[key]) data.daily[key] = emptyBucket();
+    const b = data.daily[key];
+    if (!b.hours || b.hours.length !== 24) b.hours = new Array(24).fill(0);
+    return b;
+  }
+
   recordTime(branch: string, mode: TrackingMode, durationMs: number) {
     const data = this.ensureBranch(branch);
     data.time[mode] = (data.time[mode] ?? 0) + durationMs;
+    const now = Date.now();
+    const bucket = this.ensureBucket(data, dayKey(now));
+    bucket[mode] = (bucket[mode] ?? 0) + durationMs;
+    if (mode !== 'idle') {
+      const hour = new Date(now).getHours();
+      bucket.hours[hour] = (bucket.hours[hour] ?? 0) + durationMs;
+    }
+    this.save();
+  }
+
+  /** Records a completed uninterrupted focus session. */
+  recordFocusSession(branch: string, ms: number, humanMs: number, aiMs: number) {
+    const data = this.ensureBranch(branch);
+    if (!data.focusSessions) data.focusSessions = [];
+    data.focusSessions.push({ ts: Date.now(), ms, humanMs, aiMs });
+    // Cap stored history to keep the file small (most recent 500 sessions).
+    if (data.focusSessions.length > 500) {
+      data.focusSessions = data.focusSessions.slice(-500);
+    }
     this.save();
   }
 
@@ -158,8 +243,12 @@ export class Database {
     data.lineChanges[ext][source].added += linesAdded;
     data.lineChanges[ext][source].deleted += linesDeleted;
 
+    const bucket = this.ensureBucket(data, dayKey());
     if (source === 'ai') {
       data.copilotAcceptances += 1;
+      bucket.linesAi += linesAdded;
+    } else {
+      bucket.linesHuman += linesAdded;
     }
     this.save();
   }
@@ -245,6 +334,76 @@ export class Database {
 
   getAllBranchesSummaries(): BranchSummary[] {
     return this.getAllBranches().map(b => this.getSummaryForBranch(b));
+  }
+
+  /** Daily activity aggregated across ALL branches for the last `days` days. */
+  getDailySeries(days: number = 30): DailyPoint[] {
+    const out: DailyPoint[] = [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today.getTime() - i * 86400000);
+      const key = dayKey(d.getTime());
+      const point: DailyPoint = {
+        date: key, humanCoding: 0, aiGenerating: 0, reviewing: 0,
+        idle: 0, linesHuman: 0, linesAi: 0
+      };
+      for (const branch of Object.values(this.store)) {
+        const b = branch.daily?.[key];
+        if (!b) continue;
+        point.humanCoding += b.humanCoding ?? 0;
+        point.aiGenerating += b.aiGenerating ?? 0;
+        point.reviewing += b.reviewing ?? 0;
+        point.idle += b.idle ?? 0;
+        point.linesHuman += b.linesHuman ?? 0;
+        point.linesAi += b.linesAi ?? 0;
+      }
+      out.push(point);
+    }
+    return out;
+  }
+
+  /**
+   * Activity heatmap: 7 weekdays x 24 hours of active ms, aggregated across all
+   * branches and all history. weekday 0 = Sunday.
+   */
+  getHourHeatmap(): number[][] {
+    const heat: number[][] = Array.from({ length: 7 }, () => new Array(24).fill(0));
+    for (const branch of Object.values(this.store)) {
+      if (!branch.daily) continue;
+      for (const [key, bucket] of Object.entries(branch.daily)) {
+        if (!bucket.hours) continue;
+        const wd = new Date(key + 'T00:00:00').getDay();
+        for (let h = 0; h < 24; h++) {
+          heat[wd][h] += bucket.hours[h] ?? 0;
+        }
+      }
+    }
+    return heat;
+  }
+
+  getFocusStats(goalMinutes: number = 240): FocusStats {
+    const now = Date.now();
+    const startToday = new Date(); startToday.setHours(0, 0, 0, 0);
+    const startWeek = now - 7 * 86400000;
+    let sessionsToday = 0, sessionsWeek = 0;
+    let totalToday = 0, totalWeek = 0, longest = 0, totalAll = 0, countAll = 0;
+    for (const branch of Object.values(this.store)) {
+      for (const s of branch.focusSessions ?? []) {
+        countAll++; totalAll += s.ms;
+        if (s.ms > longest) longest = s.ms;
+        if (s.ts >= startWeek) { sessionsWeek++; totalWeek += s.ms; }
+        if (s.ts >= startToday.getTime()) { sessionsToday++; totalToday += s.ms; }
+      }
+    }
+    const goalMs = Math.max(1, goalMinutes) * 60000;
+    return {
+      sessionsToday, sessionsWeek,
+      totalFocusMsToday: totalToday, totalFocusMsWeek: totalWeek,
+      longestMs: longest,
+      avgMs: countAll > 0 ? totalAll / countAll : 0,
+      goalProgressPct: Math.min(100, (totalToday / goalMs) * 100)
+    };
   }
 
   private aggregateCredits(log: CreditEntry[]): { model: string; credits: number; turns: number }[] {

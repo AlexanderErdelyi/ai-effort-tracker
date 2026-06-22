@@ -6,6 +6,17 @@ export interface InsightsConfig {
   baselineLocPerMinute: number;
   hourlyRateUsd: number;
   usdPerCredit: number;
+  dailyActiveGoalMinutes: number;
+}
+
+export interface DashboardAnalytics {
+  daily: { date: string; humanCoding: number; aiGenerating: number; reviewing: number; idle: number; linesHuman: number; linesAi: number }[];
+  heatmap: number[][];
+  focus: {
+    sessionsToday: number; sessionsWeek: number;
+    totalFocusMsToday: number; totalFocusMsWeek: number;
+    longestMs: number; avgMs: number; goalProgressPct: number;
+  };
 }
 
 export function renderDashboardHtml(
@@ -13,13 +24,15 @@ export function renderDashboardHtml(
   currentBranch: string,
   nonce: string,
   ghMetrics: CopilotMetrics | null = null,
-  config: InsightsConfig = { baselineLocPerMinute: 5, hourlyRateUsd: 80, usdPerCredit: 0.04 }
+  config: InsightsConfig = { baselineLocPerMinute: 5, hourlyRateUsd: 80, usdPerCredit: 0.04, dailyActiveGoalMinutes: 240 },
+  analytics: DashboardAnalytics = { daily: [], heatmap: [], focus: { sessionsToday: 0, sessionsWeek: 0, totalFocusMsToday: 0, totalFocusMsWeek: 0, longestMs: 0, avgMs: 0, goalProgressPct: 0 } }
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
   const catLabels = JSON.stringify(CATEGORY_LABELS);
   const ghData = JSON.stringify(ghMetrics);
   const cfgData = JSON.stringify(config);
+  const anData = JSON.stringify(analytics);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -61,7 +74,17 @@ export function renderDashboardHtml(
   .dtab.active{background:var(--vscode-editor-lineHighlightBackground);color:var(--vscode-foreground);border-color:var(--vscode-focusBorder);}
   .ds{display:none;}.ds.active{display:block;}
   .extb{display:inline-block;padding:1px 5px;border-radius:3px;font-size:.8em;font-family:monospace;background:rgba(128,128,128,.15);margin-right:4px;}
-  .dc{font-family:monospace;}`;
+  .dc{font-family:monospace;}
+  .rng{display:flex;gap:6px;margin-bottom:16px;}
+  .hm{display:grid;grid-template-columns:auto repeat(24,1fr);gap:2px;font-size:.7em;}
+  .hm .hc{width:100%;padding-top:100%;border-radius:2px;position:relative;background:rgba(128,128,128,.08);}
+  .hm .hl{color:var(--vscode-descriptionForeground);display:flex;align-items:center;justify-content:flex-end;padding-right:6px;}
+  .hm .hh{color:var(--vscode-descriptionForeground);text-align:center;font-size:.9em;}
+  .ring{position:relative;width:150px;height:150px;margin:0 auto;}
+  .ring svg{transform:rotate(-90deg);}
+  .ring .rt{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;}
+  .ring .rt .rp{font-size:1.6em;font-weight:bold;}
+  .ring .rt .rl{font-size:.7em;color:var(--vscode-descriptionForeground);text-transform:uppercase;letter-spacing:.05em;}`;
 
   const js = `
 const vscode=acquireVsCodeApi();
@@ -70,6 +93,7 @@ let currentBranch=${current};
 const CAT=${catLabels};
 let ghMetrics=${ghData};
 let CFG=${cfgData};
+let AN=${anData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -200,6 +224,98 @@ function renderOverview(){
   charts.ai=new Chart(document.getElementById('cAi'),{type:'bar',data:{labels:labels,datasets:[{label:'AI %',data:allData.map(function(d){return aiPct(d);}),backgroundColor:allData.map(function(d){return aiPct(d)>50?'rgba(197,134,192,.8)':'rgba(78,201,176,.8)';}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:dfg()},grid:{color:gc}},y:{ticks:{color:dfg()},grid:{color:gc},max:100,title:{display:true,text:'%',color:dfg()}}}}});
 }
 
+var trendRange=30;
+function renderTrends(){
+  var el=document.getElementById('trends');
+  var all=AN.daily||[];
+  var days=all.slice(-trendRange);
+  var sum=days.reduce(function(a,d){return{h:a.h+d.humanCoding,ai:a.ai+d.aiGenerating,r:a.r+d.reviewing,lh:a.lh+d.linesHuman,la:a.la+d.linesAi};},{h:0,ai:0,r:0,lh:0,la:0});
+  var activeMs=sum.h+sum.ai+sum.r;
+  var activeDays=days.filter(function(d){return(d.humanCoding+d.aiGenerating+d.reviewing)>0;}).length;
+  var avgMs=activeDays>0?activeMs/activeDays:0;
+  var totLines=sum.lh+sum.la;
+  var rngBtns=[7,30,90].map(function(n){return'<button class="dtab '+(n===trendRange?'active':'')+'" data-action="rng" data-value="'+n+'">'+n+'d</button>';}).join('');
+  el.innerHTML='<div class="rng">'+rngBtns+'</div>'
+    +'<div class="sg">'
+    +sc('Active Time ('+trendRange+'d)',fmt(activeMs),'var(--review)')
+    +sc('Daily Average',fmt(avgMs),'var(--human)')
+    +sc('Active Days',String(activeDays),'var(--vscode-foreground)')
+    +sc('Lines ('+trendRange+'d)','+'+totLines,'var(--ai)')
+    +'</div>'
+    +'<div class="card" style="margin-top:8px"><h3>Daily Activity &mdash; Human vs AI vs Review</h3><div class="cw" style="height:240px"><canvas id="cTrend"></canvas></div></div>'
+    +'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDD25 Activity Heatmap &mdash; when you work (all history)</h3><div id="heat" style="margin-top:12px"></div><p style="margin-top:10px;font-size:.78em;color:var(--vscode-descriptionForeground)">Darker = more active minutes in that hour. Local time.</p></div>';
+  dc('trend');
+  charts.trend=new Chart(document.getElementById('cTrend'),{type:'bar',
+    data:{labels:days.map(function(d){return d.date.slice(5);}),
+      datasets:[
+        {label:'Human',data:days.map(function(d){return +(d.humanCoding/60000).toFixed(1);}),backgroundColor:'rgba(78,201,176,.7)',stack:'t',yAxisID:'y'},
+        {label:'AI Gen',data:days.map(function(d){return +(d.aiGenerating/60000).toFixed(1);}),backgroundColor:'rgba(197,134,192,.7)',stack:'t',yAxisID:'y'},
+        {label:'Review',data:days.map(function(d){return +(d.reviewing/60000).toFixed(1);}),backgroundColor:'rgba(220,220,170,.7)',stack:'t',yAxisID:'y'},
+        {label:'Lines',data:days.map(function(d){return d.linesHuman+d.linesAi;}),type:'line',borderColor:'rgba(244,162,97,.9)',backgroundColor:'rgba(244,162,97,.3)',borderWidth:2,pointRadius:2,yAxisID:'y2'}
+      ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},
+      scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},
+        y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()},position:'left'},
+        y2:{ticks:{color:dfg()},grid:{display:false},title:{display:true,text:'lines',color:dfg()},position:'right'}}}});
+  renderHeatmap();
+}
+function renderHeatmap(){
+  var el=document.getElementById('heat');if(!el)return;
+  var heat=AN.heatmap||[];
+  var wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  var max=0;
+  heat.forEach(function(row){row.forEach(function(v){if(v>max)max=v;});});
+  var html='<div class="hm"><div class="hl"></div>';
+  for(var h=0;h<24;h++){html+='<div class="hh">'+(h%3===0?h:'')+'</div>';}
+  for(var d=0;d<7;d++){
+    html+='<div class="hl">'+wd[d]+'</div>';
+    for(var hr=0;hr<24;hr++){
+      var v=(heat[d]&&heat[d][hr])||0;
+      var a=max>0?(0.08+(v/max)*0.92):0.08;
+      var min=Math.round(v/60000);
+      html+='<div class="hc" style="background:rgba(78,201,176,'+a.toFixed(3)+')" title="'+wd[d]+' '+hr+':00 \\u2014 '+min+'m"></div>';
+    }
+  }
+  html+='</div>';
+  el.innerHTML=html;
+}
+function renderFocus(){
+  var el=document.getElementById('focus');
+  var f=AN.focus||{};
+  var goal=(CFG.dailyActiveGoalMinutes||240);
+  var pct=Math.round(f.goalProgressPct||0);
+  var goalDoneMin=Math.round((f.totalFocusMsToday||0)/60000);
+  var R=64,C=2*Math.PI*R,off=C*(1-Math.min(100,pct)/100);
+  var ringColor=pct>=100?'var(--added)':'var(--human)';
+  var ring='<div class="ring"><svg width="150" height="150">'
+    +'<circle cx="75" cy="75" r="'+R+'" fill="none" stroke="rgba(128,128,128,.18)" stroke-width="12"/>'
+    +'<circle cx="75" cy="75" r="'+R+'" fill="none" stroke="'+ringColor+'" stroke-width="12" stroke-linecap="round" stroke-dasharray="'+C.toFixed(1)+'" stroke-dashoffset="'+off.toFixed(1)+'"/>'
+    +'</svg><div class="rt"><div class="rp" style="color:'+ringColor+'">'+pct+'%</div><div class="rl">of goal</div></div></div>';
+  el.innerHTML='<div class="sg">'
+    +sc('\\uD83C\\uDFAF Focus Today',fmt(f.totalFocusMsToday||0),'var(--human)')
+    +sc('Sessions Today',String(f.sessionsToday||0),'var(--vscode-foreground)')
+    +sc('Longest Session',fmt(f.longestMs||0),'var(--ai)')
+    +sc('Avg Session',fmt(f.avgMs||0),'var(--review)')
+    +'</div>'
+    +'<div class="cr" style="margin-top:8px"><div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center"><h3>Daily Focus Goal</h3>'+ring
+    +'<p style="margin-top:14px;text-align:center;font-size:.9em">'+goalDoneMin+' min of '+goal+' min goal</p></div>'
+    +'<div class="card"><h3>Most Productive Hours (all history)</h3><div class="cw" style="height:200px"><canvas id="cHours"></canvas></div></div></div>'
+    +'<div class="card" style="margin-top:16px"><h3>This Week</h3><div class="sg" style="margin-top:4px">'
+    +sc('Focus Time (7d)',fmt(f.totalFocusMsWeek||0),'var(--human)')
+    +sc('Sessions (7d)',String(f.sessionsWeek||0),'var(--vscode-foreground)')
+    +'</div><p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">A focus session = continuous active work (no break longer than your idle threshold). Set your goal with <code>aiEffortTracker.dailyActiveGoalMinutes</code>.</p></div>';
+  var heat=AN.heatmap||[];
+  var byHour=new Array(24).fill(0);
+  heat.forEach(function(row){for(var h=0;h<24;h++){byHour[h]+=(row[h]||0);}});
+  dc('hours');
+  charts.hours=new Chart(document.getElementById('cHours'),{type:'bar',
+    data:{labels:byHour.map(function(_,h){return h;}),
+      datasets:[{label:'Active min',data:byHour.map(function(v){return +(v/60000).toFixed(1);}),backgroundColor:'rgba(78,201,176,.7)',borderRadius:3}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:dfg()},grid:{display:false},title:{display:true,text:'hour of day',color:dfg()}},
+        y:{ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'min',color:dfg()}}}}});
+}
+
 function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
   if(!d) return;
@@ -267,6 +383,8 @@ function showTab(name){
   document.querySelectorAll('.view').forEach(function(v){v.classList.remove('active');});
   document.getElementById(name).classList.add('active');
   if(name==='overview'){document.getElementById('tab-overview').classList.add('active');renderOverview();}
+  else if(name==='trends'){document.getElementById('tab-trends').classList.add('active');renderTrends();}
+  else if(name==='focus'){document.getElementById('tab-focus').classList.add('active');renderFocus();}
   else if(name==='ghview'){document.getElementById('tab-ghview').classList.add('active');renderGhMetrics();}
   else{document.getElementById('dtab').classList.add('active');}
 }
@@ -277,8 +395,11 @@ window.addEventListener('message',function(e){
     allData=msg.summaries;currentBranch=msg.currentBranch;
     if(msg.ghMetrics!==undefined)ghMetrics=msg.ghMetrics;
     if(msg.config!==undefined&&msg.config)CFG=msg.config;
+    if(msg.analytics!==undefined&&msg.analytics)AN=msg.analytics;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
+    else if(av&&av.id==='trends')renderTrends();
+    else if(av&&av.id==='focus')renderFocus();
     else if(av&&av.id==='ghview')renderGhMetrics();
     else if(av&&av.id==='detail'){var dt=document.getElementById('dtab');if(dt&&dt.dataset.branch)showDetail(dt.dataset.branch);}
   }
@@ -287,6 +408,8 @@ window.addEventListener('message',function(e){
 renderOverview();
 // Wire up tab buttons (CSP blocks inline onclick — use addEventListener instead)
 document.getElementById('tab-overview').addEventListener('click',function(){showTab('overview');});
+document.getElementById('tab-trends').addEventListener('click',function(){showTab('trends');});
+document.getElementById('tab-focus').addEventListener('click',function(){showTab('focus');});
 document.getElementById('tab-ghview').addEventListener('click',function(){showTab('ghview');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
@@ -299,6 +422,7 @@ document.addEventListener('click',function(e){
   if(a==='detail')showDetail(v);
   else if(a==='tab')showTab(v);
   else if(a==='ds')showDS(v,t);
+  else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
 });`;
 
@@ -314,10 +438,14 @@ document.addEventListener('click',function(e){
     '<p class="sub"><span class="ld"></span>Live tracking \u00b7 refreshes every 5s</p>',
     '<div class="tabs">',
     '  <button class="tab active" id="tab-overview">Overview</button>',
+    '  <button class="tab" id="tab-trends">\uD83D\uDCC8 Trends</button>',
+    '  <button class="tab" id="tab-focus">\uD83C\uDFAF Focus</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
     '<div id="overview" class="view active"></div>',
+    '<div id="trends" class="view"></div>',
+    '<div id="focus" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,

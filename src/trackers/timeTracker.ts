@@ -8,6 +8,8 @@ const TICK_MS = 1000;
 // Ignore gaps larger than this between ticks (machine sleep, debugger pause,
 // extension host stall) so we never attribute hours of phantom time.
 const MAX_TICK_GAP_MS = 6000;
+// A continuous active streak of at least this long is recorded as a focus session.
+const MIN_FOCUS_MS = 60_000;
 
 /**
  * Heartbeat-based tracker. A single 1s ticker accrues elapsed time into the
@@ -30,6 +32,11 @@ export class TimeTracker implements vscode.Disposable {
   private lastActivityAt = 0; // any interaction: edit, selection, focus regained
   private focused = true;
   private manualUntil = 0;    // manual override expiry timestamp
+
+  // Continuous active-work streak → recorded as a "focus session" when it ends.
+  private focusMs = 0;
+  private focusHumanMs = 0;
+  private focusAiMs = 0;
 
   constructor(private db: Database, private statusBar: StatusBarManager) {}
 
@@ -78,6 +85,7 @@ export class TimeTracker implements vscode.Disposable {
   stopTracking() {
     if (!this.isTracking) return;
     this.tick(); // final accrual
+    this.endFocusSession(); // persist any in-progress focus streak
     this.isTracking = false;
     if (this.ticker) { clearInterval(this.ticker); this.ticker = undefined; }
     this.disposables.forEach(d => d.dispose());
@@ -128,8 +136,32 @@ export class TimeTracker implements vscode.Disposable {
     this.lastTickAt = now;
     if (delta > 0 && delta <= MAX_TICK_GAP_MS) {
       this.db.recordTime(this.currentBranch, this.mode, delta);
+      this.accrueFocus(this.mode, delta);
+    } else if (delta > MAX_TICK_GAP_MS) {
+      // A long gap (sleep / stall) breaks the current focus streak.
+      this.endFocusSession();
     }
     this.setMode(this.computeMode(now));
+  }
+
+  /** Accrue continuous active time; flush a focus session when work pauses. */
+  private accrueFocus(mode: TrackingMode, delta: number) {
+    if (mode === 'idle') {
+      this.endFocusSession();
+      return;
+    }
+    this.focusMs += delta;
+    if (mode === 'humanCoding') this.focusHumanMs += delta;
+    else if (mode === 'aiGenerating') this.focusAiMs += delta;
+  }
+
+  private endFocusSession() {
+    if (this.focusMs >= MIN_FOCUS_MS) {
+      this.db.recordFocusSession(this.currentBranch, this.focusMs, this.focusHumanMs, this.focusAiMs);
+    }
+    this.focusMs = 0;
+    this.focusHumanMs = 0;
+    this.focusAiMs = 0;
   }
 
   private computeMode(now: number): TrackingMode {

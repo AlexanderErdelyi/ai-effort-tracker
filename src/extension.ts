@@ -20,6 +20,7 @@ interface InsightsConfig {
   baselineLocPerMinute: number;
   hourlyRateUsd: number;
   usdPerCredit: number;
+  dailyActiveGoalMinutes: number;
 }
 
 function getInsightsConfig(): InsightsConfig {
@@ -28,6 +29,17 @@ function getInsightsConfig(): InsightsConfig {
     baselineLocPerMinute: c.get<number>('baselineLocPerMinute') ?? 5,
     hourlyRateUsd: c.get<number>('hourlyRateUsd') ?? 80,
     usdPerCredit: c.get<number>('usdPerCredit') ?? 0.04,
+    dailyActiveGoalMinutes: c.get<number>('dailyActiveGoalMinutes') ?? 240,
+  };
+}
+
+/** Bundle of time-series analytics (daily trend, heatmap, focus) for the dashboard. */
+function getAnalytics() {
+  const goal = getInsightsConfig().dailyActiveGoalMinutes;
+  return {
+    daily: db.getDailySeries(90),
+    heatmap: db.getHourHeatmap(),
+    focus: db.getFocusStats(goal),
   };
 }
 
@@ -131,7 +143,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   const branch = await GitTracker.getCurrentBranch() ?? 'unknown';
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig());
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics());
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
@@ -157,7 +169,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       summaries: db.getAllBranchesSummaries(),
       currentBranch,
       ghMetrics: ghData,
-      config: getInsightsConfig()
+      config: getInsightsConfig(),
+      analytics: getAnalytics()
     });
   }, 5000);
 
@@ -175,7 +188,8 @@ function refreshDashboard() {
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
       currentBranch: b ?? 'unknown',
-      config: getInsightsConfig()
+      config: getInsightsConfig(),
+      analytics: getAnalytics()
     });
   });
 }
