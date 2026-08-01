@@ -90,6 +90,41 @@
           "default": 240,
           "description": "Your daily focus goal in minutes, shown as a progress ring on the Focus tab."
         },
+        "aiEffortTracker.autoCaptureCredits": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically capture the AI model used per chat/agent request by tailing the GitHub Copilot Chat log. Records an estimated premium-request weight per request (see premiumRequestMultipliers). Exact credit counts are server-side — use 'Import Copilot Premium-Request Usage' for authoritative totals."
+        },
+        "aiEffortTracker.autoCapturePollSeconds": {
+          "type": "number",
+          "default": 15,
+          "description": "How often (seconds) to check the Copilot Chat log for new requests. Minimum 5."
+        },
+        "aiEffortTracker.autoCreditDefaultMultiplier": {
+          "type": "number",
+          "default": 1,
+          "description": "Estimated premium-request credits to attribute to an auto-captured model request when the model is not listed in premiumRequestMultipliers."
+        },
+        "aiEffortTracker.premiumRequestMultipliers": {
+          "type": "object",
+          "additionalProperties": { "type": "number" },
+          "default": {
+            "gpt-4o-mini": 0,
+            "gpt-4.1": 0,
+            "gpt-4o": 0,
+            "gpt-5-mini": 0,
+            "o3-mini": 0,
+            "text-embedding": 0,
+            "embedding": 0,
+            "gpt-5": 1,
+            "claude-sonnet": 1,
+            "claude-3.5": 1,
+            "claude-opus": 1,
+            "o1": 1,
+            "gemini": 1
+          },
+          "description": "Estimated premium-request credits per auto-captured model request, matched by substring against the model id (longest match wins). Set a model to 0 to treat it as included/background and skip it."
+        },
         "aiEffortTracker.azureDevOpsOrg": {
           "type": "string",
           "default": "",
@@ -109,6 +144,24 @@
           "type": "string",
           "default": "",
           "description": "GitHub repo in 'owner/repo' format for repo-level Copilot Metrics (e.g. 'myorg/myrepo')"
+        },
+        "aiEffortTracker.categoryRules.extensions": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Categorize files by extension. Keys may be `al`, `.al`, or `*.al`; values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. These override the built-in defaults.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["programming", "specification", "documentation", "deployment", "config", "other"]
+          }
+        },
+        "aiEffortTracker.categoryRules.folders": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Categorize files by folder/path. Keys are folder names or glob patterns (e.g. `docs`, `src/specs`, `**/deploy/**`); values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. Folder rules take precedence over extension rules.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["programming", "specification", "documentation", "deployment", "config", "other"]
+          }
         }
       }
     }
