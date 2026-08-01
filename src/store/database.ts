@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import type { FileCategory } from '../util/fileTypes';
 
@@ -185,6 +186,8 @@ const COST_PER_AI_LINE_USD = 0.00003;
 
 export class Database {
   private filePath: string;
+  private tmpPath: string;
+  private bakPath: string;
   private store: Store;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -193,15 +196,81 @@ export class Database {
   constructor(storagePath: string) {
     fs.mkdirSync(storagePath, { recursive: true });
     this.filePath = path.join(storagePath, 'effort-tracker.json');
+    this.tmpPath = this.filePath + '.tmp';
+    this.bakPath = this.filePath + '.bak';
+    // Clean up any stray temp file left behind by a crashed/interrupted write.
+    try { fs.unlinkSync(this.tmpPath); } catch { /* nothing to clean */ }
     this.store = this.load();
   }
 
   private load(): Store {
+    let raw: string;
     try {
-      return JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+      raw = fs.readFileSync(this.filePath, 'utf8');
     } catch {
-      return {};
+      // Main file missing (first run, or lost). Recover from backup if present,
+      // otherwise start fresh — no warning needed for a normal first run.
+      return this.loadFromBackup() ?? {};
     }
+    try {
+      const store = JSON.parse(raw) as Store;
+      // Successful load — refresh the known-good backup.
+      this.writeBackup(raw);
+      return store;
+    } catch {
+      return this.recoverFromCorruptMain();
+    }
+  }
+
+  /** Attempt to read and parse the backup file. Returns undefined if unusable. */
+  private loadFromBackup(): Store | undefined {
+    try {
+      const store = JSON.parse(fs.readFileSync(this.bakPath, 'utf8')) as Store;
+      return store;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The main file exists but failed to parse. Try to recover from the backup;
+   * if that fails, move the corrupt file aside (never overwrite it) and start
+   * fresh. The user is warned in both cases.
+   */
+  private recoverFromCorruptMain(): Store {
+    const recovered = this.loadFromBackup();
+    if (recovered) {
+      // Promote the good backup back to the main file so future saves build on it.
+      try {
+        fs.copyFileSync(this.bakPath, this.filePath);
+      } catch { /* best effort — an upcoming save will rewrite it */ }
+      void vscode.window.showWarningMessage(
+        'AI Effort Tracker: the data file was corrupt and has been recovered from the last known-good backup.'
+      );
+      return recovered;
+    }
+
+    // No usable backup — preserve the corrupt file for manual inspection.
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const corruptPath = this.filePath + '.corrupt-' + stamp;
+    let preserved = false;
+    try {
+      fs.renameSync(this.filePath, corruptPath);
+      preserved = true;
+    } catch { /* fall through to warning */ }
+    void vscode.window.showWarningMessage(
+      preserved
+        ? `AI Effort Tracker: the data file was corrupt and could not be recovered. It was saved as "${path.basename(corruptPath)}" and tracking has started fresh.`
+        : 'AI Effort Tracker: the data file was corrupt and could not be recovered. Tracking has started fresh.'
+    );
+    return {};
+  }
+
+  /** Best-effort write of the known-good backup copy. Never throws. */
+  private writeBackup(data: string): void {
+    try {
+      fs.writeFileSync(this.bakPath, data, 'utf8');
+    } catch { /* backup is best effort */ }
   }
 
   /**
@@ -224,10 +293,24 @@ export class Database {
     this.writing = true;
     this.dirty = false;
     const data = JSON.stringify(this.store, null, 2);
+    let handle: fs.promises.FileHandle | undefined;
     try {
-      await fs.promises.writeFile(this.filePath, data, 'utf8');
+      // Atomic write: write to a temp file, fsync, then rename over the target.
+      handle = await fs.promises.open(this.tmpPath, 'w');
+      await handle.writeFile(data, 'utf8');
+      try { await handle.sync(); } catch { /* fsync unsupported — proceed */ }
+      await handle.close();
+      handle = undefined;
+      await fs.promises.rename(this.tmpPath, this.filePath);
+      // Refresh the known-good backup after a successful save.
+      await fs.promises.writeFile(this.bakPath, data, 'utf8');
     } catch {
       this.dirty = true; // retry on next save
+      if (handle) {
+        try { await handle.close(); } catch { /* ignore */ }
+      }
+      // Never leave a partial temp file behind.
+      try { await fs.promises.unlink(this.tmpPath); } catch { /* nothing to clean */ }
     } finally {
       this.writing = false;
     }
@@ -241,9 +324,22 @@ export class Database {
     }
     if (!this.dirty) return;
     this.dirty = false;
+    const data = JSON.stringify(this.store, null, 2);
     try {
-      fs.writeFileSync(this.filePath, JSON.stringify(this.store, null, 2), 'utf8');
-    } catch { /* ignore */ }
+      // Atomic write: write to a temp file, fsync, then rename over the target.
+      const fd = fs.openSync(this.tmpPath, 'w');
+      try {
+        fs.writeFileSync(fd, data, 'utf8');
+        try { fs.fsyncSync(fd); } catch { /* fsync unsupported — proceed */ }
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(this.tmpPath, this.filePath);
+      this.writeBackup(data);
+    } catch {
+      this.dirty = true; // retry on next save
+      try { fs.unlinkSync(this.tmpPath); } catch { /* nothing to clean */ }
+    }
   }
 
   private ensureBranch(branch: string): BranchData {
