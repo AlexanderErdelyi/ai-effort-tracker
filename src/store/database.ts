@@ -229,6 +229,32 @@ export interface WorkItem {
 }
 
 /**
+ * Per-project settings extension point (issue #8 / milestone M2). Deliberately
+ * empty for now: ROI/rate fields (hourly cost, sell price) land in a LATER issue
+ * (#15). Keeping the object here means the persisted shape is forward-compatible
+ * and rate wiring can be added without another schema bump.
+ */
+export interface ProjectSettings {
+  [key: string]: unknown;
+}
+
+/**
+ * A first-class Project entity (issue #8 / milestone M2). A project groups one
+ * or more repositories (`repos`, many-to-many capable) and, transitively, the
+ * work items whose {@link WorkItem.projectId} points here. Effort and credits
+ * roll up branch → work item → project. `settings` is reserved for later rate/
+ * ROI configuration (#15) and is intentionally unused for now.
+ */
+export interface Project {
+  id: string;
+  name: string;
+  /** Repository identities owned by this project. See {@link normalizeRepoId}. */
+  repos: string[];
+  settings?: ProjectSettings;
+  createdAt: number;
+}
+
+/**
  * On-disk envelope (schemaVersion >= 1). Older files were a flat
  * `Record<branchName, BranchData>` map with no version; {@link migrateStore}
  * upgrades those in place while preserving every existing field.
@@ -239,6 +265,8 @@ export interface PersistedStore {
   workItems: Record<string, WorkItem>;
   /** First-class credit ledger (issue #11). Top-level so it spans branches. */
   creditLedger: LedgerEntry[];
+  /** First-class projects keyed by id (issue #8). Top-level so repos/work items map into them. */
+  projects: Record<string, Project>;
 }
 
 /** Aggregated effort for a single work item, rolled up across all its branches. */
@@ -283,8 +311,29 @@ export type BranchRollup = Omit<
   'workItemId' | 'title' | 'projectId' | 'estimate' | 'externalRef' | 'createdAt' | 'branches'
 >;
 
+/**
+ * Aggregated effort for a single {@link Project}, rolled up across every work
+ * item that belongs to it and, in turn, all of those work items' branches.
+ * Mirrors {@link WorkItemSummary}: identity fields plus the shared numeric
+ * {@link BranchRollup}. `credits` comes straight from the top-level ledger via
+ * {@link Database.getCreditsForProject} so project spend is authoritative even
+ * when it differs from the per-branch estimate.
+ */
+export interface ProjectSummary extends BranchRollup {
+  projectId: string;
+  name: string;
+  repos: string[];
+  createdAt: number;
+  /** Work item ids that belong to this project. */
+  workItemIds: string[];
+  /** Branch names that roll up into this project (via its work items). */
+  branches: string[];
+  /** Ledger-derived credit/cost totals for the project. */
+  credits: CreditTotals;
+}
+
 /** Current persisted schema version. Bump when the on-disk shape changes. */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 /** Branch buckets that never map to a real work item (detached HEAD / worktrees). */
 const NON_WORK_ITEM_IDS = new Set<string>(['unknown']);
@@ -339,6 +388,45 @@ export function inferLedgerSource(note?: string): LedgerSource {
 }
 
 /**
+ * Canonicalize a repository identity for project ↔ repo mapping (issue #8).
+ *
+ * The extension already identifies the workspace by its git checkout (see
+ * {@link GitTracker}), so the PREFERRED identity is the `origin` remote URL
+ * normalized to a stable `host/owner/repo` form (protocol/credentials/`.git`
+ * suffix stripped, scp-style `git@host:owner/repo` rewritten, host lower-cased).
+ * When there is no remote (local-only repo) the caller passes the workspace
+ * folder path instead, which is returned as-is aside from trailing-slash
+ * trimming. Pure and idempotent so it is safe to run on already-normalized ids.
+ */
+export function normalizeRepoId(repoIdOrRemoteUrl: string): string {
+  const raw = (repoIdOrRemoteUrl ?? '').trim();
+  if (!raw) return '';
+  // A filesystem path fallback (Windows drive, UNC, or POSIX absolute) — leave
+  // the path intact but drop any trailing separators for a stable key.
+  const looksLikePath = /^[a-zA-Z]:[\\/]/.test(raw) || raw.startsWith('\\\\') || raw.startsWith('/');
+  if (looksLikePath) return raw.replace(/[\\/]+$/, '');
+
+  let s = raw;
+  // scp-style: git@github.com:owner/repo(.git) → github.com/owner/repo
+  const scp = s.match(/^[^@/]+@([^:]+):(.+)$/);
+  if (scp) {
+    s = `${scp[1]}/${scp[2]}`;
+  } else {
+    // Strip a URL scheme and any embedded credentials.
+    s = s.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '');
+    s = s.replace(/^[^@/]+@/, '');
+  }
+  s = s.replace(/\.git$/i, '');
+  s = s.replace(/\/+$/, '');
+  const slash = s.indexOf('/');
+  if (slash > 0) {
+    // Lower-case just the host segment; owner/repo casing is preserved.
+    s = s.slice(0, slash).toLowerCase() + s.slice(slash);
+  }
+  return s;
+}
+
+/**
  * Fold every branch's legacy per-branch `creditsLog` into the top-level
  * {@link LedgerEntry} ledger (issue #11), attributing `branch` and resolving
  * `workItemId`/`projectId` from the branch/work item AT MIGRATION TIME. The
@@ -390,19 +478,26 @@ export function migrateStore(parsed: unknown): PersistedStore {
   let branches: Store;
   let workItems: Record<string, WorkItem>;
   let creditLedger: LedgerEntry[];
+  let projects: Record<string, Project>;
   if (isEnvelope(parsed)) {
     branches = (parsed.branches ?? {}) as Store;
     workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
     const existing = (parsed as PersistedStore).creditLedger;
     creditLedger = Array.isArray(existing) ? existing : [];
+    const existingProjects = (parsed as PersistedStore).projects;
+    projects =
+      existingProjects && typeof existingProjects === 'object'
+        ? (existingProjects as Record<string, Project>)
+        : {};
   } else {
     branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
     workItems = {};
     creditLedger = [];
+    projects = {};
   }
   backfillWorkItems(branches, workItems);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
-  return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems, creditLedger };
+  return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems, creditLedger, projects };
 }
 
 function emptyCategoryMap(): Record<string, { human: LineStats; ai: LineStats }> {
@@ -517,6 +612,7 @@ export class Database {
   private store: Store;
   private workItems: Record<string, WorkItem>;
   private creditLedger: LedgerEntry[];
+  private projects: Record<string, Project>;
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -534,6 +630,7 @@ export class Database {
     this.store = loaded.branches;
     this.workItems = loaded.workItems;
     this.creditLedger = loaded.creditLedger;
+    this.projects = loaded.projects;
   }
 
   /** Build the on-disk envelope from the in-memory state. */
@@ -542,7 +639,8 @@ export class Database {
       schemaVersion: this.schemaVersion,
       branches: this.store,
       workItems: this.workItems,
-      creditLedger: this.creditLedger
+      creditLedger: this.creditLedger,
+      projects: this.projects
     };
     return JSON.stringify(envelope, null, 2);
   }
@@ -1278,5 +1376,173 @@ export class Database {
     query: Omit<CreditQuery, 'projectId'> = {}
   ): CreditTotals {
     return this.getCredits({ ...query, projectId });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Projects (issue #8 / milestone M2)
+  //
+  // A Project groups repositories and, transitively, the work items whose
+  // projectId points at it. Effort rolls up branch → work item → project; credits
+  // roll up from the top-level ledger via getCreditsForProject. This layer is
+  // backend-only — a management UI to create projects / link the repo lands in a
+  // later issue (#27) and will call the public methods below.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create or update a {@link Project}. When `fields.id` is omitted (or unknown)
+   * a new project is created with a fresh uuid; otherwise the existing project is
+   * updated and only the provided fields change. `createdAt`/`id` are preserved.
+   * `repos` are normalized and de-duplicated via {@link normalizeRepoId}.
+   */
+  upsertProject(fields: {
+    id?: string;
+    name?: string;
+    repos?: string[];
+    settings?: ProjectSettings;
+  } = {}): Project {
+    const id = fields.id && this.projects[fields.id] ? fields.id : fields.id ?? newLedgerId();
+    let project = this.projects[id];
+    if (!project) {
+      project = {
+        id,
+        name: fields.name ?? id,
+        repos: [],
+        createdAt: Date.now()
+      };
+      this.projects[id] = project;
+    }
+    if (fields.name !== undefined) project.name = fields.name;
+    if (fields.repos !== undefined) {
+      const seen = new Set<string>();
+      project.repos = [];
+      for (const r of fields.repos) {
+        const norm = normalizeRepoId(r);
+        if (norm && !seen.has(norm)) {
+          seen.add(norm);
+          project.repos.push(norm);
+        }
+      }
+    }
+    if (fields.settings !== undefined) project.settings = fields.settings;
+    this.save();
+    return project;
+  }
+
+  getProject(id: string): Project | undefined {
+    return this.projects[id];
+  }
+
+  getAllProjects(): Project[] {
+    return Object.keys(this.projects)
+      .sort()
+      .map(id => this.projects[id]);
+  }
+
+  /**
+   * Attach a repository identity to a project (idempotent, many-to-many capable).
+   * The id is normalized via {@link normalizeRepoId} so callers can pass a raw
+   * `origin` URL or workspace path. Returns the updated project, or `undefined`
+   * if the project id is unknown.
+   */
+  linkRepoToProject(projectId: string, repoId: string): Project | undefined {
+    const project = this.projects[projectId];
+    if (!project) return undefined;
+    const norm = normalizeRepoId(repoId);
+    if (norm && !project.repos.includes(norm)) {
+      project.repos.push(norm);
+      this.save();
+    }
+    return project;
+  }
+
+  /** Detach a repository identity from a project. Returns the updated project (or undefined). */
+  unlinkRepoFromProject(projectId: string, repoId: string): Project | undefined {
+    const project = this.projects[projectId];
+    if (!project) return undefined;
+    const norm = normalizeRepoId(repoId);
+    const idx = project.repos.indexOf(norm);
+    if (idx >= 0) {
+      project.repos.splice(idx, 1);
+      this.save();
+    }
+    return project;
+  }
+
+  /**
+   * Resolve which project owns a repository. `repoId` is normalized first, so it
+   * accepts a raw `origin` URL or workspace path. Returns the first project that
+   * lists the repo (creation order by id), or `undefined` when unmapped.
+   */
+  getProjectForRepo(repoId: string): Project | undefined {
+    const norm = normalizeRepoId(repoId);
+    if (!norm) return undefined;
+    for (const project of this.getAllProjects()) {
+      if (project.repos.includes(norm)) return project;
+    }
+    return undefined;
+  }
+
+  /**
+   * Assign a work item to a project (or clear it with `null`). Also reconciles
+   * historical ledger rows for the work item so {@link getCreditsForProject}
+   * reflects credits recorded before the link — appendLedger only resolves
+   * projectId at write time, so without this, past credits would stay orphaned.
+   * Detached-HEAD / non-work-item buckets are never forced into a project.
+   */
+  setProjectForWorkItem(workItemId: string, projectId: string | null): WorkItem | undefined {
+    if (NON_WORK_ITEM_IDS.has(workItemId)) return undefined;
+    const wi = this.ensureWorkItem(workItemId);
+    if (wi.projectId === projectId) return wi;
+    wi.projectId = projectId;
+    for (const e of this.creditLedger) {
+      if ((e.workItemId ?? null) === workItemId) e.projectId = projectId;
+    }
+    this.save();
+    return wi;
+  }
+
+  /** Work item ids whose projectId points at the given project (sorted). */
+  private getWorkItemIdsForProject(projectId: string): string[] {
+    return Object.keys(this.workItems)
+      .filter(id => this.workItems[id].projectId === projectId)
+      .sort();
+  }
+
+  /** Branch names that roll up into a project via its work items (sorted, deduped). */
+  private getBranchesForProject(projectId: string): string[] {
+    const wiIds = new Set(this.getWorkItemIdsForProject(projectId));
+    return Object.keys(this.store)
+      .filter(b => {
+        const id = this.store[b].workItemId;
+        return !!id && wiIds.has(id);
+      })
+      .sort();
+  }
+
+  /**
+   * Aggregate a project's effort across ALL of its work items and their branches
+   * (read-only rollup), plus ledger-derived credit totals. Reuses
+   * {@link rollupBranchSummaries}/{@link getSummaryForBranch} rather than
+   * duplicating aggregation logic — mirroring {@link getWorkItemSummary}.
+   */
+  getProjectSummary(projectId: string): ProjectSummary {
+    const project = this.projects[projectId];
+    const workItemIds = this.getWorkItemIdsForProject(projectId);
+    const branches = this.getBranchesForProject(projectId);
+    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    return {
+      projectId,
+      name: project?.name ?? projectId,
+      repos: project?.repos ?? [],
+      createdAt: project?.createdAt ?? 0,
+      workItemIds,
+      branches,
+      credits: this.getCreditsForProject(projectId),
+      ...rollup
+    };
+  }
+
+  getAllProjectSummaries(): ProjectSummary[] {
+    return this.getAllProjects().map(p => this.getProjectSummary(p.id));
   }
 }

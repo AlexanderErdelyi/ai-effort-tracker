@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
-import { Database } from '../store/database';
+import { Database, normalizeRepoId } from '../store/database';
 import { TimeTracker } from './timeTracker';
 
 export class GitTracker implements vscode.Disposable {
@@ -45,6 +45,27 @@ export class GitTracker implements vscode.Disposable {
     // Matches patterns like: feature/1234-something, bugfix/1234, 1234-something
     const match = branch.match(/(?:^|[/_-])(\d{3,6})(?:[_-]|$)/);
     return match?.[1];
+  }
+
+  /**
+   * Resolve a stable identity for the current workspace repository (issue #8),
+   * used to map the workspace to a {@link Project} via
+   * {@link Database.getProjectForRepo}. Prefers the git `origin` remote URL
+   * (normalized to `host/owner/repo`); when there is no remote (local-only repo)
+   * it falls back to the workspace folder path. Returns `undefined` only when
+   * there is no open workspace folder at all.
+   */
+  static async getRepoId(): Promise<string | undefined> {
+    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!wsFolder) return undefined;
+    const remote = await new Promise<string | undefined>(resolve => {
+      cp.exec('git config --get remote.origin.url', { cwd: wsFolder }, (err, stdout) => {
+        const url = err ? '' : stdout.trim();
+        resolve(url || undefined);
+      });
+    });
+    // Fall back to the workspace folder path when the repo has no origin remote.
+    return normalizeRepoId(remote ?? path.normalize(wsFolder));
   }
 
   dispose() {
