@@ -36,6 +36,18 @@
         "title": "AI Effort Tracker: Delete Credit Entry"
       },
       {
+        "command": "aiEffortTracker.addManualEffort",
+        "title": "AI Effort Tracker: Add Manual Effort"
+      },
+      {
+        "command": "aiEffortTracker.editManualEffort",
+        "title": "AI Effort Tracker: Edit Manual Effort Entry"
+      },
+      {
+        "command": "aiEffortTracker.deleteManualEffort",
+        "title": "AI Effort Tracker: Delete Manual Effort Entry"
+      },
+      {
         "command": "aiEffortTracker.assignBranchToWorkItem",
         "title": "AI Effort Tracker: Assign Branch to Work Item"
       },

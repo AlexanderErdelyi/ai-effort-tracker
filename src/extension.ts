@@ -7,8 +7,10 @@ import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { Database } from './store/database';
 import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
-import { CATEGORY_LABELS } from './util/fileTypes';
+import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
+import { CATEGORY_LABELS, ALL_CATEGORIES } from './util/fileTypes';
 import type { FileCategory } from './util/fileTypes';
+import type { TrackingMode } from './trackers/timeTracker';
 import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
 import { GitHubService, BillingUsage } from './services/githubService';
@@ -156,6 +158,15 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.deleteLedgerEntry', (id?: string) =>
       deleteLedgerEntry(id)
     ),
+    vscode.commands.registerCommand('aiEffortTracker.addManualEffort', (workItemId?: string) =>
+      addManualEffort(workItemId)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.editManualEffort', (id?: string) =>
+      editManualEffort(id)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.deleteManualEffort', (id?: string) =>
+      deleteManualEffort(id)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.assignBranchToWorkItem', () =>
       assignBranchToWorkItem()
     ),
@@ -244,7 +255,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries());
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort());
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
@@ -275,7 +286,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
       workItemSummaries: db.getAllWorkItemSummaries(),
-      ledger: db.getCreditEntries()
+      ledger: db.getCreditEntries(),
+      manualEffort: db.getManualEffort()
     });
   }, 5000);
 
@@ -826,6 +838,365 @@ async function deleteLedgerEntry(id?: string) {
   }
 }
 
+// ---- Manual effort entry & adjustment (issue #21 / milestone M5) -----------
+
+/** Human-readable label for a {@link TrackingMode}. */
+function modeLabel(mode: TrackingMode): string {
+  const labels: Record<TrackingMode, string> = {
+    humanCoding: 'human coding',
+    aiGenerating: 'AI generating',
+    reviewing: 'reviewing',
+    idle: 'idle'
+  };
+  return labels[mode];
+}
+
+/** Parse a duration entered as plain minutes (`90`) or `h:mm` (`1:30`). */
+function parseDurationMs(v: string): number | null {
+  if (!v || !v.trim()) return null;
+  const t = v.trim();
+  const hm = t.match(/^(\d+):([0-5]?\d)$/);
+  if (hm) return (parseInt(hm[1], 10) * 60 + parseInt(hm[2], 10)) * 60000;
+  const mins = Number(t);
+  if (Number.isFinite(mins) && mins >= 0) return Math.round(mins * 60000);
+  return null;
+}
+
+/** Render a millisecond duration back to `h:mm` (or plain minutes under an hour). */
+function msToHm(ms: number): string {
+  const totalMin = Math.round(ms / 60000);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}` : String(totalMin);
+}
+
+/** Pick a work item for a NEW manual entry, with an inline "new work item" option. */
+async function pickOrCreateWorkItem(placeHolder: string): Promise<string | undefined> {
+  type WiPick = vscode.QuickPickItem & { id?: string; create?: boolean };
+  const items = db.getAllWorkItems().filter(
+    w => w.id !== 'unknown' && w.id !== UNASSIGNED_WORK_ITEM_ID
+  );
+  const picks: WiPick[] = items.map(w => ({
+    label: '#' + w.id,
+    description: w.title ?? undefined,
+    detail: w.projectId ? `project: ${db.getProject(w.projectId)?.name ?? w.projectId}` : 'no project',
+    id: w.id
+  }));
+  picks.push({ label: '$(add) New work item\u2026', create: true });
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return undefined;
+  if (picked.create) {
+    const id = await vscode.window.showInputBox({
+      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+    });
+    if (!id) return undefined;
+    const wid = id.trim();
+    db.upsertWorkItem(wid);
+    return wid;
+  }
+  return picked.id;
+}
+
+/** Pick a work item when EDITING an entry: keep current, choose another, or create. */
+async function pickWorkItemForManual(current: string): Promise<string | undefined | typeof CANCELLED> {
+  type WiPick = vscode.QuickPickItem & { id?: string; keep?: boolean; create?: boolean };
+  const items = db.getAllWorkItems().filter(
+    w => w.id !== 'unknown' && w.id !== UNASSIGNED_WORK_ITEM_ID
+  );
+  const picks: WiPick[] = [
+    { label: `$(check) Keep current (#${current})`, keep: true },
+    ...items.map(w => ({
+      label: (w.id === current ? '\u25b6 ' : '') + '#' + w.id,
+      description: w.title ?? undefined,
+      id: w.id
+    })),
+    { label: '$(add) New work item\u2026', create: true }
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder: 'Work item attribution' });
+  if (!picked) return CANCELLED;
+  if (picked.keep) return undefined;
+  if (picked.create) {
+    const id = await vscode.window.showInputBox({
+      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+    });
+    if (!id) return CANCELLED;
+    const wid = id.trim();
+    db.upsertWorkItem(wid);
+    return wid;
+  }
+  return picked.id;
+}
+
+/**
+ * Pick a {@link TrackingMode} for a manual entry, or "no time" (returns `null`).
+ * Returns {@link CANCELLED} on escape.
+ */
+async function pickTrackingMode(
+  placeHolder: string,
+  current?: TrackingMode | null
+): Promise<TrackingMode | null | typeof CANCELLED> {
+  type MP = vscode.QuickPickItem & { mode?: TrackingMode; none?: boolean };
+  const modes: TrackingMode[] = ['humanCoding', 'aiGenerating', 'reviewing', 'idle'];
+  const picks: MP[] = [
+    { label: '$(circle-slash) No time (lines only)', none: true, description: current == null ? 'current' : undefined },
+    ...modes.map(m => ({ label: (m === current ? '\u25b6 ' : '') + modeLabel(m), mode: m }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.none) return null;
+  return picked.mode ?? null;
+}
+
+/**
+ * Pick a {@link FileCategory} for a manual entry's lines, or "no lines" (`null`).
+ * Returns {@link CANCELLED} on escape.
+ */
+async function pickCategory(
+  placeHolder: string,
+  current?: FileCategory | null
+): Promise<FileCategory | null | typeof CANCELLED> {
+  type CP = vscode.QuickPickItem & { cat?: FileCategory; none?: boolean };
+  const picks: CP[] = [
+    { label: '$(circle-slash) No lines / skip', none: true, description: current == null ? 'current' : undefined },
+    ...ALL_CATEGORIES.map(c => ({ label: (c === current ? '\u25b6 ' : '') + CATEGORY_LABELS[c], cat: c }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.none) return null;
+  return picked.cat ?? null;
+}
+
+/** Pick whether a manual entry's lines are human- or AI-authored. */
+async function pickIsAi(placeHolder: string, current?: boolean): Promise<boolean | typeof CANCELLED> {
+  type P = vscode.QuickPickItem & { ai: boolean };
+  const picks: P[] = [
+    { label: (current === false ? '\u25b6 ' : '') + 'Human', ai: false },
+    { label: (current === true ? '\u25b6 ' : '') + 'AI', ai: true }
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  return picked.ai;
+}
+
+/** Prompt for a duration; blank returns `undefined`, escape returns {@link CANCELLED}. */
+async function promptDurationMs(
+  prompt: string,
+  defaultMs?: number
+): Promise<number | undefined | typeof CANCELLED> {
+  const input = await vscode.window.showInputBox({
+    prompt,
+    value: defaultMs != null ? msToHm(defaultMs) : undefined,
+    placeHolder: 'e.g. 90 (minutes) or 1:30 (h:mm)',
+    validateInput: v => (!v || !v.trim() || parseDurationMs(v) !== null) ? null : 'Enter minutes (e.g. 90) or h:mm (e.g. 1:30)'
+  });
+  if (input === undefined) return CANCELLED;
+  const ms = parseDurationMs(input);
+  return ms == null ? undefined : ms;
+}
+
+/** Prompt for a non-negative whole line count; blank = 0, escape = {@link CANCELLED}. */
+async function promptLineCount(prompt: string, defaultVal?: number): Promise<number | typeof CANCELLED> {
+  const input = await vscode.window.showInputBox({
+    prompt,
+    value: defaultVal != null ? String(defaultVal) : undefined,
+    placeHolder: 'e.g. 42',
+    validateInput: v => {
+      if (!v || !v.trim()) return null;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 && Number.isInteger(n) ? null : 'Enter a non-negative whole number';
+    }
+  });
+  if (input === undefined) return CANCELLED;
+  const t = input.trim();
+  if (!t) return 0;
+  return Math.round(Number(t));
+}
+
+/** Short human label for a manual entry, used in QuickPicks and messages. */
+function manualEffortLabel(e: ManualEffortEntry): string {
+  const when = new Date(e.ts).toLocaleString();
+  const parts: string[] = [];
+  if (e.mode && e.durationMs) parts.push(`${modeLabel(e.mode)} ${fmtDuration(e.durationMs)}`);
+  if (e.category) {
+    parts.push(`${e.isAi ? 'AI' : 'human'} ${CATEGORY_LABELS[e.category]} +${e.linesAdded || 0}/-${e.linesDeleted || 0}`);
+  }
+  const body = parts.join(' \u00b7 ') || 'no measures';
+  const note = e.note ? ` \u2014 ${e.note}` : '';
+  return `#${e.workItemId} \u00b7 ${body} \u00b7 ${when}${note}`;
+}
+
+/** QuickPick an existing manual entry (newest-first). */
+async function pickManualEntry(placeHolder: string): Promise<ManualEffortEntry | undefined> {
+  const entries = db.getManualEffort();
+  if (entries.length === 0) {
+    vscode.window.showWarningMessage('No manual effort entries yet. Add one with "Add Effort" first.');
+    return undefined;
+  }
+  type EP = vscode.QuickPickItem & { entry: ManualEffortEntry };
+  const picks: EP[] = entries.map(e => ({ label: manualEffortLabel(e), entry: e }));
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  return picked?.entry;
+}
+
+/** Resolve a manual entry from a dashboard-supplied id or, failing that, a QuickPick. */
+async function resolveManualEntry(id: string | undefined, placeHolder: string): Promise<ManualEffortEntry | undefined> {
+  if (id) {
+    const found = db.getManualEffort().find(e => e.id === id);
+    if (!found) {
+      vscode.window.showWarningMessage('That manual entry no longer exists.');
+      return undefined;
+    }
+    return found;
+  }
+  return pickManualEntry(placeHolder);
+}
+
+/**
+ * Add a manual effort adjustment (issue #21): pick a work item, then optionally
+ * a mode + duration and/or a category + human/AI line counts, plus an optional
+ * note and timestamp. Any prompt escaped mid-flow cancels the whole add. Written
+ * to the SEPARATE manual-effort store, so the auto-capture path is untouched.
+ */
+async function addManualEffort(workItemId?: string) {
+  const wi = workItemId && db.getWorkItem(workItemId)
+    ? workItemId
+    : await pickOrCreateWorkItem('Add manual effort to which work item?');
+  if (!wi) return;
+
+  const input: ManualEffortInput = { workItemId: wi };
+
+  const mode = await pickTrackingMode('What kind of time? (or lines only)');
+  if (mode === CANCELLED) return;
+  if (mode) {
+    const dur = await promptDurationMs(`How much ${modeLabel(mode)} time?`);
+    if (dur === CANCELLED) return;
+    if (dur !== undefined && dur > 0) {
+      input.mode = mode;
+      input.durationMs = dur;
+    }
+  }
+
+  const cat = await pickCategory('Log lines for a category? (optional)');
+  if (cat === CANCELLED) return;
+  if (cat) {
+    const isAi = await pickIsAi('Were these lines written by a human or AI?');
+    if (isAi === CANCELLED) return;
+    const added = await promptLineCount('Lines ADDED (blank = 0)');
+    if (added === CANCELLED) return;
+    const deleted = await promptLineCount('Lines DELETED (blank = 0)');
+    if (deleted === CANCELLED) return;
+    if (added !== 0 || deleted !== 0) {
+      input.category = cat;
+      input.isAi = isAi;
+      if (added !== 0) input.linesAdded = added;
+      if (deleted !== 0) input.linesDeleted = deleted;
+    }
+  }
+
+  if (input.durationMs === undefined && input.category === undefined) {
+    vscode.window.showWarningMessage('Nothing entered \u2014 no manual effort added.');
+    return;
+  }
+
+  const note = await vscode.window.showInputBox({
+    prompt: 'Note (optional)',
+    placeHolder: 'e.g. offline work, missed by auto-capture'
+  });
+  if (note === undefined) return;
+  if (note.trim()) input.note = note.trim();
+
+  const ts = await promptTimestamp('When did this happen? (blank = now)', Date.now());
+  if (ts === CANCELLED) return;
+  if (ts !== undefined) input.ts = ts;
+
+  db.addManualEffort(input);
+  vscode.window.showInformationMessage(`Added manual effort to #${wi}.`);
+  refreshDashboard();
+}
+
+/**
+ * Edit a manual effort entry (issue #21). Re-runs the same prompts pre-filled
+ * with the current values and writes a patch; choosing "no time"/"no lines"
+ * clears those measures. Escaping any prompt cancels. Safe when the row was
+ * deleted meanwhile.
+ */
+async function editManualEffort(id?: string) {
+  const entry = await resolveManualEntry(id, 'Edit which manual entry?');
+  if (!entry) return;
+
+  const wi = await pickWorkItemForManual(entry.workItemId);
+  if (wi === CANCELLED) return;
+
+  const mode = await pickTrackingMode('What kind of time? (or lines only)', entry.mode ?? null);
+  if (mode === CANCELLED) return;
+  let durationMs: number | null = null;
+  if (mode) {
+    const dur = await promptDurationMs(`How much ${modeLabel(mode)} time?`, entry.durationMs ?? undefined);
+    if (dur === CANCELLED) return;
+    durationMs = (dur !== undefined && dur > 0) ? dur : null;
+  }
+
+  const cat = await pickCategory('Log lines for a category? (optional)', entry.category ?? null);
+  if (cat === CANCELLED) return;
+  let isAi: boolean | null = null;
+  let added: number | null = null;
+  let deleted: number | null = null;
+  if (cat) {
+    const ai = await pickIsAi('Were these lines written by a human or AI?', entry.isAi ?? undefined);
+    if (ai === CANCELLED) return;
+    isAi = ai;
+    const a = await promptLineCount('Lines ADDED (blank = 0)', entry.linesAdded);
+    if (a === CANCELLED) return;
+    const d = await promptLineCount('Lines DELETED (blank = 0)', entry.linesDeleted);
+    if (d === CANCELLED) return;
+    added = a !== 0 ? a : null;
+    deleted = d !== 0 ? d : null;
+  }
+
+  const noteIn = await vscode.window.showInputBox({ prompt: 'Note (optional)', value: entry.note ?? '' });
+  if (noteIn === undefined) return;
+
+  const ts = await promptTimestamp('Timestamp (blank to keep current)', entry.ts);
+  if (ts === CANCELLED) return;
+
+  const patch: ManualEffortPatch = {
+    mode,
+    durationMs,
+    category: cat,
+    isAi,
+    linesAdded: added,
+    linesDeleted: deleted,
+    note: noteIn.trim() ? noteIn.trim() : null
+  };
+  if (wi !== undefined) patch.workItemId = wi;
+  if (ts !== undefined) patch.ts = ts;
+
+  const updated = db.updateManualEffort(entry.id, patch);
+  if (!updated) {
+    vscode.window.showWarningMessage('That manual entry no longer exists.');
+    return;
+  }
+  vscode.window.showInformationMessage(`Updated manual effort on #${updated.workItemId}.`);
+  refreshDashboard();
+}
+
+/** Delete a manual effort entry (issue #21) after a confirmation modal. */
+async function deleteManualEffort(id?: string) {
+  const entry = await resolveManualEntry(id, 'Delete which manual entry?');
+  if (!entry) return;
+  const ok = await vscode.window.showWarningMessage(
+    `Delete this manual effort entry?\n\n${manualEffortLabel(entry)}`,
+    { modal: true },
+    'Delete'
+  );
+  if (ok !== 'Delete') return;
+  if (db.deleteManualEffort(entry.id)) {
+    vscode.window.showInformationMessage('Manual effort entry deleted.');
+    refreshDashboard();
+  }
+}
+
 
 async function createWorkItem() {
   const id = await vscode.window.showInputBox({
@@ -900,7 +1271,8 @@ function refreshDashboard() {
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
       workItemSummaries: db.getAllWorkItemSummaries(),
-      ledger: db.getCreditEntries()
+      ledger: db.getCreditEntries(),
+      manualEffort: db.getManualEffort()
     });
   });
 }

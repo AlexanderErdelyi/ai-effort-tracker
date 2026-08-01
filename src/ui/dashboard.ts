@@ -1,4 +1,4 @@
-import type { BranchSummary, ProjectSummary, WorkItemSummary, LedgerEntry } from '../store/database';
+import type { BranchSummary, ProjectSummary, WorkItemSummary, LedgerEntry, ManualEffortEntry } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 
@@ -34,7 +34,8 @@ export function renderDashboardHtml(
   billing: BillingUsage | null = null,
   projectSummaries: ProjectSummary[] = [],
   workItemSummaries: WorkItemSummary[] = [],
-  ledger: LedgerEntry[] = []
+  ledger: LedgerEntry[] = [],
+  manualEffort: ManualEffortEntry[] = []
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
@@ -46,6 +47,7 @@ export function renderDashboardHtml(
   const projData = JSON.stringify(projectSummaries);
   const wiData = JSON.stringify(workItemSummaries);
   const ledData = JSON.stringify(ledger);
+  const meData = JSON.stringify(manualEffort);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -111,6 +113,7 @@ let BL=${blData};
 let PROJ=${projData};
 let WI=${wiData};
 let LEDGER=${ledData};
+let ME=${meData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -503,6 +506,31 @@ function renderProjectDetail(){
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
     +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
 }
+function meModeLabel(m){return {humanCoding:'Human coding',aiGenerating:'AI generating',reviewing:'Reviewing',idle:'Idle'}[m]||m;}
+function meFor(wid){return (ME||[]).filter(function(e){return e.workItemId===wid;});}
+function manualSplitHtml(w){
+  var man=w.manual||{humanCodingMs:0,aiGeneratingMs:0,reviewingMs:0,linesHumanAdded:0,linesAiAdded:0,entries:0};
+  var manAct=(man.humanCodingMs||0)+(man.aiGeneratingMs||0)+(man.reviewingMs||0);
+  var autoAct=Math.max(0,activeMsOf(w)-manAct);
+  var manLines=(man.linesHumanAdded||0)+(man.linesAiAdded||0);
+  return'<div class="sg" style="margin-top:4px">'
+    +sc('Auto-tracked',fmt(autoAct),'var(--human)')
+    +sc('Manual',fmt(manAct),'var(--review)')
+    +sc('Manual +Lines','+'+manLines,'var(--ai)')
+    +sc('Manual Entries',String(man.entries||0),'var(--cost)')
+    +'</div>';
+}
+function manualRowsHtml(wid){
+  var list=meFor(wid);
+  if(!list.length)return'<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No manual entries yet. Use \\u201c\\uFF0B Add Effort\\u201d to record one.</td></tr>';
+  return list.map(function(e){
+    var when=new Date(e.ts).toLocaleString();
+    var time=(e.mode&&e.durationMs)?esc(meModeLabel(e.mode))+' '+fmt(e.durationMs):'\\u2014';
+    var lines=e.category?((e.isAi?'AI':'Human')+' '+esc(CAT[e.category]||e.category)+' +'+(e.linesAdded||0)+'/-'+(e.linesDeleted||0)):'\\u2014';
+    var note=e.note?esc(e.note):'';
+    return'<tr><td style="white-space:nowrap">'+esc(when)+'</td><td>'+time+'</td><td>'+lines+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap"><button class="dtab" data-action="meEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="meDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
+  }).join('');
+}
 function renderWorkItemDetail(){
   var el=document.getElementById('projects');
   var w=WI.find(function(x){return x.workItemId===selWi;});
@@ -528,8 +556,10 @@ function renderWorkItemDetail(){
     +sc('AI Spend','$'+I.aiCost.toFixed(2),'var(--cost)')
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
-    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button></div>'
-    +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail.</p></div>';
+    +manualSplitHtml(w)
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
+    +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail.</p></div>'
+    +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>';
 }
 function renderProjectsView(){
   if(projView==='project')return renderProjectDetail();
@@ -646,6 +676,7 @@ window.addEventListener('message',function(e){
     if(msg.projectSummaries!==undefined&&msg.projectSummaries)PROJ=msg.projectSummaries;
     if(msg.workItemSummaries!==undefined&&msg.workItemSummaries)WI=msg.workItemSummaries;
     if(msg.ledger!==undefined&&msg.ledger)LEDGER=msg.ledger;
+    if(msg.manualEffort!==undefined&&msg.manualEffort)ME=msg.manualEffort;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
@@ -683,6 +714,9 @@ document.addEventListener('click',function(e){
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
   else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
+  else if(a==='meAdd')vscode.postMessage({type:'cmd',value:'addManualEffort',arg:t.dataset.id});
+  else if(a==='meEdit')vscode.postMessage({type:'cmd',value:'editManualEffort',arg:t.dataset.id});
+  else if(a==='meDel')vscode.postMessage({type:'cmd',value:'deleteManualEffort',arg:t.dataset.id});
 });`;
 
   return [
