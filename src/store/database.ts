@@ -152,6 +152,8 @@ interface BranchData {
   aiInlineChars?: number;
   aiChatChars?: number;
   creditsLog?: CreditEntry[];
+  /** Count of model requests auto-captured from the Copilot chat log. */
+  autoModelRequests?: number;
   daily?: Record<string, DailyBucket>;
   focusSessions?: FocusSession[];
   files?: Record<string, FileStat>;
@@ -481,6 +483,20 @@ export class Database {
     if (!data.creditsLog) data.creditsLog = [];
     data.creditsLog.push({ ts: Date.now(), model, credits, note });
     data.chatTurnsHuman = (data.chatTurnsHuman ?? 0) + 1;
+    this.save();
+  }
+
+  /**
+   * Record model usage auto-captured from the Copilot chat log. Unlike
+   * recordCredits (manual entry), this does NOT count as a human chat turn,
+   * so the human interaction metric stays clean. `credits` is an ESTIMATED
+   * premium-request weight; the GitHub billing import remains authoritative.
+   */
+  recordAutoModelUsage(branch: string, model: string, credits: number, note?: string) {
+    const data = this.ensureBranch(branch);
+    if (!data.creditsLog) data.creditsLog = [];
+    data.creditsLog.push({ ts: Date.now(), model, credits, note: note ?? 'auto' });
+    data.autoModelRequests = (data.autoModelRequests ?? 0) + 1;
     this.save();
   }
 
