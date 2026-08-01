@@ -191,6 +191,17 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setBillableHours', (workItemId?: string) =>
       setBillableHours(workItemId)
     ),
+    // #47: adjust/correct the AUTO-tracked time for a branch's mode (delta stored
+    // under the hood; raw kept intact). `arg` encodes "branch\u0000mode" from the
+    // dashboard ✎ affordance; falls back to QuickPicks from the palette.
+    vscode.commands.registerCommand('aiEffortTracker.adjustTrackedTime', (arg?: string) =>
+      adjustTrackedTime(arg)
+    ),
+    // #47: reset a branch's adjustments back to the raw auto-tracked value. `arg`
+    // is the branch name from the dashboard; falls back to a QuickPick.
+    vscode.commands.registerCommand('aiEffortTracker.resetTrackedTime', (arg?: string) =>
+      resetTrackedTime(arg)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.setProjectRates', (projectId?: string) =>
       setProjectRates(projectId)
     ),
@@ -662,6 +673,101 @@ async function setBillableHours(workItemId?: string) {
       `Billable (could-charge) hours for #${id} set to ${hours}h.`
     );
   }
+  refreshDashboard();
+}
+
+/**
+ * Adjust/CORRECT a branch's automatically-tracked time for one mode (issue #47).
+ * Stores a per-mode adjustment DELTA under the hood via
+ * {@link Database.setEffectiveTime} so the user simply types the value they want
+ * to SEE; the raw auto-tracked bucket is never mutated, so auto-tracking keeps
+ * running and the original number stays restorable. `arg`, when present, encodes
+ * `"branch\u0000mode"` (forwarded by the dashboard Time-tab ✎ affordance — NUL
+ * is illegal in git ref names so it is an unambiguous delimiter); otherwise the
+ * branch and mode are QuickPicked. The InputBox is prefilled with the current
+ * EFFECTIVE value (minutes, `h:mm`, or blank to reset that mode to auto).
+ */
+async function adjustTrackedTime(arg?: string) {
+  let branch: string | undefined;
+  let mode: TrackingMode | undefined;
+
+  if (arg) {
+    const sep = arg.indexOf('\u0000');
+    if (sep >= 0) {
+      branch = arg.slice(0, sep);
+      const m = arg.slice(sep + 1);
+      if (m === 'humanCoding' || m === 'aiGenerating' || m === 'reviewing' || m === 'idle') {
+        mode = m;
+      }
+    } else {
+      branch = arg;
+    }
+  }
+
+  if (!branch) {
+    branch = await pickBranch('Adjust tracked time for which branch?');
+    if (!branch) return;
+  }
+  if (!mode) {
+    const picked = await pickTrackingMode(`Which mode's tracked time on "${branch}"?`);
+    if (picked === CANCELLED || picked == null) return;
+    mode = picked;
+  }
+
+  const raw = db.getRawTime(branch)[mode];
+  const effective = db.getEffectiveTime(branch)[mode];
+  const rawTxt = msToHm(raw);
+  const effTxt = msToHm(effective);
+
+  const value = await vscode.window.showInputBox({
+    prompt:
+      `Corrected ${modeLabel(mode)} time for "${branch}" ` +
+      `(minutes or h:mm; blank to reset this mode to auto). ` +
+      `Auto-tracked raw = ${rawTxt}, currently showing ${effTxt}.`,
+    value: effTxt,
+    placeHolder: 'e.g. 45 or 1:30',
+    validateInput: v => {
+      if (!v.trim()) return null; // blank = reset to auto
+      return parseDurationMs(v) === null ? 'Enter minutes (e.g. 45) or h:mm (e.g. 1:30)' : null;
+    }
+  });
+  if (value === undefined) return;
+
+  if (!value.trim()) {
+    db.clearTimeAdjustment(branch, mode);
+    vscode.window.showInformationMessage(
+      `${modeLabel(mode)} time for "${branch}" reset to auto (${rawTxt}).`
+    );
+  } else {
+    const desiredMs = parseDurationMs(value)!;
+    db.setEffectiveTime(branch, mode, desiredMs);
+    const nowTxt = msToHm(db.getEffectiveTime(branch)[mode]);
+    vscode.window.showInformationMessage(
+      `${modeLabel(mode)} time for "${branch}" set to ${nowTxt} (auto-tracked raw ${rawTxt} preserved).`
+    );
+  }
+  refreshDashboard();
+}
+
+/**
+ * Reset ALL of a branch's per-mode time adjustments back to the raw auto-tracked
+ * values (issue #47). `arg`, when present, is the branch name (forwarded by the
+ * dashboard "Reset to auto" affordance); otherwise it is QuickPicked. A no-op
+ * with an info message when the branch has no adjustment.
+ */
+async function resetTrackedTime(arg?: string) {
+  let branch = arg;
+  if (!branch) {
+    branch = await pickBranch('Reset tracked-time adjustments for which branch?');
+    if (!branch) return;
+  }
+  const hadAdjustment = Object.keys(db.getTimeAdjustment(branch)).length > 0;
+  db.clearTimeAdjustment(branch);
+  vscode.window.showInformationMessage(
+    hadAdjustment
+      ? `Tracked-time adjustments for "${branch}" reset to auto.`
+      : `"${branch}" has no time adjustments — already on auto.`
+  );
   refreshDashboard();
 }
 

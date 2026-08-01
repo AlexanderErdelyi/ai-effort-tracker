@@ -31,6 +31,21 @@ export interface BranchSummary {
   aiGeneratingMs: number;
   reviewingMs: number;
   idleMs: number;
+  /**
+   * The RAW auto-tracked ms per mode BEFORE the issue #47 adjustment is applied
+   * (the untouched {@link BranchData.time} buckets). Exposed so the dashboard can
+   * show the original tracked value alongside the corrected one and prove the raw
+   * number is never lost. The `humanCodingMs`/`aiGeneratingMs`/`reviewingMs`/
+   * `idleMs` fields above are the EFFECTIVE (adjusted, clamped-at-0) values used
+   * by every rollup / ROI calculation.
+   */
+  rawTime: Record<TrackingMode, number>;
+  /**
+   * The per-mode adjustment DELTA in ms currently applied to this branch (issue
+   * #47). Only modes with a non-zero adjustment are present; an empty object
+   * means the branch is fully on its raw auto-tracked value.
+   */
+  timeAdjustment: Partial<Record<TrackingMode, number>>;
   // Aggregated line totals
   linesHumanAdded: number;
   linesHumanDeleted: number;
@@ -335,6 +350,18 @@ interface BranchData {
    */
   workItemIdManual?: boolean;
   time: Record<TrackingMode, number>;
+  /**
+   * Optional per-mode adjustment DELTA in ms (issue #47 / schema v9), applied on
+   * top of the raw auto-tracked {@link BranchData.time} buckets to CORRECT
+   * over/under-counting. Values may be NEGATIVE. The raw buckets are NEVER
+   * mutated by this feature — {@link Database.recordTime} keeps incrementing them
+   * — so the EFFECTIVE time for a mode is `max(0, raw + (timeAdjustment[mode] ??
+   * 0))` and the original tracked value stays intact and restorable via
+   * {@link Database.clearTimeAdjustment}. Absent (or an empty object after
+   * sanitizing) ⇒ no adjustment. A delta of exactly 0 is never stored (it is a
+   * no-op) — see {@link sanitizeBranchTimeAdjustments}.
+   */
+  timeAdjustment?: Partial<Record<TrackingMode, number>>;
   copilotAcceptances: number;
   chatCharsHuman?: number;
   chatTurnsHuman?: number;
@@ -660,8 +687,22 @@ export interface ProjectRoi extends RoiFigures {
  * idempotent and zero-loss (a valid value round-trips untouched; an invalid one
  * would have been ignored by the ROI math anyway), so a v7 → v8 load never NaNs
  * and never loses data.
+ *
+ * v9 (issue #47) adds the optional per-branch `BranchData.timeAdjustment` — a
+ * per-mode signed ms DELTA that CORRECTS the raw auto-tracked `time` buckets
+ * (over/under-counting) without mutating them, so the effective time for a mode
+ * is `max(0, raw + (timeAdjustment[mode] ?? 0))` and the raw value stays intact
+ * and restorable. No data rewrite is needed: a pre-v9 branch simply has the
+ * field undefined, which means "no adjustment". For BOTH the current envelope
+ * AND the legacy flat map (which converge on the shared `branches` map),
+ * {@link migrateStore} runs {@link sanitizeBranchTimeAdjustments}, which strips
+ * the field when absent/empty and drops any per-mode entry that is not a finite
+ * non-zero number. That is pure, idempotent and zero-loss (a valid delta
+ * round-trips untouched; a 0 or garbage delta — which the effective-time math
+ * would treat as a no-op anyway — is removed), so a v8 → v9 load never NaNs and
+ * never loses data.
  */
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -931,6 +972,9 @@ export function migrateStore(parsed: unknown): PersistedStore {
   // #46: default/sanitize the optional billableHours override on every work item
   // for BOTH shapes (envelope + legacy flat map converge on `workItems` here).
   normalizeWorkItemBillableHours(workItems);
+  // #47: default/sanitize the optional per-branch timeAdjustment deltas for BOTH
+  // shapes (envelope + legacy flat map converge on `branches` here).
+  sanitizeBranchTimeAdjustments(branches);
   // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
   // their legacy credit log is attributed to the resolved/holding work item.
   assignUnmappedBranches(branches, workItems, extractWorkItemId);
@@ -963,6 +1007,45 @@ export function normalizeWorkItemBillableHours(workItems: Record<string, WorkIte
     if (bh === undefined) continue;
     if (typeof bh !== 'number' || !Number.isFinite(bh) || bh < 0) {
       delete (wi as WorkItem).billableHours;
+    }
+  }
+}
+
+/**
+ * Sanitize the optional per-branch {@link BranchData.timeAdjustment} deltas in
+ * place (issue #47 / schema v9). For every branch it strips the field entirely
+ * when it is absent, not an object, or reduces to empty, and drops any per-mode
+ * entry that is not a finite, NON-ZERO number for one of the four known
+ * {@link TrackingMode}s. Pure over its inputs, idempotent (re-running on clean
+ * data is a no-op) and zero-loss: a valid signed delta round-trips untouched, a
+ * delta of 0 means "no adjustment" (effective === raw) and is dropped, and only
+ * garbage the effective-time math would ignore anyway is removed — so it can
+ * never introduce a NaN or drop real tracked time (the raw `time` buckets are
+ * left completely untouched). Mirrors the defaulting done for
+ * `manualEffort`/`reassignments`/`billableHours`.
+ */
+export function sanitizeBranchTimeAdjustments(branches: Store): void {
+  if (!branches || typeof branches !== 'object') return;
+  const modes: TrackingMode[] = ['humanCoding', 'aiGenerating', 'reviewing', 'idle'];
+  for (const data of Object.values(branches)) {
+    if (!data || typeof data !== 'object') continue;
+    const adj = (data as BranchData).timeAdjustment;
+    if (adj === undefined) continue;
+    if (typeof adj !== 'object' || adj === null) {
+      delete (data as BranchData).timeAdjustment;
+      continue;
+    }
+    const clean: Partial<Record<TrackingMode, number>> = {};
+    for (const mode of modes) {
+      const v = (adj as Record<string, unknown>)[mode];
+      if (typeof v === 'number' && Number.isFinite(v) && v !== 0) {
+        clean[mode] = v;
+      }
+    }
+    if (Object.keys(clean).length === 0) {
+      delete (data as BranchData).timeAdjustment;
+    } else {
+      (data as BranchData).timeAdjustment = clean;
     }
   }
 }
@@ -2063,6 +2146,125 @@ export class Database {
   }
 
   /**
+   * The EFFECTIVE tracked time for a branch (issue #47): the raw auto-tracked ms
+   * plus the per-mode adjustment DELTA, CLAMPED at 0 so a correction can never
+   * drive a bucket negative. The raw {@link BranchData.time} buckets are never
+   * mutated, so this is a pure read-through — the single funnel every
+   * summary/rollup/ROI read of tracked time goes through, which is why a
+   * correction propagates to the branch summary, work-item rollup, project
+   * rollups and ROI while the original value stays restorable via
+   * {@link clearTimeAdjustment}.
+   */
+  private effectiveTime(data: BranchData): Record<TrackingMode, number> {
+    const adj = data.timeAdjustment;
+    const eff = (mode: TrackingMode): number => {
+      const raw = data.time[mode] ?? 0;
+      const d = adj ? adj[mode] : undefined;
+      const delta = typeof d === 'number' && Number.isFinite(d) ? d : 0;
+      const v = raw + delta;
+      return v > 0 ? v : 0;
+    };
+    return {
+      humanCoding: eff('humanCoding'),
+      aiGenerating: eff('aiGenerating'),
+      reviewing: eff('reviewing'),
+      idle: eff('idle')
+    };
+  }
+
+  /**
+   * Raw auto-tracked time buckets for a branch (issue #47) — a defensive copy of
+   * the untouched {@link BranchData.time}. Useful for a UI that wants to show the
+   * original value next to the corrected one, or to compute a delta from a
+   * desired absolute value.
+   */
+  getRawTime(branch: string): Record<TrackingMode, number> {
+    const data = this.ensureBranch(branch);
+    return {
+      humanCoding: data.time.humanCoding ?? 0,
+      aiGenerating: data.time.aiGenerating ?? 0,
+      reviewing: data.time.reviewing ?? 0,
+      idle: data.time.idle ?? 0
+    };
+  }
+
+  /**
+   * The EFFECTIVE (raw ± adjustment, clamped at 0) time buckets for a branch
+   * (issue #47) — the same values every rollup/ROI read uses. Public wrapper over
+   * {@link effectiveTime}.
+   */
+  getEffectiveTime(branch: string): Record<TrackingMode, number> {
+    return this.effectiveTime(this.ensureBranch(branch));
+  }
+
+  /**
+   * The per-mode adjustment DELTAs currently applied to a branch (issue #47), as
+   * a defensive copy. An empty object means the branch is on its raw value.
+   */
+  getTimeAdjustment(branch: string): Partial<Record<TrackingMode, number>> {
+    const data = this.ensureBranch(branch);
+    return { ...(data.timeAdjustment ?? {}) };
+  }
+
+  /**
+   * Set the per-mode adjustment DELTA (issue #47) for a branch — the signed ms
+   * offset applied on top of the raw auto-tracked bucket (may be negative). A
+   * delta of exactly 0, or any non-finite value, CLEARS that mode's adjustment so
+   * it falls back to the raw value; when the branch's last adjustment is cleared
+   * the whole `timeAdjustment` object is dropped so the persisted shape stays
+   * clean. The raw {@link BranchData.time} bucket is NEVER touched, so the
+   * original auto value stays intact and restorable. Persists via the durable
+   * {@link save} path.
+   */
+  setTimeAdjustment(branch: string, mode: TrackingMode, deltaMs: number): void {
+    const data = this.ensureBranch(branch);
+    if (typeof deltaMs !== 'number' || !Number.isFinite(deltaMs) || deltaMs === 0) {
+      if (data.timeAdjustment) {
+        delete data.timeAdjustment[mode];
+        if (Object.keys(data.timeAdjustment).length === 0) delete data.timeAdjustment;
+      }
+    } else {
+      if (!data.timeAdjustment) data.timeAdjustment = {};
+      data.timeAdjustment[mode] = deltaMs;
+    }
+    this.save();
+  }
+
+  /**
+   * Set the EFFECTIVE (corrected) time for a branch's mode to an absolute
+   * `desiredMs` (issue #47) by storing the delta = `desiredMs − rawMs` under the
+   * hood, so the UI can let the user type the value they want to SEE rather than
+   * a signed offset. `desiredMs` is clamped at 0; when it equals the raw value
+   * the adjustment is cleared (back to auto). The raw bucket is never mutated.
+   * Persists via the durable {@link save} path.
+   */
+  setEffectiveTime(branch: string, mode: TrackingMode, desiredMs: number): void {
+    const data = this.ensureBranch(branch);
+    const raw = data.time[mode] ?? 0;
+    const desired =
+      typeof desiredMs === 'number' && Number.isFinite(desiredMs) && desiredMs > 0 ? desiredMs : 0;
+    this.setTimeAdjustment(branch, mode, desired - raw);
+  }
+
+  /**
+   * Clear the adjustment on a branch (issue #47), restoring the exact raw
+   * auto-tracked value. Pass a `mode` to reset only that mode; omit it to reset
+   * ALL modes on the branch back to auto. Persists via the durable {@link save}
+   * path. A no-op (still persisted-safe) when the branch has no adjustment.
+   */
+  clearTimeAdjustment(branch: string, mode?: TrackingMode): void {
+    const data = this.ensureBranch(branch);
+    if (!data.timeAdjustment) return;
+    if (mode) {
+      delete data.timeAdjustment[mode];
+      if (Object.keys(data.timeAdjustment).length === 0) delete data.timeAdjustment;
+    } else {
+      delete data.timeAdjustment;
+    }
+    this.save();
+  }
+
+  /**
    * Compare a work item's per-category ESTIMATE against its tracked ACTUAL
    * (issue #16). The `actual` measure is LINES ADDED per category
    * (`human.added + ai.added` from the rolled-up {@link WorkItemSummary.byCategory}),
@@ -2141,15 +2343,25 @@ export class Database {
     const projectId = data.workItemId
       ? this.workItems[data.workItemId]?.projectId ?? null
       : null;
-    const billableMs =
-      (data.time.humanCoding ?? 0) + (data.time.aiGenerating ?? 0) + (data.time.reviewing ?? 0);
+    // #47: read the EFFECTIVE (raw ± adjustment, clamped) tracked time so a
+    // correction flows into this summary, the work-item/project rollups and ROI.
+    // The raw buckets are exposed separately so the UI can prove they're intact.
+    const eff = this.effectiveTime(data);
+    const billableMs = eff.humanCoding + eff.aiGenerating + eff.reviewing;
     return {
       branch,
       workItemId: data.workItemId,
-      humanCodingMs: data.time.humanCoding ?? 0,
-      aiGeneratingMs: data.time.aiGenerating ?? 0,
-      reviewingMs: data.time.reviewing ?? 0,
-      idleMs: data.time.idle ?? 0,
+      humanCodingMs: eff.humanCoding,
+      aiGeneratingMs: eff.aiGenerating,
+      reviewingMs: eff.reviewing,
+      idleMs: eff.idle,
+      rawTime: {
+        humanCoding: data.time.humanCoding ?? 0,
+        aiGenerating: data.time.aiGenerating ?? 0,
+        reviewing: data.time.reviewing ?? 0,
+        idle: data.time.idle ?? 0
+      },
+      timeAdjustment: { ...(data.timeAdjustment ?? {}) },
       linesHumanAdded,
       linesHumanDeleted,
       linesAiAdded,
