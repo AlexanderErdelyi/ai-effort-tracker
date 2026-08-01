@@ -2,7 +2,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
-import type { FileCategory } from '../util/fileTypes';
 
 export interface LineStats {
   added: number;
@@ -42,8 +41,8 @@ export interface BranchSummary {
   creditsByModel: { model: string; credits: number; turns: number }[];
   // Breakdown by file extension: { "al": { human: {...}, ai: {...} }, ... }
   byExt: Record<string, ExtStats>;
-  // Breakdown by category (code/spec/config/other)
-  byCategory: Record<FileCategory, { human: LineStats; ai: LineStats }>;
+  // Breakdown by category (programming/specification/documentation/deployment/config/other)
+  byCategory: Record<string, { human: LineStats; ai: LineStats }>;
 }
 
 export interface CreditEntry {
@@ -493,28 +492,43 @@ export class Database {
 
   getSummaryForBranch(branch: string): BranchSummary {
     const data = this.ensureBranch(branch);
-    const { categorizeExt } = require('../util/fileTypes');
+    const { categorize, categorizeExt, ALL_CATEGORIES } = require('../util/fileTypes');
 
     let linesHumanAdded = 0, linesHumanDeleted = 0;
     let linesAiAdded = 0, linesAiDeleted = 0;
-    const byCategory: Record<FileCategory, { human: LineStats; ai: LineStats }> = {
-      code: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
-      spec: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
-      config: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
-      other: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } }
-    };
+    const byCategory: Record<string, { human: LineStats; ai: LineStats }> = {};
+    for (const cat of ALL_CATEGORIES as string[]) {
+      byCategory[cat] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+    }
+    const bucketFor = (cat: string) =>
+      (byCategory[cat] ??= { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } });
 
-    for (const [ext, stats] of Object.entries(data.lineChanges)) {
+    // Totals come from the extension-keyed line changes (backward compatible).
+    for (const stats of Object.values(data.lineChanges)) {
       linesHumanAdded += stats.human.added;
       linesHumanDeleted += stats.human.deleted;
       linesAiAdded += stats.ai.added;
       linesAiDeleted += stats.ai.deleted;
+    }
 
-      const cat: FileCategory = categorizeExt(ext);
-      byCategory[cat].human.added += stats.human.added;
-      byCategory[cat].human.deleted += stats.human.deleted;
-      byCategory[cat].ai.added += stats.ai.added;
-      byCategory[cat].ai.deleted += stats.ai.deleted;
+    // Prefer per-file paths so folder rules apply; fall back to ext-only data.
+    const files = data.files ?? {};
+    if (Object.keys(files).length > 0) {
+      for (const [filePath, f] of Object.entries(files)) {
+        const b = bucketFor(categorize(filePath));
+        b.human.added += f.humanAdded;
+        b.human.deleted += f.humanDeleted;
+        b.ai.added += f.aiAdded;
+        b.ai.deleted += f.aiDeleted;
+      }
+    } else {
+      for (const [ext, stats] of Object.entries(data.lineChanges)) {
+        const b = bucketFor(categorizeExt(ext));
+        b.human.added += stats.human.added;
+        b.human.deleted += stats.human.deleted;
+        b.ai.added += stats.ai.added;
+        b.ai.deleted += stats.ai.deleted;
+      }
     }
 
     return {

@@ -109,6 +109,24 @@
           "type": "string",
           "default": "",
           "description": "GitHub repo in 'owner/repo' format for repo-level Copilot Metrics (e.g. 'myorg/myrepo')"
+        },
+        "aiEffortTracker.categoryRules.extensions": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Categorize files by extension. Keys may be `al`, `.al`, or `*.al`; values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. These override the built-in defaults.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["programming", "specification", "documentation", "deployment", "config", "other"]
+          }
+        },
+        "aiEffortTracker.categoryRules.folders": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Categorize files by folder/path. Keys are folder names or glob patterns (e.g. `docs`, `src/specs`, `**/deploy/**`); values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. Folder rules take precedence over extension rules.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["programming", "specification", "documentation", "deployment", "config", "other"]
+          }
         }
       }
     }
