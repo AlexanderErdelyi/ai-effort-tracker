@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
-import { Database, normalizeRepoId } from '../store/database';
+import { Database, normalizeRepoId, extractWorkItemId } from '../store/database';
 import { TimeTracker } from './timeTracker';
 
 export class GitTracker implements vscode.Disposable {
@@ -42,9 +42,9 @@ export class GitTracker implements vscode.Disposable {
   }
 
   static extractWorkItemId(branch: string): string | undefined {
-    // Matches patterns like: feature/1234-something, bugfix/1234, 1234-something
-    const match = branch.match(/(?:^|[/_-])(\d{3,6})(?:[_-]|$)/);
-    return match?.[1];
+    // Single source of truth: the regex lives in the store module so migration
+    // ({@link assignUnmappedBranches}) and live tracking share one implementation.
+    return extractWorkItemId(branch);
   }
 
   /**
