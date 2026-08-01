@@ -264,7 +264,7 @@ function renderOverview(){
   function scd(lbl,val,sub,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div><div style="font-size:.75em;margin-top:2px">'+sub+'</div></div>';}
   var hdr='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px">'
     +'<div class="sub" style="margin:0">This week vs last week \\u00b7 streak \\u00b7 totals</div>'
-    +'<div style="display:flex;gap:6px"><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>'
+    +'<div style="display:flex;gap:6px"><button class="dtab" data-action="cmd" data-value="assignBranchToWorkItem">\\uD83D\\uDD17 Assign Work Item</button><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>'
     +'<div class="sg">'
     +scd('\\uD83D\\uDD25 Streak',stk.current+'d','longest '+stk.longest+'d','var(--cost)')
     +scd('This Week Active',fmt(wk.thisWeek.activeMs),dlt(wk.thisWeek.activeMs,wk.lastWeek.activeMs)+' vs last','var(--review)')

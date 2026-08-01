@@ -188,6 +188,12 @@ export interface TodayTimeline {
 
 interface BranchData {
   workItemId: string | null;
+  /**
+   * Sticky manual-override marker (issue #10). When true the branch → work item
+   * mapping was set explicitly by the user and MUST NOT be overwritten by
+   * branch-name auto-detection. Absent/false ⇒ the mapping is auto-managed.
+   */
+  workItemIdManual?: boolean;
   time: Record<TrackingMode, number>;
   copilotAcceptances: number;
   chatCharsHuman?: number;
@@ -332,8 +338,15 @@ export interface ProjectSummary extends BranchRollup {
   credits: CreditTotals;
 }
 
-/** Current persisted schema version. Bump when the on-disk shape changes. */
-export const CURRENT_SCHEMA_VERSION = 3;
+/**
+ * Current persisted schema version. Bump when the on-disk shape changes.
+ *
+ * v4 (issue #10) reserves the optional `BranchData.workItemIdManual` sticky
+ * marker. No data rewrite is needed: {@link migrateStore} carries every branch
+ * record through untouched and a missing marker is treated as `auto`, so a v3 →
+ * v4 load is a pure, idempotent, zero-loss default.
+ */
+export const CURRENT_SCHEMA_VERSION = 4;
 
 /** Branch buckets that never map to a real work item (detached HEAD / worktrees). */
 const NON_WORK_ITEM_IDS = new Set<string>(['unknown']);
@@ -974,13 +987,62 @@ export class Database {
     this.save();
   }
 
+  /**
+   * Auto-associate a branch with a work item (from branch-name detection).
+   * Sticky manual overrides are respected: if the branch was mapped manually
+   * (see {@link reassignBranchToWorkItem}) this is a no-op so the user's choice
+   * survives later auto-detection passes (issue #10).
+   */
   setWorkItemForBranch(branch: string, workItemId: string) {
     const data = this.ensureBranch(branch);
+    // Never clobber a manual override with auto-detection.
+    if (data.workItemIdManual) return;
     data.workItemId = workItemId;
     // A branch may be auto-detected before the work item entity exists; make sure
     // the persisted work item is present so aggregation can find it.
     this.ensureWorkItem(workItemId);
     this.save();
+  }
+
+  /**
+   * Manually map — or reassign — a branch to a work item and make the choice
+   * STICK (issue #10). Unlike auto-detection ({@link setWorkItemForBranch}) this:
+   *  - marks the branch as a manual override so later auto-detection skips it,
+   *  - ensures the destination work item entity exists,
+   *  - reconciles historical credit-ledger rows for the branch so their
+   *    `workItemId` (and `projectId`, derived from the destination work item's
+   *    project) point at the new work item — mirroring
+   *    {@link setProjectForWorkItem}'s reconciliation loop but keyed by branch.
+   *
+   * Because effort is stored PER BRANCH and rolled up by work item at query
+   * time, re-pointing `data.workItemId` moves ALL accrued effort with the branch;
+   * the ledger loop does the same for recorded credits/cost. A detached-HEAD /
+   * `unknown` branch can be attached here after the fact and its accrued effort
+   * follows — but such branches are never force-merged automatically.
+   */
+  reassignBranchToWorkItem(branch: string, workItemId: string) {
+    const data = this.ensureBranch(branch);
+    this.ensureWorkItem(workItemId);
+    data.workItemId = workItemId;
+    data.workItemIdManual = true;
+    const projectId = this.workItems[workItemId]?.projectId ?? null;
+    for (const e of this.creditLedger) {
+      if (e.branch === branch) {
+        e.workItemId = workItemId;
+        e.projectId = projectId;
+      }
+    }
+    this.save();
+  }
+
+  /** The work item id currently mapped to a branch (or null). */
+  getWorkItemForBranch(branch: string): string | null {
+    return this.store[branch]?.workItemId ?? null;
+  }
+
+  /** Whether a branch's work item mapping was set manually (sticky). */
+  isBranchMappingManual(branch: string): boolean {
+    return !!this.store[branch]?.workItemIdManual;
   }
 
   /** Create the work item entity if missing. Does not persist on its own. */
