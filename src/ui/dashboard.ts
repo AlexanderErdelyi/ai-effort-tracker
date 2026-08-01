@@ -520,7 +520,7 @@ function renderProjectDetail(){
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
   var roi=(!isNone&&p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
   var repos=(!isNone&&p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
-  var setRates=isNone?'':'<button class="dtab" data-action="cmd" data-value="setProjectRates">\\uD83D\\uDCB0 Set Rates</button>';
+  var setRates=isNone?'':'<button class="dtab" data-action="ratesSet" data-id="'+esc(p.projectId)+'" title="Edit this project\\u2019s rates">\\u270E Edit Rates</button>';
   el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'
     +'<div class="sg"><div class="st"><div class="lbl">Project</div><div class="val" style="font-size:.95em;word-break:break-word">'+name+'</div></div>'
     +'<div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(act)+'</div></div>'
@@ -582,7 +582,7 @@ function renderWorkItemDetail(){
   if(!branchRows.length)branchRows=['<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No branches roll up into this work item yet.</td></tr>'];
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
     +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></div>'
-    +'<div class="st"><div class="lbl">Estimate</div><div class="val">'+est+'</div></div>'
+    +'<div class="st"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
     +'<div class="st"><div class="lbl">Actual</div><div class="val">'+fmt(activeMsOf(w))+'</div></div>'
     +'<div class="st"><div class="lbl">Net ROI / AI gain</div><div class="val" style="color:'+moneyColor(I.netGain)+'">'+fmtMoney(I.netGain,I.currency)+'</div></div></div>'
     +'<div class="sg" style="margin-top:4px">'
@@ -779,6 +779,8 @@ document.addEventListener('click',function(e){
   else if(a==='moveBranch')vscode.postMessage({type:'cmd',value:'moveBranchToWorkItem',arg:t.dataset.id});
   else if(a==='reassignBulk')vscode.postMessage({type:'cmd',value:'reassignBranchesBulk',arg:t.dataset.id});
   else if(a==='bhSet')vscode.postMessage({type:'cmd',value:'setBillableHours',arg:t.dataset.id});
+  else if(a==='estSet')vscode.postMessage({type:'cmd',value:'setWorkItemEstimate',arg:t.dataset.id});
+  else if(a==='ratesSet')vscode.postMessage({type:'cmd',value:'setProjectRates',arg:t.dataset.id});
 });`;
 
   return [

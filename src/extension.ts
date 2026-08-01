@@ -185,14 +185,14 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.reassignBranchesBulk', (workItemId?: string) =>
       reassignBranchesBulk(workItemId)
     ),
-    vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', () =>
-      setWorkItemEstimate()
+    vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', (workItemId?: string) =>
+      setWorkItemEstimate(workItemId)
     ),
     vscode.commands.registerCommand('aiEffortTracker.setBillableHours', (workItemId?: string) =>
       setBillableHours(workItemId)
     ),
-    vscode.commands.registerCommand('aiEffortTracker.setProjectRates', () =>
-      setProjectRates()
+    vscode.commands.registerCommand('aiEffortTracker.setProjectRates', (projectId?: string) =>
+      setProjectRates(projectId)
     ),
     vscode.commands.registerCommand('aiEffortTracker.createProject', () => createProject()),
     vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
@@ -491,39 +491,50 @@ async function reassignBranchesBulk(workItemId?: string) {
  * breakdown is captured through a short sequence of input boxes for the four
  * primary categories (programming / specification / documentation / deployment);
  * a blank entry means "skip" (0). Persists via the store API and refreshes the
- * dashboard. Kept intentionally minimal — the estimate-vs-actual report UI is
- * milestone M7 (#28/#29).
+ * dashboard. When a `preselectedId` is passed (issue #50 — the dashboard
+ * Estimate ✎ affordance forwards `m.arg`), the QuickPick is skipped and that
+ * work item is edited directly, prefilled with its current estimate. Kept
+ * intentionally minimal — the estimate-vs-actual report UI is milestone M7
+ * (#28/#29).
  */
-async function setWorkItemEstimate() {
-  type WiPick = vscode.QuickPickItem & { id?: string; create?: boolean };
-  const picks: WiPick[] = db.getAllWorkItems().map(wi => {
-    const total = db.getWorkItemSummary(wi.id).estimate;
-    const unit = wi.estimateUnit ?? 'hours';
-    return {
-      label: '#' + wi.id,
-      description: wi.title ?? undefined,
-      detail: total !== null ? `current estimate: ${total} ${unit}` : 'no estimate yet',
-      id: wi.id
-    };
-  });
-  picks.push({ label: '$(add) New work item\u2026', create: true });
-  const picked = await vscode.window.showQuickPick(picks, {
-    placeHolder: 'Set the estimate for which work item?'
-  });
-  if (!picked) return;
-
+async function setWorkItemEstimate(preselectedId?: string) {
   let workItemId: string;
-  if (picked.create) {
-    const id = await vscode.window.showInputBox({
-      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
-      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
-    });
-    if (!id) return;
-    workItemId = id.trim();
+  if (preselectedId) {
+    // Called from a dashboard card that already knows the target — edit it
+    // directly, skipping the QuickPick (mirrors setBillableHours). Ensure the
+    // work item exists so downstream summary/prefill lookups are safe.
+    workItemId = preselectedId;
     db.upsertWorkItem(workItemId);
   } else {
-    if (!picked.id) return;
-    workItemId = picked.id;
+    type WiPick = vscode.QuickPickItem & { id?: string; create?: boolean };
+    const picks: WiPick[] = db.getAllWorkItems().map(wi => {
+      const total = db.getWorkItemSummary(wi.id).estimate;
+      const unit = wi.estimateUnit ?? 'hours';
+      return {
+        label: '#' + wi.id,
+        description: wi.title ?? undefined,
+        detail: total !== null ? `current estimate: ${total} ${unit}` : 'no estimate yet',
+        id: wi.id
+      };
+    });
+    picks.push({ label: '$(add) New work item\u2026', create: true });
+    const picked = await vscode.window.showQuickPick(picks, {
+      placeHolder: 'Set the estimate for which work item?'
+    });
+    if (!picked) return;
+
+    if (picked.create) {
+      const id = await vscode.window.showInputBox({
+        prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+        validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+      });
+      if (!id) return;
+      workItemId = id.trim();
+      db.upsertWorkItem(workItemId);
+    } else {
+      if (!picked.id) return;
+      workItemId = picked.id;
+    }
   }
 
   const existingUnit = db.getWorkItem(workItemId)?.estimateUnit ?? 'hours';
@@ -659,10 +670,13 @@ async function setBillableHours(workItemId?: string) {
  * hourly COST, hourly SELL rate, currency, and credit cost. Blank leaves a field
  * unset so it inherits the global default (and, for cost/credit, the legacy
  * setting). Persists into `Project.settings` via {@link Database.upsertProject},
- * merging with any existing settings so unrelated keys survive. The full project
- * setup UI is #27; this is intentionally the command + persistence only.
+ * merging with any existing settings so unrelated keys survive. When a
+ * `preselectedId` is passed (issue #50 — the project card ✎ Edit Rates button
+ * forwards `m.arg`), the QuickPick is skipped and that project is edited
+ * directly, prefilled with its current settings. The full project setup UI is
+ * #27; this is intentionally the command + persistence only.
  */
-async function setProjectRates() {
+async function setProjectRates(preselectedId?: string) {
   const projects = db.getAllProjects();
   if (projects.length === 0) {
     vscode.window.showWarningMessage(
@@ -671,25 +685,41 @@ async function setProjectRates() {
     return;
   }
 
-  type ProjPick = vscode.QuickPickItem & { id: string };
-  const picks: ProjPick[] = projects.map(p => {
-    const r = p.settings ?? {};
-    const bits: string[] = [];
-    if (typeof r.hourlyCostRate === 'number') bits.push(`cost ${r.hourlyCostRate}`);
-    if (typeof r.hourlySellRate === 'number') bits.push(`sell ${r.hourlySellRate}`);
-    return {
-      label: p.name,
-      description: p.repos.join(', ') || undefined,
-      detail: bits.length ? `current: ${bits.join(' \u00b7 ')} ${r.currency ?? ''}`.trim() : 'no rates set',
-      id: p.id
-    };
-  });
-  const picked = await vscode.window.showQuickPick(picks, {
-    placeHolder: 'Set rates for which project?'
-  });
-  if (!picked) return;
+  let projectId: string;
+  let projectLabel: string;
+  if (preselectedId) {
+    // Called from a project card that already knows the target — edit it
+    // directly, skipping the QuickPick (mirrors setBillableHours).
+    const proj = db.getProject(preselectedId);
+    if (!proj) {
+      vscode.window.showWarningMessage('That project no longer exists.');
+      return;
+    }
+    projectId = proj.id;
+    projectLabel = proj.name;
+  } else {
+    type ProjPick = vscode.QuickPickItem & { id: string };
+    const picks: ProjPick[] = projects.map(p => {
+      const r = p.settings ?? {};
+      const bits: string[] = [];
+      if (typeof r.hourlyCostRate === 'number') bits.push(`cost ${r.hourlyCostRate}`);
+      if (typeof r.hourlySellRate === 'number') bits.push(`sell ${r.hourlySellRate}`);
+      return {
+        label: p.name,
+        description: p.repos.join(', ') || undefined,
+        detail: bits.length ? `current: ${bits.join(' \u00b7 ')} ${r.currency ?? ''}`.trim() : 'no rates set',
+        id: p.id
+      };
+    });
+    const picked = await vscode.window.showQuickPick(picks, {
+      placeHolder: 'Set rates for which project?'
+    });
+    if (!picked) return;
+    projectId = picked.id;
+    projectLabel = picked.label;
+  }
 
-  const project = db.getProject(picked.id);
+  const project = db.getProject(projectId);
   const existing = project?.settings ?? {};
 
   // Blank input ⇒ leave the field unset (inherit global/legacy). Non-negative number otherwise.
@@ -711,24 +741,24 @@ async function setProjectRates() {
   };
 
   const cost = await numInput(
-    `Hourly COST for "${picked.label}" (what an hour costs) — blank to inherit default`,
+    `Hourly COST for "${projectLabel}" (what an hour costs) — blank to inherit default`,
     existing.hourlyCostRate
   );
   if (!cost.ok) return;
   const sell = await numInput(
-    `Hourly SELL rate for "${picked.label}" (what an hour is billed for) — blank to inherit`,
+    `Hourly SELL rate for "${projectLabel}" (what an hour is billed for) — blank to inherit`,
     existing.hourlySellRate
   );
   if (!sell.ok) return;
 
   const currencyRaw = await vscode.window.showInputBox({
-    prompt: `Currency for "${picked.label}" (e.g. USD, EUR) — blank to inherit`,
+    prompt: `Currency for "${projectLabel}" (e.g. USD, EUR) — blank to inherit`,
     value: typeof existing.currency === 'string' ? existing.currency : ''
   });
   if (currencyRaw === undefined) return;
 
   const creditCost = await numInput(
-    `Credit cost for "${picked.label}" (money per 1 credit/premium request) — blank to inherit`,
+    `Credit cost for "${projectLabel}" (money per 1 credit/premium request) — blank to inherit`,
     existing.creditCostPerUnit
   );
   if (!creditCost.ok) return;
@@ -739,12 +769,12 @@ async function setProjectRates() {
   settings.hourlySellRate = sell.value;
   settings.currency = currencyRaw.trim() ? currencyRaw.trim() : undefined;
   settings.creditCostPerUnit = creditCost.value;
-  db.upsertProject({ id: picked.id, settings });
+  db.upsertProject({ id: projectId, settings });
 
-  const eff = db.getEffectiveRates(picked.id);
+  const eff = db.getEffectiveRates(projectId);
   const fmt = (n: number | null) => (n === null ? '\u2014' : String(n));
   vscode.window.showInformationMessage(
-    `Rates for "${picked.label}" saved. Effective: cost ${fmt(eff.hourlyCostRate)}, ` +
+    `Rates for "${projectLabel}" saved. Effective: cost ${fmt(eff.hourlyCostRate)}, ` +
     `sell ${fmt(eff.hourlySellRate)}, credit ${fmt(eff.creditCostPerUnit)} (${eff.currency}).`
   );
   refreshDashboard();
