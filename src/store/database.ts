@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES } from '../util/fileTypes';
@@ -51,6 +52,53 @@ export interface CreditEntry {
   model: string;
   credits: number;
   note?: string;
+}
+
+/** How a {@link LedgerEntry} was captured. */
+export type LedgerSource = 'manual' | 'auto' | 'import';
+
+/**
+ * A first-class credit ledger row (issue #11 / milestone M2). Unlike the legacy
+ * per-branch {@link CreditEntry}, ledger entries live at the TOP LEVEL of the
+ * store so credit/cost can be summed across branches by work item, project, or
+ * period. `source` separates ESTIMATED auto captures from manual/import so
+ * callers can compute manual-only vs auto vs all (addresses the #17
+ * over-counting concern). Attribution (`branch`/`workItemId`/`projectId`) is
+ * resolved at write/migration time and stored on the row.
+ */
+export interface LedgerEntry {
+  id: string;
+  ts: number;
+  model: string;
+  credits: number;
+  cost?: number;
+  source: LedgerSource;
+  branch?: string;
+  workItemId?: string | null;
+  projectId?: string | null;
+  chatSessionId?: string | null;
+  note?: string;
+}
+
+/** Optional filter for {@link Database.getCredits} and its wrappers. */
+export interface CreditQuery {
+  branch?: string;
+  workItemId?: string | null;
+  projectId?: string | null;
+  source?: LedgerSource;
+  /** Inclusive lower bound on entry timestamp (ms). */
+  from?: number;
+  /** Inclusive upper bound on entry timestamp (ms). */
+  to?: number;
+}
+
+/** Summable credit/cost totals for a ledger slice. */
+export interface CreditTotals {
+  credits: number;
+  cost: number;
+  entries: number;
+  byModel: { model: string; credits: number; turns: number }[];
+  bySource: { manual: number; auto: number; import: number };
 }
 
 /** One calendar day of activity for a branch (key = YYYY-MM-DD, local time). */
@@ -189,6 +237,8 @@ export interface PersistedStore {
   schemaVersion: number;
   branches: Store;
   workItems: Record<string, WorkItem>;
+  /** First-class credit ledger (issue #11). Top-level so it spans branches. */
+  creditLedger: LedgerEntry[];
 }
 
 /** Aggregated effort for a single work item, rolled up across all its branches. */
@@ -234,7 +284,7 @@ export type BranchRollup = Omit<
 >;
 
 /** Current persisted schema version. Bump when the on-disk shape changes. */
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 /** Branch buckets that never map to a real work item (detached HEAD / worktrees). */
 const NON_WORK_ITEM_IDS = new Set<string>(['unknown']);
@@ -273,6 +323,63 @@ export function backfillWorkItems(
   }
 }
 
+/** Generate a collision-resistant ledger id without adding a runtime dependency. */
+export function newLedgerId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    // Extremely old runtimes without randomUUID — fall back to a unique-enough id.
+    return `led-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+/** Infer a ledger {@link LedgerSource} from a legacy credit note. */
+export function inferLedgerSource(note?: string): LedgerSource {
+  return note && note.startsWith('auto') ? 'auto' : 'manual';
+}
+
+/**
+ * Fold every branch's legacy per-branch `creditsLog` into the top-level
+ * {@link LedgerEntry} ledger (issue #11), attributing `branch` and resolving
+ * `workItemId`/`projectId` from the branch/work item AT MIGRATION TIME. The
+ * consumed `creditsLog` is removed from the branch so the fold is idempotent:
+ * re-running finds nothing left to move and never double-counts. Pure over the
+ * passed structures, so it is easy to unit test. No credit data is lost.
+ */
+export function foldCreditsLogIntoLedger(
+  branches: Store,
+  workItems: Record<string, WorkItem>,
+  ledger: LedgerEntry[]
+): void {
+  for (const [branch, data] of Object.entries(branches)) {
+    if (!data || typeof data !== 'object') continue;
+    const log = data.creditsLog;
+    if (!Array.isArray(log) || log.length === 0) {
+      // Nothing to fold — still drop any empty legacy array for a clean shape.
+      if ('creditsLog' in data) delete data.creditsLog;
+      continue;
+    }
+    const workItemId = data.workItemId ?? null;
+    const projectId =
+      workItemId && workItems[workItemId] ? workItems[workItemId].projectId ?? null : null;
+    for (const e of log) {
+      ledger.push({
+        id: newLedgerId(),
+        ts: e.ts,
+        model: e.model,
+        credits: e.credits,
+        source: inferLedgerSource(e.note),
+        branch,
+        workItemId,
+        projectId,
+        chatSessionId: null,
+        note: e.note
+      });
+    }
+    delete data.creditsLog;
+  }
+}
+
 /**
  * Normalize any parsed JSON into the current {@link PersistedStore} shape.
  * Accepts both the legacy flat `Record<branch, BranchData>` (schemaVersion 0,
@@ -280,16 +387,22 @@ export function backfillWorkItems(
  * branch records — only the top-level container is reshaped.
  */
 export function migrateStore(parsed: unknown): PersistedStore {
+  let branches: Store;
+  let workItems: Record<string, WorkItem>;
+  let creditLedger: LedgerEntry[];
   if (isEnvelope(parsed)) {
-    const branches = (parsed.branches ?? {}) as Store;
-    const workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
-    backfillWorkItems(branches, workItems);
-    return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems };
+    branches = (parsed.branches ?? {}) as Store;
+    workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
+    const existing = (parsed as PersistedStore).creditLedger;
+    creditLedger = Array.isArray(existing) ? existing : [];
+  } else {
+    branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
+    workItems = {};
+    creditLedger = [];
   }
-  const branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
-  const workItems: Record<string, WorkItem> = {};
   backfillWorkItems(branches, workItems);
-  return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems };
+  foldCreditsLogIntoLedger(branches, workItems, creditLedger);
+  return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems, creditLedger };
 }
 
 function emptyCategoryMap(): Record<string, { human: LineStats; ai: LineStats }> {
@@ -403,6 +516,7 @@ export class Database {
   private bakPath: string;
   private store: Store;
   private workItems: Record<string, WorkItem>;
+  private creditLedger: LedgerEntry[];
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -419,6 +533,7 @@ export class Database {
     this.schemaVersion = loaded.schemaVersion;
     this.store = loaded.branches;
     this.workItems = loaded.workItems;
+    this.creditLedger = loaded.creditLedger;
   }
 
   /** Build the on-disk envelope from the in-memory state. */
@@ -426,7 +541,8 @@ export class Database {
     const envelope: PersistedStore = {
       schemaVersion: this.schemaVersion,
       branches: this.store,
-      workItems: this.workItems
+      workItems: this.workItems,
+      creditLedger: this.creditLedger
     };
     return JSON.stringify(envelope, null, 2);
   }
@@ -705,10 +821,43 @@ export class Database {
     this.save();
   }
 
+  /**
+   * Append a row to the top-level credit ledger, resolving work item / project
+   * attribution from the branch at write time. Central path for all writers so
+   * the ledger stays the single source of truth (issue #11).
+   */
+  private appendLedger(
+    branch: string,
+    model: string,
+    credits: number,
+    source: LedgerSource,
+    note?: string,
+    extra?: { cost?: number; chatSessionId?: string | null }
+  ): LedgerEntry {
+    const data = this.ensureBranch(branch);
+    const workItemId = data.workItemId ?? null;
+    const projectId =
+      workItemId && this.workItems[workItemId] ? this.workItems[workItemId].projectId ?? null : null;
+    const entry: LedgerEntry = {
+      id: newLedgerId(),
+      ts: Date.now(),
+      model,
+      credits,
+      source,
+      branch,
+      workItemId,
+      projectId,
+      chatSessionId: extra?.chatSessionId ?? null,
+      note
+    };
+    if (extra?.cost !== undefined) entry.cost = extra.cost;
+    this.creditLedger.push(entry);
+    return entry;
+  }
+
   recordCredits(branch: string, model: string, credits: number, note?: string) {
     const data = this.ensureBranch(branch);
-    if (!data.creditsLog) data.creditsLog = [];
-    data.creditsLog.push({ ts: Date.now(), model, credits, note });
+    this.appendLedger(branch, model, credits, 'manual', note);
     data.chatTurnsHuman = (data.chatTurnsHuman ?? 0) + 1;
     this.save();
   }
@@ -717,12 +866,12 @@ export class Database {
    * Record model usage auto-captured from the Copilot chat log. Unlike
    * recordCredits (manual entry), this does NOT count as a human chat turn,
    * so the human interaction metric stays clean. `credits` is an ESTIMATED
-   * premium-request weight; the GitHub billing import remains authoritative.
+   * premium-request weight (stored with source `auto` so it can be separated
+   * from manual/import totals); the GitHub billing import remains authoritative.
    */
   recordAutoModelUsage(branch: string, model: string, credits: number, note?: string) {
     const data = this.ensureBranch(branch);
-    if (!data.creditsLog) data.creditsLog = [];
-    data.creditsLog.push({ ts: Date.now(), model, credits, note: note ?? 'auto' });
+    this.appendLedger(branch, model, credits, 'auto', note ?? 'auto');
     data.autoModelRequests = (data.autoModelRequests ?? 0) + 1;
     this.save();
   }
@@ -853,6 +1002,7 @@ export class Database {
       }
     }
 
+    const creditTotals = this.getCreditsForBranch(branch);
     return {
       branch,
       workItemId: data.workItemId,
@@ -876,8 +1026,8 @@ export class Database {
       aiChatLines: data.aiChatLines ?? 0,
       aiInlineChars: data.aiInlineChars ?? 0,
       aiChatChars: data.aiChatChars ?? 0,
-      creditsTotal: (data.creditsLog ?? []).reduce((a, e) => a + e.credits, 0),
-      creditsByModel: this.aggregateCredits(data.creditsLog ?? []),
+      creditsTotal: creditTotals.credits,
+      creditsByModel: creditTotals.byModel,
       byExt: data.lineChanges,
       byCategory
     };
@@ -1060,15 +1210,73 @@ export class Database {
     return out;
   }
 
-  private aggregateCredits(log: CreditEntry[]): { model: string; credits: number; turns: number }[] {
-    const map: Record<string, { credits: number; turns: number }> = {};
-    for (const e of log) {
-      if (!map[e.model]) map[e.model] = { credits: 0, turns: 0 };
-      map[e.model].credits += e.credits;
-      map[e.model].turns += 1;
+  // ---- Credit ledger queries (issue #11) --------------------------------
+
+  /** Raw ledger rows matching a filter, sorted newest-first. */
+  getCreditEntries(query: CreditQuery = {}): LedgerEntry[] {
+    return this.creditLedger
+      .filter(e => this.matchesCreditQuery(e, query))
+      .sort((a, b) => b.ts - a.ts);
+  }
+
+  private matchesCreditQuery(e: LedgerEntry, q: CreditQuery): boolean {
+    if (q.branch !== undefined && e.branch !== q.branch) return false;
+    if (q.workItemId !== undefined && (e.workItemId ?? null) !== q.workItemId) return false;
+    if (q.projectId !== undefined && (e.projectId ?? null) !== q.projectId) return false;
+    if (q.source !== undefined && e.source !== q.source) return false;
+    if (q.from !== undefined && e.ts < q.from) return false;
+    if (q.to !== undefined && e.ts > q.to) return false;
+    return true;
+  }
+
+  /**
+   * Summable credit/cost totals for a ledger slice (issue #11). Splitting by
+   * `source` lets callers separate ESTIMATED auto credits from manual/import
+   * (addresses the #17 over-counting concern).
+   */
+  getCredits(query: CreditQuery = {}): CreditTotals {
+    const byModel: Record<string, { credits: number; turns: number }> = {};
+    const totals: CreditTotals = {
+      credits: 0,
+      cost: 0,
+      entries: 0,
+      byModel: [],
+      bySource: { manual: 0, auto: 0, import: 0 }
+    };
+    for (const e of this.creditLedger) {
+      if (!this.matchesCreditQuery(e, query)) continue;
+      totals.credits += e.credits;
+      totals.cost += e.cost ?? 0;
+      totals.entries += 1;
+      totals.bySource[e.source] += e.credits;
+      if (!byModel[e.model]) byModel[e.model] = { credits: 0, turns: 0 };
+      byModel[e.model].credits += e.credits;
+      byModel[e.model].turns += 1;
     }
-    return Object.entries(map)
+    totals.byModel = Object.entries(byModel)
       .map(([model, v]) => ({ model, credits: v.credits, turns: v.turns }))
       .sort((a, b) => b.credits - a.credits);
+    return totals;
+  }
+
+  /** Credit totals for one branch (optionally filtered by period/source). */
+  getCreditsForBranch(branch: string, query: Omit<CreditQuery, 'branch'> = {}): CreditTotals {
+    return this.getCredits({ ...query, branch });
+  }
+
+  /** Credit totals rolled up for a work item across all its branches. */
+  getCreditsForWorkItem(
+    workItemId: string,
+    query: Omit<CreditQuery, 'workItemId'> = {}
+  ): CreditTotals {
+    return this.getCredits({ ...query, workItemId });
+  }
+
+  /** Credit totals rolled up for a project across all its work items/branches. */
+  getCreditsForProject(
+    projectId: string,
+    query: Omit<CreditQuery, 'projectId'> = {}
+  ): CreditTotals {
+    return this.getCredits({ ...query, projectId });
   }
 }
