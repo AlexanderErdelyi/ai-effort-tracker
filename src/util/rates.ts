@@ -105,10 +105,23 @@ export const MS_PER_HOUR = 3_600_000;
 /** Raw inputs the ROI math needs for a project (or work item). */
 export interface RoiInput {
   /**
-   * Billable active time in ms. Convention (documented): the sum of
-   * human-coding + AI-generating + reviewing modes; `idle` never counts.
+   * ACTUAL worked time in ms. Convention (documented): the sum of
+   * human-coding + AI-generating + reviewing modes; `idle` never counts. This is
+   * the wall-clock effort actually spent and is the basis for cost + the
+   * "value at cost of time" (`soldValue`).
    */
   billableMs: number;
+  /**
+   * Optional 'could-charge' billable hours (issue #46), DECOUPLED from the
+   * actual worked time in {@link billableMs}. With AI leverage a subject can be
+   * invoiced for MORE hours than were physically worked (e.g. worked 1h, deliver
+   * 2h of value). When provided (a finite, non-negative number) it drives
+   * {@link RoiFigures.invoiceValue}/`netGain`/`profit`; when omitted or invalid
+   * these fall back to the actual worked hours so a subject with no explicit
+   * billable quantity (a branch or project) still invoices at the cost of its
+   * time and nothing regresses. Never NaN by construction.
+   */
+  billableHours?: number;
   /** Total credits (premium requests) attributed to the subject. */
   credits: number;
   /**
@@ -128,8 +141,20 @@ export interface RoiInput {
  * By construction no field is ever NaN.
  */
 export interface RoiFigures {
-  /** {@link RoiInput.billableMs} expressed in hours. */
+  /**
+   * ACTUAL worked hours = {@link RoiInput.billableMs} expressed in hours. Kept
+   * under its historical name so pre-#46 callers are unaffected; it is the same
+   * value as {@link actualHours}.
+   */
   billableHours: number;
+  /** Actual worked hours (issue #46) — alias of {@link billableHours}, named for clarity. */
+  actualHours: number;
+  /**
+   * The 'could-charge' hours actually used for invoicing (issue #46): the
+   * explicit {@link RoiInput.billableHours} when provided, else the actual
+   * worked hours. Always a finite, non-negative number.
+   */
+  chargeableHours: number;
   hourlyCostRate: number | null;
   hourlySellRate: number | null;
   creditCostPerUnit: number | null;
@@ -140,10 +165,34 @@ export interface RoiFigures {
   creditCost: number | null;
   /** laborCost + creditCost (each treated as 0 only when the OTHER is present). Null when both null. */
   totalCost: number | null;
-  /** hours * hourlySellRate. Null when the sell rate is unset. */
+  /**
+   * ACTUAL hours * hourlySellRate — the value of the time actually spent, at the
+   * sell rate. Null when the sell rate is unset. Unchanged since #45 so the
+   * branch/project "Value Produced" + net ROI keep rendering.
+   */
   soldValue: number | null;
-  /** soldValue - totalCost. Null when either side is unresolved. */
+  /** soldValue - totalCost. Null when either side is unresolved. Unchanged since #45. */
   netValue: number | null;
+  /**
+   * chargeableHours * hourlySellRate (issue #46) — what the subject can be
+   * INVOICED for given its 'could-charge' hours. Equals {@link soldValue} when
+   * no explicit billable quantity is supplied. Null when the sell rate is unset.
+   */
+  invoiceValue: number | null;
+  /**
+   * The AI-leverage gain (issue #46): `invoiceValue - (actualHours * sellRate) -
+   * creditCost`, i.e. `invoiceValue - soldValue - creditCost`. The primary/
+   * headline ROI figure. Null when the sell rate is unset (creditCost counts as
+   * 0 when unconfigured so the figure is never NaN).
+   */
+  netGain: number | null;
+  /**
+   * Profit against internal cost (issue #46): `invoiceValue - (actualHours *
+   * costRate) - creditCost`, i.e. `invoiceValue - laborCost - creditCost`. Null
+   * unless BOTH a sell rate and a cost rate are configured (creditCost counts as
+   * 0 when unconfigured); never NaN.
+   */
+  profit: number | null;
 }
 
 /** Add two `number | null` values, returning null only when BOTH are null. Pure. */
@@ -162,10 +211,18 @@ export function computeRoiFigures(input: RoiInput): RoiFigures {
   const billableMs = Number.isFinite(input.billableMs) && input.billableMs > 0 ? input.billableMs : 0;
   const credits = Number.isFinite(input.credits) && input.credits > 0 ? input.credits : 0;
   const ledgerCost = Number.isFinite(input.ledgerCost) && input.ledgerCost > 0 ? input.ledgerCost : 0;
-  const billableHours = billableMs / MS_PER_HOUR;
+  const actualHours = billableMs / MS_PER_HOUR;
+  // #46: the 'could-charge' hours default to the actual worked hours unless an
+  // explicit (finite, non-negative) override is supplied — never NaN.
+  const chargeableHours =
+    typeof input.billableHours === 'number' &&
+    Number.isFinite(input.billableHours) &&
+    input.billableHours >= 0
+      ? input.billableHours
+      : actualHours;
 
   const laborCost =
-    rates.hourlyCostRate !== null ? billableHours * rates.hourlyCostRate : null;
+    rates.hourlyCostRate !== null ? actualHours * rates.hourlyCostRate : null;
 
   let creditCost: number | null;
   if (ledgerCost > 0) {
@@ -178,14 +235,33 @@ export function computeRoiFigures(input: RoiInput): RoiFigures {
 
   const totalCost = addNullable(laborCost, creditCost);
 
+  // #45 (unchanged): value of the ACTUAL time spent, at the sell rate.
   const soldValue =
-    rates.hourlySellRate !== null ? billableHours * rates.hourlySellRate : null;
+    rates.hourlySellRate !== null ? actualHours * rates.hourlySellRate : null;
 
   const netValue =
     soldValue !== null && totalCost !== null ? soldValue - totalCost : null;
 
+  // #46: invoice from the decoupled 'could-charge' hours.
+  const invoiceValue =
+    rates.hourlySellRate !== null ? chargeableHours * rates.hourlySellRate : null;
+
+  // creditCost is treated as 0 when unconfigured so the gain/profit are never
+  // NaN; they still go null whenever the rate they truly depend on is missing.
+  const creditCostForGain = creditCost ?? 0;
+  const netGain =
+    invoiceValue !== null && soldValue !== null
+      ? invoiceValue - soldValue - creditCostForGain
+      : null;
+  const profit =
+    invoiceValue !== null && laborCost !== null
+      ? invoiceValue - laborCost - creditCostForGain
+      : null;
+
   return {
-    billableHours,
+    billableHours: actualHours,
+    actualHours,
+    chargeableHours,
     hourlyCostRate: rates.hourlyCostRate,
     hourlySellRate: rates.hourlySellRate,
     creditCostPerUnit: rates.creditCostPerUnit,
@@ -194,6 +270,9 @@ export function computeRoiFigures(input: RoiInput): RoiFigures {
     creditCost,
     totalCost,
     soldValue,
-    netValue
+    netValue,
+    invoiceValue,
+    netGain,
+    profit
   };
 }

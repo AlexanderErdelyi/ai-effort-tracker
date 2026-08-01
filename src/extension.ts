@@ -188,6 +188,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', () =>
       setWorkItemEstimate()
     ),
+    vscode.commands.registerCommand('aiEffortTracker.setBillableHours', (workItemId?: string) =>
+      setBillableHours(workItemId)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.setProjectRates', () =>
       setProjectRates()
     ),
@@ -585,6 +588,69 @@ async function setWorkItemEstimate() {
   vscode.window.showInformationMessage(
     `Estimate for #${workItemId} set to ${total} ${unit}.`
   );
+  refreshDashboard();
+}
+
+/**
+ * Set (or clear) a work item's manual 'could-charge' billable-hours override
+ * (issue #46), DECOUPLED from the actual tracked time. Accepts an optional
+ * `workItemId` (mirroring the `m.arg` pattern) so a dashboard button can target
+ * a specific item; otherwise it QuickPicks one. The InputBox is prefilled with
+ * the CURRENT effective billable hours (the override when set, else the
+ * estimate-in-hours / actual-hours default) and its prompt names that default;
+ * submitting blank CLEARS the override so it falls back to the default again.
+ */
+async function setBillableHours(workItemId?: string) {
+  let id = workItemId;
+  if (!id) {
+    id = await pickWorkItem('Set billable (could-charge) hours for which work item?');
+    if (!id) return;
+  }
+
+  const summary = db.getWorkItemSummary(id);
+  const roi = summary.roi;
+  const override = db.getWorkItem(id)?.billableHours;
+  // The estimate-derived default the effective hours would fall back to when no
+  // override is set (estimate-in-hours, else actual worked hours).
+  const estUnit = summary.estimateUnit ?? 'hours';
+  const estimate = summary.estimate;
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const actualHours = round2(roi.actualHours ?? 0);
+  const defaultHours =
+    estimate !== null && estUnit === 'hours' ? round2(estimate) : actualHours;
+  const defaultLabel =
+    estimate !== null && estUnit === 'hours'
+      ? `estimate ${defaultHours}h`
+      : `actual ${actualHours}h`;
+  // Effective = what invoicing uses right now (override else default).
+  const effective = round2(roi.chargeableHours ?? defaultHours);
+
+  const raw = await vscode.window.showInputBox({
+    prompt:
+      `Billable (could-charge) hours for #${id} — blank to clear the override ` +
+      `(default = ${defaultLabel}, actual worked = ${actualHours}h)`,
+    value: override !== undefined ? String(round2(override)) : String(effective),
+    placeHolder: `e.g. ${defaultHours} — leverage lets you charge more hours than you worked`,
+    validateInput: v => {
+      if (!v.trim()) return null; // blank = clear
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? null : 'Enter a non-negative number';
+    }
+  });
+  if (raw === undefined) return;
+
+  if (!raw.trim()) {
+    db.setBillableHours(id, null);
+    vscode.window.showInformationMessage(
+      `Billable-hours override for #${id} cleared — now defaults to ${defaultLabel}.`
+    );
+  } else {
+    const hours = Number(raw);
+    db.setBillableHours(id, hours);
+    vscode.window.showInformationMessage(
+      `Billable (could-charge) hours for #${id} set to ${hours}h.`
+    );
+  }
   refreshDashboard();
 }
 

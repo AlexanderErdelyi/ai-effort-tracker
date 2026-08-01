@@ -8,6 +8,7 @@ import type { FileCategory } from '../util/fileTypes';
 import {
   resolveEffectiveRates,
   computeRoiFigures,
+  MS_PER_HOUR,
   type EffectiveRates,
   type RateGlobals,
   type RoiFigures
@@ -383,6 +384,16 @@ export interface WorkItem {
   estimateBreakdown?: EstimateBreakdown;
   /** Unit the estimate numbers are expressed in (issue #16). Defaults to 'hours'. */
   estimateUnit?: EstimateUnit;
+  /**
+   * Manual 'could-charge' billable-hours override (issue #46), DECOUPLED from
+   * the actual tracked time. When set to a finite, non-negative number it is the
+   * billable quantity used for the invoice/ROI economics; when `null`/absent the
+   * effective billable hours default to the work item's total estimate (only
+   * when {@link estimateUnit} is hours) and finally to the actual worked hours.
+   * A 'points' estimate is never used as billable hours. See
+   * {@link Database.setBillableHours} / `effectiveBillableHours`.
+   */
+  billableHours?: number;
 }
 
 /** Categories an estimate can be broken down by — reuses {@link FileCategory}. */
@@ -638,8 +649,19 @@ export interface ProjectRoi extends RoiFigures {
  * `[]` for every pre-v7 file (both the current envelope and the legacy flat map)
  * exactly as `manualEffort`/`creditLedger` are defaulted, so a v6 → v7 load is a
  * pure, idempotent, zero-loss default with no rewrite of existing data.
+ *
+ * v8 (issue #46) adds optional `WorkItem.billableHours` — the manual
+ * 'could-charge' hours override, DECOUPLED from actual worked time. No data
+ * rewrite is needed: a pre-v8 work item simply has the field undefined, which
+ * means "use the default" (estimate-in-hours, else actual hours). For BOTH the
+ * current envelope AND the legacy flat map, {@link migrateStore} runs
+ * {@link normalizeWorkItemBillableHours}, which only strips a persisted
+ * `billableHours` that is not a finite, non-negative number. That is pure,
+ * idempotent and zero-loss (a valid value round-trips untouched; an invalid one
+ * would have been ignored by the ROI math anyway), so a v7 → v8 load never NaNs
+ * and never loses data.
  */
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -906,6 +928,9 @@ export function migrateStore(parsed: unknown): PersistedStore {
     reassignments = [];
   }
   backfillWorkItems(branches, workItems);
+  // #46: default/sanitize the optional billableHours override on every work item
+  // for BOTH shapes (envelope + legacy flat map converge on `workItems` here).
+  normalizeWorkItemBillableHours(workItems);
   // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
   // their legacy credit log is attributed to the resolved/holding work item.
   assignUnmappedBranches(branches, workItems, extractWorkItemId);
@@ -919,6 +944,27 @@ export function migrateStore(parsed: unknown): PersistedStore {
     manualEffort,
     reassignments
   };
+}
+
+/**
+ * Sanitize the optional {@link WorkItem.billableHours} override on every work
+ * item in place (issue #46 / schema v8). Deletes the field whenever it is not a
+ * finite, non-negative number; a valid override is left untouched. Pure over its
+ * inputs, idempotent (re-running on already-clean data is a no-op) and zero-loss
+ * (only invalid values — which the ROI math would ignore anyway — are removed),
+ * so it can never introduce a NaN or drop real data. Mirrors the defaulting done
+ * for `manualEffort`/`reassignments`.
+ */
+export function normalizeWorkItemBillableHours(workItems: Record<string, WorkItem>): void {
+  if (!workItems || typeof workItems !== 'object') return;
+  for (const wi of Object.values(workItems)) {
+    if (!wi || typeof wi !== 'object') continue;
+    const bh = (wi as WorkItem).billableHours;
+    if (bh === undefined) continue;
+    if (typeof bh !== 'number' || !Number.isFinite(bh) || bh < 0) {
+      delete (wi as WorkItem).billableHours;
+    }
+  }
 }
 
 /**
@@ -1886,6 +1932,45 @@ export class Database {
   }
 
   /**
+   * Set (or clear) a work item's manual 'could-charge' billable-hours override
+   * (issue #46). Pass a finite, non-negative number to pin the billable hours;
+   * pass `null` (or a NaN/negative value) to CLEAR the override so the effective
+   * billable hours fall back to the estimate-in-hours and then the actual worked
+   * hours (see {@link effectiveBillableHours}). Persists via the durable
+   * {@link save} path. Never stores a NaN.
+   */
+  setBillableHours(workItemId: string, hours: number | null): WorkItem {
+    const wi = this.ensureWorkItem(workItemId);
+    if (hours === null || typeof hours !== 'number' || !Number.isFinite(hours) || hours < 0) {
+      delete wi.billableHours;
+    } else {
+      wi.billableHours = hours;
+    }
+    this.save();
+    return wi;
+  }
+
+  /**
+   * Resolve a work item's effective 'could-charge' billable hours (issue #46):
+   * the manual {@link WorkItem.billableHours} override when set; else the total
+   * estimate ONLY when it is expressed in hours; else the `actualHours` worked.
+   * A 'points' estimate never counts (it is not a duration). Always returns a
+   * finite, non-negative number. Pure over its inputs.
+   */
+  private effectiveBillableHours(wi: WorkItem, actualHours: number): number {
+    const override = wi.billableHours;
+    if (typeof override === 'number' && Number.isFinite(override) && override >= 0) {
+      return override;
+    }
+    const unit = wi.estimateUnit ?? 'hours';
+    if (unit === 'hours') {
+      const est = workItemTotalEstimate(wi);
+      if (est !== null && Number.isFinite(est) && est >= 0) return est;
+    }
+    return actualHours;
+  }
+
+  /**
    * Normalize + store a breakdown on a work item and resync the scalar total.
    * Keeps only finite numeric category entries; an empty/absent breakdown is
    * removed and the scalar `estimate` is left as-is. Does not persist on its own.
@@ -1942,10 +2027,16 @@ export class Database {
     const manual = this.manualRollupForWorkItem(workItemId);
     mergeManualRollup(rollup, manual);
     const billableMs = rollup.humanCodingMs + rollup.aiGeneratingMs + rollup.reviewingMs;
+    // #46: decouple the 'could-charge' billable hours from the actual worked
+    // hours before computing ROI, so invoice value / net gain / profit reflect
+    // AI leverage instead of just wall-clock time.
+    const actualHours = billableMs / MS_PER_HOUR;
+    const billableHours = this.effectiveBillableHours(wi, actualHours);
     const roi = this.roiForSubject(
       wi.projectId ?? null,
       billableMs,
-      this.getCreditsForWorkItem(workItemId)
+      this.getCreditsForWorkItem(workItemId),
+      billableHours
     );
     return {
       workItemId: wi.id,
@@ -2545,13 +2636,15 @@ export class Database {
   private roiForSubject(
     projectId: string | null | undefined,
     billableMs: number,
-    credits: CreditTotals
+    credits: CreditTotals,
+    billableHours?: number
   ): RoiFigures {
     return computeRoiFigures({
       billableMs,
       credits: credits.credits,
       ledgerCost: credits.cost,
-      rates: this.getEffectiveRates(projectId ?? undefined)
+      rates: this.getEffectiveRates(projectId ?? undefined),
+      ...(billableHours !== undefined ? { billableHours } : {})
     });
   }
 
