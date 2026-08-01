@@ -88,6 +88,88 @@ export interface LedgerEntry {
   note?: string;
 }
 
+/**
+ * A hand-entered effort/time/line adjustment for a work item (issue #21 /
+ * milestone M5). Mirrors the first-class credit ledger ({@link LedgerEntry}):
+ * manual effort lives at the TOP LEVEL of the store (its own `manualEffort`
+ * array) so a user can CORRECT under/over-tracked effort per work item without
+ * touching the automatic per-branch capture path (issue #17). `source` is fixed
+ * to `'manual'` so these rows are always separable from auto-captured data.
+ *
+ * All measurement fields are optional so one entry can add just time, just
+ * lines, or both:
+ *  - `mode` + `durationMs` add time onto that {@link TrackingMode} bucket.
+ *  - `category` + `linesAdded`/`linesDeleted` add lines onto that
+ *    {@link FileCategory} bucket, on the AI side when `isAi` is true else human.
+ */
+export interface ManualEffortEntry {
+  id: string;
+  ts: number;
+  workItemId: string;
+  mode?: TrackingMode;
+  category?: FileCategory;
+  durationMs?: number;
+  linesAdded?: number;
+  linesDeleted?: number;
+  isAi?: boolean;
+  note?: string;
+  source: 'manual';
+}
+
+/**
+ * Caller-supplied fields for {@link Database.addManualEffort}. `id`/`source` are
+ * assigned by the store; `ts` defaults to now when omitted.
+ */
+export interface ManualEffortInput {
+  workItemId: string;
+  ts?: number;
+  mode?: TrackingMode;
+  category?: FileCategory;
+  durationMs?: number;
+  linesAdded?: number;
+  linesDeleted?: number;
+  isAi?: boolean;
+  note?: string;
+}
+
+/**
+ * Editable fields for {@link Database.updateManualEffort} (issue #21). Only keys
+ * that are present are applied. `id`/`source` are intentionally NOT editable so
+ * a row's identity and provenance survive an edit. Passing `null` for an
+ * optional measurement field clears it.
+ */
+export interface ManualEffortPatch {
+  workItemId?: string;
+  ts?: number;
+  mode?: TrackingMode | null;
+  category?: FileCategory | null;
+  durationMs?: number | null;
+  linesAdded?: number | null;
+  linesDeleted?: number | null;
+  isAi?: boolean | null;
+  note?: string | null;
+}
+
+/**
+ * The rolled-up contribution of a work item's MANUAL effort entries (issue #21),
+ * kept separate from the automatic totals so the UI can show what portion of a
+ * work item's effort was hand-entered. Time is summed per {@link TrackingMode}
+ * bucket; lines are summed per {@link FileCategory} plus flat human/AI totals.
+ */
+export interface ManualRollup {
+  humanCodingMs: number;
+  aiGeneratingMs: number;
+  reviewingMs: number;
+  idleMs: number;
+  linesHumanAdded: number;
+  linesHumanDeleted: number;
+  linesAiAdded: number;
+  linesAiDeleted: number;
+  /** Number of manual entries that rolled into this total. */
+  entries: number;
+  byCategory: Record<string, { human: LineStats; ai: LineStats }>;
+}
+
 /** Optional filter for {@link Database.getCredits} and its wrappers. */
 export interface CreditQuery {
   branch?: string;
@@ -358,6 +440,12 @@ export interface PersistedStore {
   creditLedger: LedgerEntry[];
   /** First-class projects keyed by id (issue #8). Top-level so repos/work items map into them. */
   projects: Record<string, Project>;
+  /**
+   * Hand-entered effort adjustments (issue #21). Top-level, like the credit
+   * ledger, so a work item's manual corrections span its branches and stay
+   * separable from the automatic capture path.
+   */
+  manualEffort: ManualEffortEntry[];
 }
 
 /** Aggregated effort for a single work item, rolled up across all its branches. */
@@ -398,13 +486,20 @@ export interface WorkItemSummary {
   creditsByModel: { model: string; credits: number; turns: number }[];
   byExt: Record<string, ExtStats>;
   byCategory: Record<string, { human: LineStats; ai: LineStats }>;
+  /**
+   * The portion of the totals above that came from MANUAL effort entries
+   * (issue #21). The mode/line/category numbers here are ALREADY INCLUDED in the
+   * fields above (manual is additive); this breakdown just lets the UI show how
+   * much of a work item's effort was hand-entered vs auto-tracked.
+   */
+  manual: ManualRollup;
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
 export type BranchRollup = Omit<
   WorkItemSummary,
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
-  | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches'
+  | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -491,7 +586,7 @@ export interface ProjectRoi extends RoiFigures {
  * change the on-disk envelope SHAPE (both fields already exist), so NO schema
  * bump is required and the pass stays pure, idempotent and zero-loss.
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -733,6 +828,7 @@ export function migrateStore(parsed: unknown): PersistedStore {
   let workItems: Record<string, WorkItem>;
   let creditLedger: LedgerEntry[];
   let projects: Record<string, Project>;
+  let manualEffort: ManualEffortEntry[];
   if (isEnvelope(parsed)) {
     branches = (parsed.branches ?? {}) as Store;
     workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
@@ -743,18 +839,155 @@ export function migrateStore(parsed: unknown): PersistedStore {
       existingProjects && typeof existingProjects === 'object'
         ? (existingProjects as Record<string, Project>)
         : {};
+    // #21: default to [] for any pre-v6 file, which had no manualEffort array.
+    manualEffort = sanitizeManualEffort((parsed as PersistedStore).manualEffort);
   } else {
     branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
     workItems = {};
     creditLedger = [];
     projects = {};
+    manualEffort = [];
   }
   backfillWorkItems(branches, workItems);
   // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
   // their legacy credit log is attributed to the resolved/holding work item.
   assignUnmappedBranches(branches, workItems, extractWorkItemId);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
-  return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems, creditLedger, projects };
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    branches,
+    workItems,
+    creditLedger,
+    projects,
+    manualEffort
+  };
+}
+
+/**
+ * Coerce persisted manual-effort JSON into a clean {@link ManualEffortEntry}[]
+ * (issue #21). Drops non-object rows and rows without a usable `workItemId`,
+ * fills a missing `id`, and pins `source` to `'manual'`. Pure + idempotent so a
+ * re-migration of already-clean data is a no-op with zero data loss.
+ */
+export function sanitizeManualEffort(input: unknown): ManualEffortEntry[] {
+  if (!Array.isArray(input)) return [];
+  const out: ManualEffortEntry[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue;
+    const r = raw as Partial<ManualEffortEntry>;
+    if (typeof r.workItemId !== 'string' || !r.workItemId) continue;
+    const entry: ManualEffortEntry = {
+      id: typeof r.id === 'string' && r.id ? r.id : newLedgerId(),
+      ts: typeof r.ts === 'number' && Number.isFinite(r.ts) ? r.ts : Date.now(),
+      workItemId: r.workItemId,
+      source: 'manual'
+    };
+    if (r.mode !== undefined) entry.mode = r.mode;
+    if (r.category !== undefined) entry.category = r.category;
+    if (typeof r.durationMs === 'number') entry.durationMs = r.durationMs;
+    if (typeof r.linesAdded === 'number') entry.linesAdded = r.linesAdded;
+    if (typeof r.linesDeleted === 'number') entry.linesDeleted = r.linesDeleted;
+    if (typeof r.isAi === 'boolean') entry.isAi = r.isAi;
+    if (typeof r.note === 'string') entry.note = r.note;
+    out.push(entry);
+  }
+  return out;
+}
+
+/** Maps a {@link TrackingMode} to its millisecond bucket key on a rollup. */
+const MODE_TO_MS_FIELD: Record<
+  TrackingMode,
+  'humanCodingMs' | 'aiGeneratingMs' | 'reviewingMs' | 'idleMs'
+> = {
+  humanCoding: 'humanCodingMs',
+  aiGenerating: 'aiGeneratingMs',
+  reviewing: 'reviewingMs',
+  idle: 'idleMs'
+};
+
+/** A fresh, all-zero {@link ManualRollup}. */
+export function emptyManualRollup(): ManualRollup {
+  return {
+    humanCodingMs: 0, aiGeneratingMs: 0, reviewingMs: 0, idleMs: 0,
+    linesHumanAdded: 0, linesHumanDeleted: 0, linesAiAdded: 0, linesAiDeleted: 0,
+    entries: 0, byCategory: emptyCategoryMap()
+  };
+}
+
+/**
+ * Accumulate ONE manual entry into a {@link ManualRollup} (issue #21). Time
+ * lands on the entry's mode bucket; lines land on the entry's category bucket on
+ * the AI or human side per `isAi`. Non-finite/absent numbers are treated as 0 so
+ * the result can never be NaN. Pure (mutates only `roll`).
+ */
+export function accumulateManualEntry(roll: ManualRollup, e: ManualEffortEntry): void {
+  roll.entries += 1;
+  const dur = Number(e.durationMs);
+  if (e.mode && MODE_TO_MS_FIELD[e.mode] && Number.isFinite(dur)) {
+    roll[MODE_TO_MS_FIELD[e.mode]] += dur;
+  }
+  const added = Number(e.linesAdded);
+  const deleted = Number(e.linesDeleted);
+  const a = Number.isFinite(added) ? added : 0;
+  const d = Number.isFinite(deleted) ? deleted : 0;
+  if (a !== 0 || d !== 0) {
+    if (e.isAi) { roll.linesAiAdded += a; roll.linesAiDeleted += d; }
+    else { roll.linesHumanAdded += a; roll.linesHumanDeleted += d; }
+    if (e.category) {
+      const bucket = (roll.byCategory[e.category] ??= {
+        human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 }
+      });
+      const side = e.isAi ? bucket.ai : bucket.human;
+      side.added += a;
+      side.deleted += d;
+    }
+  }
+}
+
+/**
+ * Merge a {@link ManualRollup} INTO an automatic {@link BranchRollup} (issue #21)
+ * so manual corrections are additive to the tracked totals. Mode ms, flat line
+ * totals, per-category lines and the AI-line cost estimate are all folded in.
+ * Pure (mutates only `target`); a zero rollup leaves `target` untouched.
+ */
+export function mergeManualRollup(target: BranchRollup, m: ManualRollup): void {
+  target.humanCodingMs += m.humanCodingMs;
+  target.aiGeneratingMs += m.aiGeneratingMs;
+  target.reviewingMs += m.reviewingMs;
+  target.idleMs += m.idleMs;
+  target.linesHumanAdded += m.linesHumanAdded;
+  target.linesHumanDeleted += m.linesHumanDeleted;
+  target.linesAiAdded += m.linesAiAdded;
+  target.linesAiDeleted += m.linesAiDeleted;
+  // Keep the AI-line cost estimate consistent with the folded-in AI lines.
+  target.estimatedCostUsd += m.linesAiAdded * COST_PER_AI_LINE_USD;
+  for (const cat of Object.keys(m.byCategory)) {
+    const src = m.byCategory[cat];
+    const dst = (target.byCategory[cat] ??= {
+      human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 }
+    });
+    dst.human.added += src.human.added;
+    dst.human.deleted += src.human.deleted;
+    dst.ai.added += src.ai.added;
+    dst.ai.deleted += src.ai.deleted;
+  }
+}
+
+/**
+ * Apply one optional field of a {@link ManualEffortPatch} to an entry (issue
+ * #21): `undefined` leaves it unchanged, `null` clears it, any other value sets
+ * it. Keeps {@link Database.updateManualEffort} terse and consistent.
+ */
+type OptionalManualKey =
+  'mode' | 'category' | 'durationMs' | 'linesAdded' | 'linesDeleted' | 'isAi' | 'note';
+function applyManualOptional<K extends OptionalManualKey>(
+  entry: ManualEffortEntry,
+  key: K,
+  value: ManualEffortEntry[K] | null | undefined
+): void {
+  if (value === undefined) return;
+  if (value === null) delete entry[key];
+  else entry[key] = value;
 }
 
 function emptyCategoryMap(): Record<string, { human: LineStats; ai: LineStats }> {
@@ -870,6 +1103,7 @@ export class Database {
   private workItems: Record<string, WorkItem>;
   private creditLedger: LedgerEntry[];
   private projects: Record<string, Project>;
+  private manualEffort: ManualEffortEntry[];
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -888,6 +1122,7 @@ export class Database {
     this.workItems = loaded.workItems;
     this.creditLedger = loaded.creditLedger;
     this.projects = loaded.projects;
+    this.manualEffort = loaded.manualEffort;
   }
 
   /** Build the on-disk envelope from the in-memory state. */
@@ -897,7 +1132,8 @@ export class Database {
       branches: this.store,
       workItems: this.workItems,
       creditLedger: this.creditLedger,
-      projects: this.projects
+      projects: this.projects,
+      manualEffort: this.manualEffort
     };
     return JSON.stringify(envelope, null, 2);
   }
@@ -1279,6 +1515,98 @@ export class Database {
     return true;
   }
 
+  // ---- Manual effort entry & adjustment (issue #21 / milestone M5) -----------
+
+  /**
+   * Record a hand-entered effort adjustment for a work item (issue #21). Mirrors
+   * {@link recordCredits}/{@link appendLedger} for the effort dimension: the row
+   * lands in the top-level `manualEffort` array with a generated id, `ts`
+   * defaulting to now, and `source: 'manual'`. The target work item is ensured
+   * so the entry shows up in roll-ups even if no branch maps to it yet. This is
+   * a SEPARATE write path from the #17 auto-capture, which is left untouched.
+   */
+  addManualEffort(input: ManualEffortInput): ManualEffortEntry {
+    this.ensureWorkItem(input.workItemId);
+    const entry: ManualEffortEntry = {
+      id: newLedgerId(),
+      ts: typeof input.ts === 'number' && Number.isFinite(input.ts) ? input.ts : Date.now(),
+      workItemId: input.workItemId,
+      source: 'manual'
+    };
+    if (input.mode !== undefined) entry.mode = input.mode;
+    if (input.category !== undefined) entry.category = input.category;
+    if (input.durationMs !== undefined) entry.durationMs = input.durationMs;
+    if (input.linesAdded !== undefined) entry.linesAdded = input.linesAdded;
+    if (input.linesDeleted !== undefined) entry.linesDeleted = input.linesDeleted;
+    if (input.isAi !== undefined) entry.isAi = input.isAi;
+    if (input.note !== undefined) entry.note = input.note;
+    this.manualEffort.push(entry);
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Edit a manual-effort entry in place (issue #21). Only the fields present in
+   * `patch` change; `id`/`source` are preserved so the row's identity survives.
+   * Passing `null` for an optional measurement field clears it; when `workItemId`
+   * changes the destination work item is ensured. Safe no-op returning
+   * `undefined` when `id` is not found (never throws). Roll-ups recompute
+   * automatically because they derive from `manualEffort`.
+   */
+  updateManualEffort(id: string, patch: ManualEffortPatch): ManualEffortEntry | undefined {
+    const entry = this.manualEffort.find(e => e.id === id);
+    if (!entry) return undefined;
+    if (patch.workItemId !== undefined && patch.workItemId) {
+      entry.workItemId = patch.workItemId;
+      this.ensureWorkItem(patch.workItemId);
+    }
+    if (patch.ts !== undefined && patch.ts !== null) entry.ts = patch.ts;
+    applyManualOptional(entry, 'mode', patch.mode);
+    applyManualOptional(entry, 'category', patch.category);
+    applyManualOptional(entry, 'durationMs', patch.durationMs);
+    applyManualOptional(entry, 'linesAdded', patch.linesAdded);
+    applyManualOptional(entry, 'linesDeleted', patch.linesDeleted);
+    applyManualOptional(entry, 'isAi', patch.isAi);
+    applyManualOptional(entry, 'note', patch.note);
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Remove a manual-effort entry by id (issue #21). Returns `true` when a row
+   * was removed, `false` when `id` was not found (safe no-op, never throws).
+   * Because roll-ups derive from `manualEffort`, deleting a row drops its
+   * contribution from every derived total automatically.
+   */
+  deleteManualEffort(id: string): boolean {
+    const idx = this.manualEffort.findIndex(e => e.id === id);
+    if (idx === -1) return false;
+    this.manualEffort.splice(idx, 1);
+    this.save();
+    return true;
+  }
+
+  /**
+   * List manual-effort entries (issue #21), newest-first. Pass a `workItemId` to
+   * scope to a single work item. Returns a shallow copy so callers can't mutate
+   * the stored array.
+   */
+  getManualEffort(workItemId?: string): ManualEffortEntry[] {
+    return this.manualEffort
+      .filter(e => workItemId === undefined || e.workItemId === workItemId)
+      .sort((a, b) => b.ts - a.ts);
+  }
+
+  /** Roll a work item's manual entries into a {@link ManualRollup}. */
+  private manualRollupForWorkItem(workItemId: string): ManualRollup {
+    const roll = emptyManualRollup();
+    for (const e of this.manualEffort) {
+      if (e.workItemId !== workItemId) continue;
+      accumulateManualEntry(roll, e);
+    }
+    return roll;
+  }
+
   /**
    * Auto-associate a branch with a work item (from branch-name detection).
    * Sticky manual overrides are respected: if the branch was mapped manually
@@ -1449,6 +1777,10 @@ export class Database {
     const wi = this.ensureWorkItem(workItemId);
     const branches = this.getBranchesForWorkItem(workItemId);
     const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    // #21: fold hand-entered corrections into the tracked totals (additive) and
+    // expose them separately as `manual` so the UI can show the auto/manual split.
+    const manual = this.manualRollupForWorkItem(workItemId);
+    mergeManualRollup(rollup, manual);
     return {
       workItemId: wi.id,
       title: wi.title ?? null,
@@ -1463,7 +1795,8 @@ export class Database {
       externalRef: wi.externalRef ?? null,
       createdAt: wi.createdAt,
       branches,
-      ...rollup
+      ...rollup,
+      manual
     };
   }
 
@@ -1975,7 +2308,7 @@ export class Database {
     const project = this.projects[projectId];
     const workItemIds = this.getWorkItemIdsForProject(projectId);
     const branches = this.getBranchesForProject(projectId);
-    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    const rollup = this.projectRollupWithManual(branches, workItemIds);
     const credits = this.getCreditsForProject(projectId);
     return {
       projectId,
@@ -2054,7 +2387,23 @@ export class Database {
    */
   getProjectRoi(projectId: string): ProjectRoi {
     const branches = this.getBranchesForProject(projectId);
-    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    const workItemIds = this.getWorkItemIdsForProject(projectId);
+    const rollup = this.projectRollupWithManual(branches, workItemIds);
     return this.computeProjectRoi(projectId, rollup, this.getCreditsForProject(projectId));
+  }
+
+  /**
+   * Roll a project's branches up and fold in the manual effort of all its work
+   * items (issue #21) so project totals stay equal to the SUM of their work-item
+   * totals (which include manual). Shared by {@link getProjectSummary} and
+   * {@link getProjectRoi} so their numbers can never drift. When no manual
+   * effort exists this is byte-for-byte the old branch-only rollup.
+   */
+  private projectRollupWithManual(branches: string[], workItemIds: string[]): BranchRollup {
+    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    for (const id of workItemIds) {
+      mergeManualRollup(rollup, this.manualRollupForWorkItem(id));
+    }
+    return rollup;
   }
 }
