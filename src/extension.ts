@@ -5,6 +5,7 @@ import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { Database } from './store/database';
+import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit } from './store/database';
 import { CATEGORY_LABELS } from './util/fileTypes';
 import type { FileCategory } from './util/fileTypes';
@@ -134,6 +135,11 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setProjectRates', () =>
       setProjectRates()
     ),
+    vscode.commands.registerCommand('aiEffortTracker.createProject', () => createProject()),
+    vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
+    vscode.commands.registerCommand('aiEffortTracker.createWorkItem', () => createWorkItem()),
+    vscode.commands.registerCommand('aiEffortTracker.editWorkItem', () => editWorkItem()),
+    vscode.commands.registerCommand('aiEffortTracker.assignWorkItemToProject', () => assignWorkItemToProject()),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
     vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
@@ -203,7 +209,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries());
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
@@ -231,7 +237,9 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       ghMetrics: ghData,
       config: getInsightsConfig(),
       analytics: getAnalytics(),
-      billing: lastBilling
+      billing: lastBilling,
+      projectSummaries: db.getAllProjectSummaries(),
+      workItemSummaries: db.getAllWorkItemSummaries()
     });
   }, 5000);
 
@@ -491,6 +499,176 @@ async function setProjectRates() {
   refreshDashboard();
 }
 
+/**
+ * Create a new project (issue #27 / M7): prompt for a name, create it, then
+ * offer to link the current workspace repo so this repo's effort rolls up under
+ * the project. Mirrors the QuickPick/InputBox style used elsewhere.
+ */
+async function createProject() {
+  const name = await vscode.window.showInputBox({
+    prompt: 'New project name',
+    validateInput: v => (v && v.trim()) ? null : 'Enter a project name'
+  });
+  if (!name) return;
+  const project = db.upsertProject({ name: name.trim() });
+
+  const repoId = await GitTracker.getRepoId();
+  if (repoId) {
+    const link = await vscode.window.showQuickPick(['Yes', 'No'], {
+      placeHolder: `Link the current repository to "${project.name}"?`
+    });
+    if (link === 'Yes') {
+      db.linkRepoToProject(project.id, repoId);
+      vscode.window.showInformationMessage(`Project "${project.name}" created and linked to this repo.`);
+    } else {
+      vscode.window.showInformationMessage(`Project "${project.name}" created.`);
+    }
+  } else {
+    vscode.window.showInformationMessage(`Project "${project.name}" created. (No repository detected to link.)`);
+  }
+  refreshDashboard();
+}
+
+/** Link the current workspace repo to an existing project (issue #27). */
+async function linkRepoToProject() {
+  const repoId = await GitTracker.getRepoId();
+  if (!repoId) {
+    vscode.window.showWarningMessage('No repository detected in the current workspace to link.');
+    return;
+  }
+  const projects = db.getAllProjects();
+  if (projects.length === 0) {
+    vscode.window.showWarningMessage('No projects yet. Create one with "New Project" first.');
+    return;
+  }
+  type ProjPick = vscode.QuickPickItem & { id: string };
+  const picks: ProjPick[] = projects.map(p => {
+    const linked = p.repos.includes(repoId);
+    return {
+      label: (linked ? '\u2713 ' : '') + p.name,
+      description: p.repos.join(', ') || undefined,
+      detail: linked ? 'already linked to this repo' : undefined,
+      id: p.id
+    };
+  });
+  const picked = await vscode.window.showQuickPick(picks, {
+    placeHolder: `Link this repository (${repoId}) to which project?`
+  });
+  if (!picked) return;
+  db.linkRepoToProject(picked.id, repoId);
+  vscode.window.showInformationMessage(`Linked this repo to "${db.getProject(picked.id)?.name ?? picked.id}".`);
+  refreshDashboard();
+}
+
+/**
+ * QuickPick a REAL work item (issue #27). Excludes the synthetic holding buckets
+ * (`unknown`, `__unassigned__`) which are not user-managed work items.
+ */
+async function pickWorkItem(placeHolder: string): Promise<string | undefined> {
+  type WiPick = vscode.QuickPickItem & { id: string };
+  const items = db.getAllWorkItems().filter(
+    w => w.id !== 'unknown' && w.id !== UNASSIGNED_WORK_ITEM_ID
+  );
+  if (items.length === 0) {
+    vscode.window.showWarningMessage('No work items yet. Create one with "New Work Item" first.');
+    return undefined;
+  }
+  const picks: WiPick[] = items.map(w => ({
+    label: '#' + w.id,
+    description: w.title ?? undefined,
+    detail: w.projectId
+      ? `project: ${db.getProject(w.projectId)?.name ?? w.projectId}`
+      : 'no project',
+    id: w.id
+  }));
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  return picked?.id;
+}
+
+/**
+ * QuickPick a project or "no project" (issue #27). Returns the chosen project id,
+ * `null` to unassign, or `undefined` when the user cancels.
+ */
+async function pickProjectOrNone(placeHolder: string, current?: string | null): Promise<string | null | undefined> {
+  type ProjPick = vscode.QuickPickItem & { id?: string; none?: boolean };
+  const picks: ProjPick[] = [
+    { label: '$(circle-slash) No project (unassign)', none: true, description: current == null ? 'current' : undefined },
+    ...db.getAllProjects().map(p => ({
+      label: (p.id === current ? '\u25b6 ' : '') + p.name,
+      description: p.repos.join(', ') || undefined,
+      id: p.id
+    }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return undefined;
+  return picked.none ? null : (picked.id ?? null);
+}
+
+/**
+ * Create a new work item (issue #27): id + optional title, then optionally
+ * assign it to a project. Rejects ids that already exist so this stays a pure
+ * "create" (edits go through {@link editWorkItem}).
+ */
+async function createWorkItem() {
+  const id = await vscode.window.showInputBox({
+    prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+    validateInput: v => {
+      if (!v || !v.trim()) return 'Enter a work item id';
+      if (db.getWorkItem(v.trim())) return `Work item #${v.trim()} already exists`;
+      return null;
+    }
+  });
+  if (!id) return;
+  const workItemId = id.trim();
+  const title = await vscode.window.showInputBox({
+    prompt: `Title for work item #${workItemId} (optional)`
+  });
+  if (title === undefined) return;
+  db.upsertWorkItem(workItemId, title.trim() ? { title: title.trim() } : {});
+
+  if (db.getAllProjects().length > 0) {
+    const sel = await pickProjectOrNone(`Assign #${workItemId} to a project? (optional)`, null);
+    if (sel) db.setProjectForWorkItem(workItemId, sel);
+  }
+  vscode.window.showInformationMessage(`Work item #${workItemId} created.`);
+  refreshDashboard();
+}
+
+/**
+ * Edit an existing work item (issue #27): change its title and optionally
+ * reassign its project. Excludes the synthetic holding buckets.
+ */
+async function editWorkItem() {
+  const wi = await pickWorkItem('Edit which work item?');
+  if (!wi) return;
+  const existing = db.getWorkItem(wi);
+  const title = await vscode.window.showInputBox({
+    prompt: `Title for work item #${wi}`,
+    value: existing?.title ?? ''
+  });
+  if (title === undefined) return;
+  db.upsertWorkItem(wi, { title: title.trim() ? title.trim() : null });
+
+  const sel = await pickProjectOrNone(`Project for #${wi} (Esc to keep current)`, existing?.projectId ?? null);
+  if (sel !== undefined) db.setProjectForWorkItem(wi, sel);
+
+  vscode.window.showInformationMessage(`Work item #${wi} updated.`);
+  refreshDashboard();
+}
+
+/** Assign (or unassign) a work item to a project (issue #27). */
+async function assignWorkItemToProject() {
+  const wi = await pickWorkItem('Assign which work item to a project?');
+  if (!wi) return;
+  const current = db.getWorkItem(wi)?.projectId ?? null;
+  const sel = await pickProjectOrNone(`Assign #${wi} to which project?`, current);
+  if (sel === undefined) return;
+  db.setProjectForWorkItem(wi, sel);
+  const name = sel ? (db.getProject(sel)?.name ?? sel) : 'no project';
+  vscode.window.showInformationMessage(`Work item #${wi} assigned to ${name}.`);
+  refreshDashboard();
+}
+
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */
 function refreshDashboard() {
   if (!dashboardPanel) return;
@@ -501,7 +679,9 @@ function refreshDashboard() {
       currentBranch: b ?? 'unknown',
       config: getInsightsConfig(),
       analytics: getAnalytics(),
-      billing: lastBilling
+      billing: lastBilling,
+      projectSummaries: db.getAllProjectSummaries(),
+      workItemSummaries: db.getAllWorkItemSummaries()
     });
   });
 }

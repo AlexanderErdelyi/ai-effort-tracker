@@ -1,4 +1,4 @@
-import type { BranchSummary } from '../store/database';
+import type { BranchSummary, ProjectSummary, WorkItemSummary } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 
@@ -31,7 +31,9 @@ export function renderDashboardHtml(
   ghMetrics: CopilotMetrics | null = null,
   config: InsightsConfig = { baselineLocPerMinute: 5, hourlyRateUsd: 80, usdPerCredit: 0.04, dailyActiveGoalMinutes: 240 },
   analytics: DashboardAnalytics = { daily: [], heatmap: [], focus: { sessionsToday: 0, sessionsWeek: 0, totalFocusMsToday: 0, totalFocusMsWeek: 0, longestMs: 0, avgMs: 0, goalProgressPct: 0 } },
-  billing: BillingUsage | null = null
+  billing: BillingUsage | null = null,
+  projectSummaries: ProjectSummary[] = [],
+  workItemSummaries: WorkItemSummary[] = []
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
@@ -40,6 +42,8 @@ export function renderDashboardHtml(
   const cfgData = JSON.stringify(config);
   const anData = JSON.stringify(analytics);
   const blData = JSON.stringify(billing);
+  const projData = JSON.stringify(projectSummaries);
+  const wiData = JSON.stringify(workItemSummaries);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -102,6 +106,8 @@ let ghMetrics=${ghData};
 let CFG=${cfgData};
 let AN=${anData};
 let BL=${blData};
+let PROJ=${projData};
+let WI=${wiData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -132,6 +138,8 @@ function insights(d){
 }
 function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
 function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function activeMsOf(x){return(x.humanCodingMs||0)+(x.aiGeneratingMs||0)+(x.reviewingMs||0);}
 
 function billingHtml(){
   var imp='<button class="dtab" data-action="cmd" data-value="importCredits" style="margin-top:10px">\\u21bb Import / refresh usage</button>';
@@ -422,6 +430,110 @@ function renderFocus(){
         y:{stacked:true,ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'min',color:dfg()}}}}});
 }
 
+var projView='list',selProj=null,selWi=null;
+var ROI_NONE='\\u2014';
+function wiOfProject(pid){
+  if(pid==='__none__')return WI.filter(function(w){return!w.projectId;});
+  return WI.filter(function(w){return w.projectId===pid;});
+}
+function fmtMoney(v,cur){return v==null?ROI_NONE:(cur||'USD')+' '+v.toFixed(2);}
+function aiPctOf(x){var t=(x.linesHumanAdded||0)+(x.linesAiAdded||0);return t>0?Math.round((x.linesAiAdded/t)*100):0;}
+function projToolbar(){
+  return'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">'
+    +'<button class="dtab" data-action="cmd" data-value="createProject">\\uFF0B New Project</button>'
+    +'<button class="dtab" data-action="cmd" data-value="linkRepoToProject">\\uD83D\\uDD17 Link This Repo</button>'
+    +'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button>'
+    +'<button class="dtab" data-action="cmd" data-value="editWorkItem">\\u270E Edit Work Item</button>'
+    +'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button>'
+    +'</div>';
+}
+function projectRowsHtml(){
+  var rows=PROJ.map(function(p){
+    var act=activeMsOf(p);
+    var roi=(p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
+    var reposTxt=(p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+    return'<tr data-action="proj" data-value="'+esc(p.projectId)+'"><td><strong>'+esc(p.name)+'</strong></td><td style="font-family:monospace;font-size:.85em">'+reposTxt+'</td><td>'+p.workItemIds.length+'</td><td>'+fmt(act)+'</td><td>'+((p.credits&&p.credits.credits)||0).toFixed(1)+'</td><td>'+roi+'</td></tr>';
+  });
+  var none=wiOfProject('__none__');
+  if(none.length){
+    var act=none.reduce(function(a,w){return a+activeMsOf(w);},0);
+    var cr=none.reduce(function(a,w){return a+(w.creditsTotal||0);},0);
+    rows.push('<tr data-action="proj" data-value="__none__"><td><strong>\\uD83D\\uDCE5 Unassigned</strong><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">work items with no project</div></td><td>'+ROI_NONE+'</td><td>'+none.length+'</td><td>'+fmt(act)+'</td><td>'+cr.toFixed(1)+'</td><td>'+ROI_NONE+'</td></tr>');
+  }
+  if(!rows.length)return'<tr><td colspan="6" style="color:var(--vscode-descriptionForeground)">No projects yet \\u2014 use \\u201cNew Project\\u201d to create one and link this repo.</td></tr>';
+  return rows.join('');
+}
+function renderProjectList(){
+  var el=document.getElementById('projects');
+  el.innerHTML=projToolbar()
+    +'<table><thead><tr><th>Project</th><th>Repos</th><th>Work Items</th><th>Active</th><th>Credits</th><th>ROI Net</th></tr></thead><tbody>'+projectRowsHtml()+'</tbody></table>'
+    +'<p style="margin-top:12px;font-size:.8em;color:var(--vscode-descriptionForeground)">Project ROI net = value produced \\u2212 cost from the project\\u2019s effective rates. \\u201c\\u2014\\u201d means a required rate is not configured (set it with \\u201cSet Rates\\u201d).</p>';
+}
+function wiRowsHtml(items){
+  var rows=items.map(function(w){
+    var I=insights(w);
+    var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
+    var roiColor=I.roi>=0?'var(--added)':'var(--deleted)';
+    return'<tr data-action="wi" data-value="'+esc(w.workItemId)+'"><td><strong>'+esc(w.title||('#'+w.workItemId))+'</strong><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></td><td>'+est+'</td><td>'+fmt(activeMsOf(w))+'</td><td><span class="badge '+(aiPctOf(w)>50?'ba':'bh')+'">'+aiPctOf(w)+'%</span></td><td>'+(w.creditsTotal||0).toFixed(1)+'</td><td style="color:'+roiColor+'">$'+I.roi.toFixed(2)+'</td></tr>';
+  });
+  if(!rows.length)return'<tr><td colspan="6" style="color:var(--vscode-descriptionForeground)">No work items here yet.</td></tr>';
+  return rows.join('');
+}
+function renderProjectDetail(){
+  var el=document.getElementById('projects');
+  var p=PROJ.find(function(x){return x.projectId===selProj;});
+  var isNone=selProj==='__none__';
+  if(!p&&!isNone){projView='list';return renderProjectList();}
+  var items=wiOfProject(selProj);
+  var name=isNone?'\\uD83D\\uDCE5 Unassigned':esc(p.name);
+  var act=isNone?items.reduce(function(a,w){return a+activeMsOf(w);},0):activeMsOf(p);
+  var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
+  var roi=(!isNone&&p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
+  var repos=(!isNone&&p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+  var setRates=isNone?'':'<button class="dtab" data-action="cmd" data-value="setProjectRates">\\uD83D\\uDCB0 Set Rates</button>';
+  el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'
+    +'<div class="sg"><div class="st"><div class="lbl">Project</div><div class="val" style="font-size:.95em;word-break:break-word">'+name+'</div></div>'
+    +'<div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(act)+'</div></div>'
+    +'<div class="st"><div class="lbl">Credits</div><div class="val" style="color:var(--cost)">'+credits.toFixed(1)+'</div></div>'
+    +'<div class="st"><div class="lbl">ROI Net</div><div class="val">'+roi+'</div></div></div>'
+    +'<p class="sub" style="margin:12px 0 6px">Repos: '+repos+'</p>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
+    +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
+}
+function renderWorkItemDetail(){
+  var el=document.getElementById('projects');
+  var w=WI.find(function(x){return x.workItemId===selWi;});
+  if(!w){projView='list';return renderProjectList();}
+  var I=insights(w);
+  var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
+  var roiColor=I.roi>=0?'var(--added)':'var(--deleted)';
+  var backTarget=w.projectId?w.projectId:'__none__';
+  var branchRows=(w.branches||[]).map(function(b){
+    var d=allData.find(function(x){return x.branch===b;});
+    var act=d?tms(d):0;var ai=d?aiPct(d):0;
+    return'<tr data-action="detail" data-value="'+esc(b)+'"><td><strong>'+esc(b)+'</strong></td><td>'+fmt(act)+'</td><td><span class="badge '+(ai>50?'ba':'bh')+'">'+ai+'%</span></td><td>'+(d?'$'+d.estimatedCostUsd.toFixed(4):ROI_NONE)+'</td></tr>';
+  });
+  if(!branchRows.length)branchRows=['<tr><td colspan="4" style="color:var(--vscode-descriptionForeground)">No branches roll up into this work item yet.</td></tr>'];
+  el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
+    +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></div>'
+    +'<div class="st"><div class="lbl">Estimate</div><div class="val">'+est+'</div></div>'
+    +'<div class="st"><div class="lbl">Actual</div><div class="val">'+fmt(activeMsOf(w))+'</div></div>'
+    +'<div class="st"><div class="lbl">Net ROI</div><div class="val" style="color:'+roiColor+'">$'+I.roi.toFixed(2)+'</div></div></div>'
+    +'<div class="sg" style="margin-top:4px">'
+    +sc('AI Share',aiPctOf(w)+'%','var(--ai)')
+    +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)')
+    +sc('AI Spend','$'+I.aiCost.toFixed(2),'var(--cost)')
+    +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
+    +'</div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button></div>'
+    +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail.</p></div>';
+}
+function renderProjectsView(){
+  if(projView==='project')return renderProjectDetail();
+  if(projView==='workitem')return renderWorkItemDetail();
+  return renderProjectList();
+}
+
 function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
   if(!d) return;
@@ -492,6 +604,7 @@ function showTab(name){
   else if(name==='trends'){document.getElementById('tab-trends').classList.add('active');renderTrends();}
   else if(name==='focus'){document.getElementById('tab-focus').classList.add('active');renderFocus();}
   else if(name==='ghview'){document.getElementById('tab-ghview').classList.add('active');renderGhMetrics();}
+  else if(name==='projects'){document.getElementById('tab-projects').classList.add('active');renderProjectsView();}
   else{document.getElementById('dtab').classList.add('active');}
 }
 
@@ -503,11 +616,14 @@ window.addEventListener('message',function(e){
     if(msg.config!==undefined&&msg.config)CFG=msg.config;
     if(msg.analytics!==undefined&&msg.analytics)AN=msg.analytics;
     if(msg.billing!==undefined)BL=msg.billing;
+    if(msg.projectSummaries!==undefined&&msg.projectSummaries)PROJ=msg.projectSummaries;
+    if(msg.workItemSummaries!==undefined&&msg.workItemSummaries)WI=msg.workItemSummaries;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
     else if(av&&av.id==='focus')renderFocus();
     else if(av&&av.id==='ghview')renderGhMetrics();
+    else if(av&&av.id==='projects')renderProjectsView();
     else if(av&&av.id==='detail'){var dt=document.getElementById('dtab');if(dt&&dt.dataset.branch)showDetail(dt.dataset.branch);}
   }
 });
@@ -518,6 +634,7 @@ document.getElementById('tab-overview').addEventListener('click',function(){show
 document.getElementById('tab-trends').addEventListener('click',function(){showTab('trends');});
 document.getElementById('tab-focus').addEventListener('click',function(){showTab('focus');});
 document.getElementById('tab-ghview').addEventListener('click',function(){showTab('ghview');});
+document.getElementById('tab-projects').addEventListener('click',function(){showTab('projects');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -530,6 +647,9 @@ document.addEventListener('click',function(e){
   else if(a==='tab')showTab(v);
   else if(a==='ds')showDS(v,t);
   else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
+  else if(a==='proj'){selProj=v;selWi=null;projView='project';renderProjectsView();}
+  else if(a==='wi'){selWi=v;projView='workitem';renderProjectsView();}
+  else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
 });`;
 
@@ -547,12 +667,14 @@ document.addEventListener('click',function(e){
     '  <button class="tab active" id="tab-overview">Overview</button>',
     '  <button class="tab" id="tab-trends">\uD83D\uDCC8 Trends</button>',
     '  <button class="tab" id="tab-focus">\uD83C\uDFAF Focus</button>',
+    '  <button class="tab" id="tab-projects">\uD83D\uDCC1 Projects</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
     '<div id="overview" class="view active"></div>',
     '<div id="trends" class="view"></div>',
     '<div id="focus" class="view"></div>',
+    '<div id="projects" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,
