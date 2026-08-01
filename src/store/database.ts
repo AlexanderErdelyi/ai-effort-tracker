@@ -5,6 +5,13 @@ import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES } from '../util/fileTypes';
 import type { FileCategory } from '../util/fileTypes';
+import {
+  resolveEffectiveRates,
+  computeRoiFigures,
+  type EffectiveRates,
+  type RateGlobals,
+  type RoiFigures
+} from '../util/rates';
 
 export interface LineStats {
   added: number;
@@ -286,12 +293,23 @@ export function sumBreakdown(breakdown: EstimateBreakdown | undefined): number |
 }
 
 /**
- * Per-project settings extension point (issue #8 / milestone M2). Deliberately
- * empty for now: ROI/rate fields (hourly cost, sell price) land in a LATER issue
- * (#15). Keeping the object here means the persisted shape is forward-compatible
- * and rate wiring can be added without another schema bump.
+ * Per-project settings (issue #8 extension point; rate fields land in #15 / M3).
+ * The rate fields below are the per-project OVERRIDES for ROI economics; when a
+ * field is absent the effective value falls back to a global default and then to
+ * a legacy setting (see {@link resolveEffectiveRates} / package.json). Because
+ * these live inside `Project.settings`, which already persists, adding them does
+ * NOT change the on-disk envelope shape and needs no schema bump. The index
+ * signature is kept so the object stays open/extensible for future settings.
  */
 export interface ProjectSettings {
+  /** What one developer hour COSTS for this project (money, in `currency`). */
+  hourlyCostRate?: number;
+  /** What one developer hour is BILLED/SOLD for on this project (money). */
+  hourlySellRate?: number;
+  /** Currency the rate figures are expressed in (e.g. 'USD', 'EUR'). */
+  currency?: string;
+  /** Money cost per 1 credit / premium-request, for folding AI spend into cost. */
+  creditCostPerUnit?: number;
   [key: string]: unknown;
 }
 
@@ -299,8 +317,8 @@ export interface ProjectSettings {
  * A first-class Project entity (issue #8 / milestone M2). A project groups one
  * or more repositories (`repos`, many-to-many capable) and, transitively, the
  * work items whose {@link WorkItem.projectId} points here. Effort and credits
- * roll up branch → work item → project. `settings` is reserved for later rate/
- * ROI configuration (#15) and is intentionally unused for now.
+ * roll up branch → work item → project. `settings` carries per-project rate/ROI
+ * configuration (issue #15) and remains open for future keys.
  */
 export interface Project {
   id: string;
@@ -415,6 +433,22 @@ export interface ProjectSummary extends BranchRollup {
   branches: string[];
   /** Ledger-derived credit/cost totals for the project. */
   credits: CreditTotals;
+  /**
+   * Economic ROI figures (issue #15) computed from the project's EFFECTIVE
+   * rates + its rolled-up billable time + its ledger credits. Money fields are
+   * `null` when a required rate is unconfigured (never NaN). This is raw input
+   * for the ROI report (M7 / #29), not the report itself.
+   */
+  roi: ProjectRoi;
+}
+
+/**
+ * A project's resolved rates + ROI economic figures (issue #15). Extends the
+ * pure {@link RoiFigures} with the owning project id so callers can carry it
+ * around standalone (see {@link Database.getProjectRoi}).
+ */
+export interface ProjectRoi extends RoiFigures {
+  projectId: string;
 }
 
 /**
@@ -1770,6 +1804,7 @@ export class Database {
     const workItemIds = this.getWorkItemIdsForProject(projectId);
     const branches = this.getBranchesForProject(projectId);
     const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    const credits = this.getCreditsForProject(projectId);
     return {
       projectId,
       name: project?.name ?? projectId,
@@ -1777,12 +1812,77 @@ export class Database {
       createdAt: project?.createdAt ?? 0,
       workItemIds,
       branches,
-      credits: this.getCreditsForProject(projectId),
+      credits,
+      roi: this.computeProjectRoi(projectId, rollup, credits),
       ...rollup
     };
   }
 
   getAllProjectSummaries(): ProjectSummary[] {
     return this.getAllProjects().map(p => this.getProjectSummary(p.id));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rates & ROI (issue #15 / milestone M3)
+  //
+  // Rate resolution precedence: project setting > new global default > legacy
+  // setting (`hourlyRateUsd` for cost, `usdPerCredit` for credit cost). The pure
+  // precedence + math live in util/rates.ts; this layer only reads VS Code
+  // configuration and the project's stored settings and delegates.
+  // ---------------------------------------------------------------------------
+
+  /** Read the global rate-related settings from VS Code configuration. */
+  private readRateGlobals(): RateGlobals {
+    const c = vscode.workspace.getConfiguration('aiEffortTracker');
+    return {
+      defaultHourlyCostRate: c.get<number>('defaultHourlyCostRate'),
+      defaultHourlySellRate: c.get<number>('defaultHourlySellRate'),
+      currency: c.get<string>('currency'),
+      creditCostPerUnit: c.get<number>('creditCostPerUnit'),
+      // Legacy fallbacks so pre-#15 configuration keeps working unchanged.
+      legacyHourlyRateUsd: c.get<number>('hourlyRateUsd'),
+      legacyUsdPerCredit: c.get<number>('usdPerCredit')
+    };
+  }
+
+  /**
+   * Resolve the EFFECTIVE rates for a project (or the global defaults when no
+   * project id / no project is given): project override → global default →
+   * legacy setting. Never throws; missing money rates resolve to `null` (never
+   * NaN) and currency always resolves to a string. See {@link resolveEffectiveRates}.
+   */
+  getEffectiveRates(projectId?: string): EffectiveRates {
+    const overrides = projectId ? this.projects[projectId]?.settings : undefined;
+    return resolveEffectiveRates(overrides, this.readRateGlobals());
+  }
+
+  /** Shared ROI computation used by {@link getProjectRoi} and {@link getProjectSummary}. */
+  private computeProjectRoi(
+    projectId: string,
+    rollup: BranchRollup,
+    credits: CreditTotals
+  ): ProjectRoi {
+    // Billable = active work (human coding + AI generating + reviewing); idle
+    // is never billed. Documented convention for issue #15.
+    const billableMs = rollup.humanCodingMs + rollup.aiGeneratingMs + rollup.reviewingMs;
+    const figures = computeRoiFigures({
+      billableMs,
+      credits: credits.credits,
+      ledgerCost: credits.cost,
+      rates: this.getEffectiveRates(projectId)
+    });
+    return { projectId, ...figures };
+  }
+
+  /**
+   * Economic ROI figures for a project (issue #15): its effective rates applied
+   * to its rolled-up billable time + ledger credits. Provided both here as a
+   * standalone method and inline on {@link ProjectSummary.roi}. The full ROI
+   * report is milestone M7 (#29).
+   */
+  getProjectRoi(projectId: string): ProjectRoi {
+    const branches = this.getBranchesForProject(projectId);
+    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    return this.computeProjectRoi(projectId, rollup, this.getCreditsForProject(projectId));
   }
 }

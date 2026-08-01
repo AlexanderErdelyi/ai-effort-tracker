@@ -131,6 +131,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', () =>
       setWorkItemEstimate()
     ),
+    vscode.commands.registerCommand('aiEffortTracker.setProjectRates', () =>
+      setProjectRates()
+    ),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
     vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
@@ -388,6 +391,102 @@ async function setWorkItemEstimate() {
   const total = db.getWorkItemSummary(workItemId).estimate;
   vscode.window.showInformationMessage(
     `Estimate for #${workItemId} set to ${total} ${unit}.`
+  );
+  refreshDashboard();
+}
+
+/**
+ * Set per-project ROI rates (issue #15 / M3): pick a project, then enter its
+ * hourly COST, hourly SELL rate, currency, and credit cost. Blank leaves a field
+ * unset so it inherits the global default (and, for cost/credit, the legacy
+ * setting). Persists into `Project.settings` via {@link Database.upsertProject},
+ * merging with any existing settings so unrelated keys survive. The full project
+ * setup UI is #27; this is intentionally the command + persistence only.
+ */
+async function setProjectRates() {
+  const projects = db.getAllProjects();
+  if (projects.length === 0) {
+    vscode.window.showWarningMessage(
+      'No projects yet. Projects are created when a repository is linked; rates can be set once a project exists.'
+    );
+    return;
+  }
+
+  type ProjPick = vscode.QuickPickItem & { id: string };
+  const picks: ProjPick[] = projects.map(p => {
+    const r = p.settings ?? {};
+    const bits: string[] = [];
+    if (typeof r.hourlyCostRate === 'number') bits.push(`cost ${r.hourlyCostRate}`);
+    if (typeof r.hourlySellRate === 'number') bits.push(`sell ${r.hourlySellRate}`);
+    return {
+      label: p.name,
+      description: p.repos.join(', ') || undefined,
+      detail: bits.length ? `current: ${bits.join(' \u00b7 ')} ${r.currency ?? ''}`.trim() : 'no rates set',
+      id: p.id
+    };
+  });
+  const picked = await vscode.window.showQuickPick(picks, {
+    placeHolder: 'Set rates for which project?'
+  });
+  if (!picked) return;
+
+  const project = db.getProject(picked.id);
+  const existing = project?.settings ?? {};
+
+  // Blank input ⇒ leave the field unset (inherit global/legacy). Non-negative number otherwise.
+  const numInput = async (
+    prompt: string,
+    current: unknown
+  ): Promise<{ ok: boolean; value: number | undefined }> => {
+    const raw = await vscode.window.showInputBox({
+      prompt,
+      value: typeof current === 'number' ? String(current) : '',
+      validateInput: v => {
+        if (!v.trim()) return null; // blank = inherit
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? null : 'Enter a non-negative number (or leave blank to inherit)';
+      }
+    });
+    if (raw === undefined) return { ok: false, value: undefined };
+    return { ok: true, value: raw.trim() ? Number(raw) : undefined };
+  };
+
+  const cost = await numInput(
+    `Hourly COST for "${picked.label}" (what an hour costs) — blank to inherit default`,
+    existing.hourlyCostRate
+  );
+  if (!cost.ok) return;
+  const sell = await numInput(
+    `Hourly SELL rate for "${picked.label}" (what an hour is billed for) — blank to inherit`,
+    existing.hourlySellRate
+  );
+  if (!sell.ok) return;
+
+  const currencyRaw = await vscode.window.showInputBox({
+    prompt: `Currency for "${picked.label}" (e.g. USD, EUR) — blank to inherit`,
+    value: typeof existing.currency === 'string' ? existing.currency : ''
+  });
+  if (currencyRaw === undefined) return;
+
+  const creditCost = await numInput(
+    `Credit cost for "${picked.label}" (money per 1 credit/premium request) — blank to inherit`,
+    existing.creditCostPerUnit
+  );
+  if (!creditCost.ok) return;
+
+  // Merge onto existing settings; assigning undefined clears an override.
+  const settings = { ...existing };
+  settings.hourlyCostRate = cost.value;
+  settings.hourlySellRate = sell.value;
+  settings.currency = currencyRaw.trim() ? currencyRaw.trim() : undefined;
+  settings.creditCostPerUnit = creditCost.value;
+  db.upsertProject({ id: picked.id, settings });
+
+  const eff = db.getEffectiveRates(picked.id);
+  const fmt = (n: number | null) => (n === null ? '\u2014' : String(n));
+  vscode.window.showInformationMessage(
+    `Rates for "${picked.label}" saved. Effective: cost ${fmt(eff.hourlyCostRate)}, ` +
+    `sell ${fmt(eff.hourlySellRate)}, credit ${fmt(eff.creditCostPerUnit)} (${eff.currency}).`
   );
   refreshDashboard();
 }
