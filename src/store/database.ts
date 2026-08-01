@@ -120,6 +120,23 @@ export interface LedgerEntry {
   projectId?: string | null;
   chatSessionId?: string | null;
   note?: string;
+  /**
+   * Real prompt (input) tokens captured from VS Code chat session storage
+   * (issue #59). Optional and additive: pre-#59 rows simply lack it and load as
+   * `undefined`, so no schema migration is required — {@link migrateStore} passes
+   * the ledger through untouched.
+   */
+  promptTokens?: number;
+  /** Real completion (output) tokens captured from chat session storage (#59). */
+  completionTokens?: number;
+  /**
+   * True when `credits` is the EXACT AIU cost read from a request's
+   * `copilot_usage.total_nano_aiu` (caught by the live tailer before compaction);
+   * false/undefined when `credits` is the deterministic per-model token-rate
+   * ESTIMATE (issue #59). An exact capture upgrades an earlier estimate for the
+   * same requestId in place (never a second row).
+   */
+  exact?: boolean;
 }
 
 /**
@@ -1932,6 +1949,65 @@ export class Database {
   recordAutoModelUsage(branch: string, model: string, credits: number, note?: string) {
     const data = this.ensureBranch(branch);
     this.appendLedger(branch, model, credits, 'auto', note ?? 'auto');
+    data.autoModelRequests = (data.autoModelRequests ?? 0) + 1;
+    this.save();
+  }
+
+  /**
+   * Record REAL per-request chat usage captured from VS Code chat session
+   * storage (issue #59), keyed idempotently on `requestId`. Unlike
+   * {@link recordAutoModelUsage} (log-based, model-only estimate), this stores the
+   * real `promptTokens`/`completionTokens` and the AIU `credits` — either the
+   * per-model token-rate ESTIMATE or, when the live tailer caught a request's
+   * `copilot_usage.total_nano_aiu` before compaction, the EXACT cost (`exact`).
+   *
+   * Idempotency & dedup: the row is upserted by its `auto:jsonl:<requestId>`
+   * note, so re-reading the same request (across polls OR an extension restart)
+   * updates the SAME row in place — never a second ledger entry, never a double
+   * count — and `autoModelRequests` increments only on first insert. This is also
+   * the estimate→exact UPGRADE path: a later exact capture overwrites the earlier
+   * estimate for that requestId; an already-exact row is never downgraded by a
+   * later estimate. Uses a distinct note namespace from the #17 log tracker
+   * (`auto:ccreq:`), so the two never collide or double-count.
+   *
+   * Attribution (`branch`/`workItemId`/`projectId`) is resolved at write time via
+   * {@link appendLedger}, exactly like every other ledger writer, so captured
+   * credits flow into the existing credits→ROI roll-ups automatically. Fully
+   * defensive: `credits` is clamped to a finite, non-negative number (never NaN).
+   */
+  recordAutoChatUsage(
+    branch: string,
+    model: string,
+    credits: number,
+    opts: {
+      requestId: string;
+      promptTokens?: number;
+      completionTokens?: number;
+      exact?: boolean;
+      chatSessionId?: string | null;
+    }
+  ): void {
+    const safeCredits = Number.isFinite(credits) && credits >= 0 ? credits : 0;
+    const note = `auto:jsonl:${opts.requestId}`;
+    const existing = this.creditLedger.find(e => e.source === 'auto' && e.note === note);
+    if (existing) {
+      // Never let a later estimate clobber an already-exact capture.
+      if (existing.exact && !opts.exact) return;
+      existing.model = model;
+      existing.credits = safeCredits;
+      if (opts.promptTokens !== undefined) existing.promptTokens = opts.promptTokens;
+      if (opts.completionTokens !== undefined) existing.completionTokens = opts.completionTokens;
+      existing.exact = opts.exact ?? existing.exact ?? false;
+      this.save();
+      return;
+    }
+    const data = this.ensureBranch(branch);
+    const entry = this.appendLedger(branch, model, safeCredits, 'auto', note, {
+      chatSessionId: opts.chatSessionId ?? null
+    });
+    if (opts.promptTokens !== undefined) entry.promptTokens = opts.promptTokens;
+    if (opts.completionTokens !== undefined) entry.completionTokens = opts.completionTokens;
+    entry.exact = opts.exact ?? false;
     data.autoModelRequests = (data.autoModelRequests ?? 0) + 1;
     this.save();
   }
