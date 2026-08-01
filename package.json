@@ -48,6 +48,18 @@
         "title": "AI Effort Tracker: Delete Manual Effort Entry"
       },
       {
+        "command": "aiEffortTracker.addTimeEntry",
+        "title": "AI Effort Tracker: Add Time Entry"
+      },
+      {
+        "command": "aiEffortTracker.editTimeEntry",
+        "title": "AI Effort Tracker: Edit Time Entry"
+      },
+      {
+        "command": "aiEffortTracker.deleteTimeEntry",
+        "title": "AI Effort Tracker: Delete Time Entry"
+      },
+      {
         "command": "aiEffortTracker.assignBranchToWorkItem",
         "title": "AI Effort Tracker: Assign Branch to Work Item"
       },

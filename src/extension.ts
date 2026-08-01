@@ -8,6 +8,9 @@ import { Database } from './store/database';
 import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
+import type { TimeEntry, TimeEntryInput, TimeEntryPatch } from './store/database';
+import { TIME_ENTRY_CATEGORIES } from './store/database';
+import type { TimeEntryCategory } from './store/database';
 import { CATEGORY_LABELS, ALL_CATEGORIES } from './util/fileTypes';
 import type { FileCategory } from './util/fileTypes';
 import type { TrackingMode } from './trackers/timeTracker';
@@ -166,6 +169,17 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand('aiEffortTracker.deleteManualEffort', (id?: string) =>
       deleteManualEffort(id)
+    ),
+    // #60: per-entry Time Log. `arg` on add encodes "workItemId\u0000branch" from the
+    // dashboard ➕ affordance (either part may be empty); edit/delete take an entry id.
+    vscode.commands.registerCommand('aiEffortTracker.addTimeEntry', (arg?: string) =>
+      addTimeEntry(arg)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.editTimeEntry', (id?: string) =>
+      editTimeEntry(id)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.deleteTimeEntry', (id?: string) =>
+      deleteTimeEntry(id)
     ),
     vscode.commands.registerCommand('aiEffortTracker.assignBranchToWorkItem', () =>
       assignBranchToWorkItem()
@@ -1683,6 +1697,332 @@ async function deleteManualEffort(id?: string) {
   if (ok !== 'Delete') return;
   if (db.deleteManualEffort(entry.id)) {
     vscode.window.showInformationMessage('Manual effort entry deleted.');
+    refreshDashboard();
+  }
+}
+
+// ---- Time Log entries (issue #60) -----------------------------------------
+
+/** Short human label for a time-log entry, used in QuickPicks and messages. */
+function timeEntryLabel(e: TimeEntry): string {
+  const when = new Date(e.startTs ?? e.createdAt).toLocaleString();
+  const bits: string[] = [fmtDuration(e.durationMs)];
+  if (e.mode) bits.push(modeLabel(e.mode));
+  if (e.category) bits.push(e.category);
+  const attr = e.workItemId
+    ? `#${e.workItemId}`
+    : e.branch
+      ? e.branch
+      : e.projectId
+        ? `project ${e.projectId}`
+        : 'unattached';
+  const note = e.note ? ` \u2014 ${e.note}` : '';
+  return `${attr} \u00b7 ${bits.join(' \u00b7 ')} \u00b7 ${when}${note}`;
+}
+
+/**
+ * Pick a work item for a time-log entry, allowing "No work item" (for work not
+ * tied to any item) and "New work item…". Returns a work-item id, `null` for
+ * none, or {@link CANCELLED} on escape.
+ */
+async function pickWorkItemOptional(
+  placeHolder: string,
+  current?: string | null
+): Promise<string | null | typeof CANCELLED> {
+  type WiPick = vscode.QuickPickItem & { id?: string; none?: boolean; create?: boolean };
+  const items = db.getAllWorkItems().filter(
+    w => w.id !== 'unknown' && w.id !== UNASSIGNED_WORK_ITEM_ID
+  );
+  const picks: WiPick[] = [
+    { label: '$(circle-slash) No work item', none: true, description: current == null ? 'current' : undefined },
+    ...items.map(w => ({
+      label: (w.id === current ? '\u25b6 ' : '') + '#' + w.id,
+      description: w.title ?? undefined,
+      id: w.id
+    })),
+    { label: '$(add) New work item\u2026', create: true }
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.none) return null;
+  if (picked.create) {
+    const id = await vscode.window.showInputBox({
+      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+    });
+    if (!id) return CANCELLED;
+    const wid = id.trim();
+    db.upsertWorkItem(wid);
+    return wid;
+  }
+  return picked.id ?? null;
+}
+
+/**
+ * Pick a branch for a time-log entry, allowing "No branch" so work done outside
+ * VS Code can attach to a work item/project only. Returns a branch name, `null`
+ * for none, or {@link CANCELLED} on escape.
+ */
+async function pickBranchOptional(
+  placeHolder: string,
+  current?: string | null
+): Promise<string | null | typeof CANCELLED> {
+  type BP = vscode.QuickPickItem & { branch?: string; none?: boolean };
+  const summaries = db.getAllBranchesSummaries();
+  const picks: BP[] = [
+    { label: '$(circle-slash) No branch (work outside VS Code)', none: true, description: current == null ? 'current' : undefined },
+    ...summaries.map(s => ({
+      label: (s.branch === current ? '\u25b6 ' : '') + s.branch,
+      description: s.workItemId ? '#' + s.workItemId : undefined,
+      branch: s.branch
+    }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.none) return null;
+  return picked.branch ?? null;
+}
+
+/** Pick a descriptive category for a time-log entry, or "No category" (`null`). */
+async function pickTimeEntryCategory(
+  placeHolder: string,
+  current?: TimeEntryCategory | null
+): Promise<TimeEntryCategory | null | typeof CANCELLED> {
+  type CP = vscode.QuickPickItem & { cat?: TimeEntryCategory; none?: boolean };
+  const picks: CP[] = [
+    { label: '$(circle-slash) No category', none: true, description: current == null ? 'current' : undefined },
+    ...TIME_ENTRY_CATEGORIES.map(c => ({ label: (c === current ? '\u25b6 ' : '') + c, cat: c }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.none) return null;
+  return picked.cat ?? null;
+}
+
+/**
+ * Pick a {@link TrackingMode} for a time-log entry. "Default (human coding)"
+ * returns `null` — the roll-up then counts the entry as billable human-coding
+ * time. Returns {@link CANCELLED} on escape.
+ */
+async function pickTimeEntryMode(
+  placeHolder: string,
+  current?: TrackingMode | null
+): Promise<TrackingMode | null | typeof CANCELLED> {
+  type MP = vscode.QuickPickItem & { mode?: TrackingMode; none?: boolean };
+  const modes: TrackingMode[] = ['humanCoding', 'aiGenerating', 'reviewing', 'idle'];
+  const picks: MP[] = [
+    { label: '$(circle-slash) Default (human coding)', none: true, description: current == null ? 'current' : undefined },
+    ...modes.map(m => ({ label: (m === current ? '\u25b6 ' : '') + modeLabel(m), mode: m }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.none) return null;
+  return picked.mode ?? null;
+}
+
+/** A resolved time specification: either a direct duration OR a start/end interval. */
+type TimeSpec = { startTs?: number; endTs?: number; durationMs?: number };
+
+/**
+ * Prompt for a time-log entry's time, either as a direct duration or a
+ * start+end interval (the store derives the duration from the interval). Returns
+ * the spec, `undefined` when nothing usable was entered, or {@link CANCELLED} on
+ * escape.
+ */
+async function promptTimeSpec(
+  defaults?: TimeSpec
+): Promise<TimeSpec | undefined | typeof CANCELLED> {
+  type MP = vscode.QuickPickItem & { value: 'dur' | 'interval' };
+  const method = await vscode.window.showQuickPick<MP>(
+    [
+      { label: '$(watch) Enter a duration', value: 'dur' },
+      { label: '$(calendar) Enter start and end times', value: 'interval' }
+    ],
+    { placeHolder: 'How do you want to log this time?' }
+  );
+  if (!method) return CANCELLED;
+  if (method.value === 'dur') {
+    const dur = await promptDurationMs('How long? (e.g. 90 or 1:30)', defaults?.durationMs);
+    if (dur === CANCELLED) return CANCELLED;
+    if (dur === undefined || dur <= 0) return undefined;
+    return { durationMs: dur };
+  }
+  const start = await promptTimestamp('Start time', defaults?.startTs ?? Date.now());
+  if (start === CANCELLED) return CANCELLED;
+  const end = await promptTimestamp('End time', defaults?.endTs ?? (start ?? Date.now()));
+  if (end === CANCELLED) return CANCELLED;
+  if (start === undefined || end === undefined || end < start) {
+    vscode.window.showWarningMessage('Need a valid start and end (end at or after start).');
+    return undefined;
+  }
+  return { startTs: start, endTs: end };
+}
+
+/**
+ * Add a Time Log entry (issue #60). `arg` from the dashboard encodes
+ * "workItemId\u0000branch" (either part may be empty). From the palette, the user
+ * picks a work item and/or branch (allowing "work item only, no branch" for work
+ * done outside VS Code), then either a direct duration or a start/end interval,
+ * plus an optional category, mode and note. Written to the SEPARATE timeEntries
+ * store; auto-capture is untouched.
+ */
+async function addTimeEntry(arg?: string) {
+  let workItemId: string | undefined;
+  let branch: string | undefined;
+  let fromDashboard = false;
+  if (arg) {
+    fromDashboard = true;
+    const sep = arg.indexOf('\u0000');
+    if (sep >= 0) {
+      workItemId = arg.slice(0, sep) || undefined;
+      branch = arg.slice(sep + 1) || undefined;
+    } else {
+      workItemId = arg || undefined;
+    }
+  }
+
+  if (!fromDashboard) {
+    const wi = await pickWorkItemOptional('Log time to which work item? (or none)');
+    if (wi === CANCELLED) return;
+    workItemId = wi ?? undefined;
+    const br = await pickBranchOptional('Attach to which branch? (or none for non-VS-Code work)');
+    if (br === CANCELLED) return;
+    branch = br ?? undefined;
+  }
+
+  if (!workItemId && !branch) {
+    vscode.window.showWarningMessage('Pick a work item and/or a branch to log time against.');
+    return;
+  }
+
+  const spec = await promptTimeSpec();
+  if (spec === CANCELLED) return;
+  if (!spec) {
+    vscode.window.showWarningMessage('No time entered \u2014 nothing logged.');
+    return;
+  }
+
+  const input: TimeEntryInput = { source: 'manual' };
+  if (workItemId) input.workItemId = workItemId;
+  if (branch) input.branch = branch;
+  if (spec.durationMs !== undefined) input.durationMs = spec.durationMs;
+  if (spec.startTs !== undefined) input.startTs = spec.startTs;
+  if (spec.endTs !== undefined) input.endTs = spec.endTs;
+
+  const cat = await pickTimeEntryCategory('Category? (optional)');
+  if (cat === CANCELLED) return;
+  if (cat) input.category = cat;
+
+  const mode = await pickTimeEntryMode('Kind of time? (optional)');
+  if (mode === CANCELLED) return;
+  if (mode) input.mode = mode;
+
+  const note = await vscode.window.showInputBox({
+    prompt: 'Note (optional)',
+    placeHolder: 'e.g. pairing session, offline work'
+  });
+  if (note === undefined) return;
+  if (note.trim()) input.note = note.trim();
+
+  const entry = db.addTimeEntry(input);
+  const target = workItemId ? `#${workItemId}` : branch;
+  vscode.window.showInformationMessage(`Logged ${fmtDuration(entry.durationMs)} to ${target}.`);
+  refreshDashboard();
+}
+
+/** QuickPick an existing time-log entry (newest-first). */
+async function pickTimeEntry(placeHolder: string): Promise<TimeEntry | undefined> {
+  const entries = db.getTimeEntries();
+  if (entries.length === 0) {
+    vscode.window.showWarningMessage('No time-log entries yet. Add one with "Add Time Entry" first.');
+    return undefined;
+  }
+  type EP = vscode.QuickPickItem & { entry: TimeEntry };
+  const picks: EP[] = entries.map(e => ({ label: timeEntryLabel(e), entry: e }));
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  return picked?.entry;
+}
+
+/** Resolve a time-log entry from a dashboard-supplied id or, failing that, a QuickPick. */
+async function resolveTimeEntry(id: string | undefined, placeHolder: string): Promise<TimeEntry | undefined> {
+  if (id) {
+    const found = db.getTimeEntries().find(e => e.id === id);
+    if (!found) {
+      vscode.window.showWarningMessage('That time entry no longer exists.');
+      return undefined;
+    }
+    return found;
+  }
+  return pickTimeEntry(placeHolder);
+}
+
+/**
+ * Edit a Time Log entry (issue #60). Re-runs the prompts pre-filled with current
+ * values and writes a patch. Choosing "No work item"/"No branch"/"No category"/
+ * "Default" clears those fields. Escaping any prompt cancels. Safe when the row
+ * was deleted meanwhile.
+ */
+async function editTimeEntry(id?: string) {
+  const entry = await resolveTimeEntry(id, 'Edit which time entry?');
+  if (!entry) return;
+
+  const wi = await pickWorkItemOptional('Work item (or none)', entry.workItemId ?? null);
+  if (wi === CANCELLED) return;
+  const br = await pickBranchOptional('Branch (or none)', entry.branch ?? null);
+  if (br === CANCELLED) return;
+
+  const spec = await promptTimeSpec({ startTs: entry.startTs, endTs: entry.endTs, durationMs: entry.durationMs });
+  if (spec === CANCELLED) return;
+  if (!spec) {
+    vscode.window.showWarningMessage('No time entered \u2014 entry unchanged.');
+    return;
+  }
+
+  const cat = await pickTimeEntryCategory('Category? (optional)', entry.category ?? null);
+  if (cat === CANCELLED) return;
+  const mode = await pickTimeEntryMode('Kind of time? (optional)', entry.mode ?? null);
+  if (mode === CANCELLED) return;
+  const noteIn = await vscode.window.showInputBox({ prompt: 'Note (optional)', value: entry.note ?? '' });
+  if (noteIn === undefined) return;
+
+  const patch: TimeEntryPatch = {
+    workItemId: wi,
+    branch: br,
+    category: cat,
+    mode,
+    note: noteIn.trim() ? noteIn.trim() : null
+  };
+  if (spec.durationMs !== undefined) {
+    // Direct duration: drop any prior interval so start/end don't override it.
+    patch.durationMs = spec.durationMs;
+    patch.startTs = null;
+    patch.endTs = null;
+  } else {
+    patch.startTs = spec.startTs ?? null;
+    patch.endTs = spec.endTs ?? null;
+  }
+
+  const updated = db.updateTimeEntry(entry.id, patch);
+  if (!updated) {
+    vscode.window.showWarningMessage('That time entry no longer exists.');
+    return;
+  }
+  vscode.window.showInformationMessage(`Updated time entry (${fmtDuration(updated.durationMs)}).`);
+  refreshDashboard();
+}
+
+/** Delete a Time Log entry (issue #60) after a confirmation modal. */
+async function deleteTimeEntry(id?: string) {
+  const entry = await resolveTimeEntry(id, 'Delete which time entry?');
+  if (!entry) return;
+  const ok = await vscode.window.showWarningMessage(
+    `Delete this time entry?\n\n${timeEntryLabel(entry)}`,
+    { modal: true },
+    'Delete'
+  );
+  if (ok !== 'Delete') return;
+  if (db.deleteTimeEntry(entry.id)) {
+    vscode.window.showInformationMessage('Time entry deleted.');
     refreshDashboard();
   }
 }

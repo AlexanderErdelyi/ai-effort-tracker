@@ -72,6 +72,13 @@ export interface BranchSummary {
   // Breakdown by category (programming/specification/documentation/deployment/config/other)
   byCategory: Record<string, { human: LineStats; ai: LineStats }>;
   /**
+   * The itemised time-log entries attached to THIS branch (issue #60), newest
+   * first. These `source:'manual'` entries are ALREADY INCLUDED (additively) in
+   * the effective time above; the array just lets the UI render the per-entry
+   * Time Log card and a running total. Display-only.
+   */
+  timeEntries?: TimeEntry[];
+  /**
    * Economic ROI figures (issue #45) for this branch, computed from the EFFECTIVE
    * rates of the branch's owning project (project override → global default →
    * legacy) applied to its billable time + ledger credits/cost. Money fields are
@@ -199,6 +206,93 @@ export interface ManualEffortPatch {
   linesDeleted?: number | null;
   isAi?: boolean | null;
   note?: string | null;
+}
+
+/** The categories allowed on a {@link TimeEntry} (issue #60) — a descriptive tag
+ * for the KIND of work, distinct from the file-based {@link FileCategory}; it does
+ * not feed any line bucket. */
+export const TIME_ENTRY_CATEGORIES = ['programming', 'spec', 'docs', 'deployment', 'other'] as const;
+export type TimeEntryCategory = typeof TIME_ENTRY_CATEGORIES[number];
+
+/**
+ * One discrete, itemised time-log entry (issue #60 / milestone M5). Unlike the
+ * single #21 manual-effort CORRECTION or the #47 aggregate DELTA, this is an
+ * append-only LOG row — "worked 10:00–11:00" — that the user can add, edit and
+ * delete individually. Entries live at the TOP LEVEL of the store (its own
+ * `timeEntries` array, exactly like `manualEffort`/`reassignments`) so they span
+ * branches and survive re-homings.
+ *
+ * `durationMs` is the AUTHORITATIVE amount (derived from `startTs`/`endTs` when
+ * those are given, or entered directly). Attachment is optional and drives the
+ * roll-up level (see the Database roll-up helpers): a `branch` entry rolls up at
+ * the branch level, else a `workItemId` entry at the work-item level, else a
+ * `projectId` entry at the project level. `source` separates hand-entered
+ * `'manual'` rows (which DO roll up) from any future `'auto'` surfacing of tracked
+ * sessions (display-only, so they can never double-count the auto buckets).
+ */
+export interface TimeEntry {
+  id: string;
+  workItemId?: string;
+  branch?: string;
+  projectId?: string;
+  /** Optional explicit start (epoch ms). */
+  startTs?: number;
+  /** Optional explicit end (epoch ms). */
+  endTs?: number;
+  /** Authoritative duration in ms (from start/end, or entered directly). */
+  durationMs: number;
+  mode?: TrackingMode;
+  category?: TimeEntryCategory;
+  source: 'manual' | 'auto';
+  note?: string;
+  createdAt: number;
+}
+
+/**
+ * Caller-supplied fields for {@link Database.addTimeEntry} (issue #60). `id` and
+ * `createdAt` are assigned by the store; `source` defaults to `'manual'`;
+ * `durationMs` may be omitted when `startTs`+`endTs` bound a valid interval.
+ */
+export interface TimeEntryInput {
+  workItemId?: string;
+  branch?: string;
+  projectId?: string;
+  startTs?: number;
+  endTs?: number;
+  durationMs?: number;
+  mode?: TrackingMode;
+  category?: TimeEntryCategory;
+  source?: 'manual' | 'auto';
+  note?: string;
+}
+
+/**
+ * Editable fields for {@link Database.updateTimeEntry} (issue #60). Only keys that
+ * are present are applied; `id`/`source`/`createdAt` are intentionally NOT editable
+ * so a row's identity and provenance survive an edit. Passing `null` for an
+ * optional field clears it.
+ */
+export interface TimeEntryPatch {
+  workItemId?: string | null;
+  branch?: string | null;
+  projectId?: string | null;
+  startTs?: number | null;
+  endTs?: number | null;
+  durationMs?: number;
+  mode?: TrackingMode | null;
+  category?: TimeEntryCategory | null;
+  note?: string | null;
+}
+
+/** Optional filter for {@link Database.getTimeEntries} (issue #60). */
+export interface TimeEntryQuery {
+  workItemId?: string;
+  branch?: string;
+  projectId?: string;
+  /** Inclusive lower bound on the entry's effective timestamp (ms). */
+  from?: number;
+  /** Inclusive upper bound on the entry's effective timestamp (ms). */
+  to?: number;
 }
 
 /**
@@ -525,6 +619,13 @@ export interface PersistedStore {
    * branches and work items and survives future re-points. Added in schema v7.
    */
   reassignments: ReassignmentRecord[];
+  /**
+   * Itemised time-log entries (issue #60). Top-level, like the credit ledger,
+   * manual effort and reassignments, so discrete time rows span branches and
+   * work items and stay separable from the automatic capture path. Added in
+   * schema v10.
+   */
+  timeEntries: TimeEntry[];
 }
 
 /** Aggregated effort for a single work item, rolled up across all its branches. */
@@ -590,6 +691,13 @@ export interface WorkItemSummary {
    * source as {@link roi} so they can never disagree. Display-only / derived.
    */
   generated: GeneratedValue;
+  /**
+   * The itemised time-log entries that roll up into THIS work item (issue #60),
+   * newest first — branch-scoped entries on the work item's mapped branches plus
+   * branch-less entries attached directly to it. Already INCLUDED (additively) in
+   * the totals above; the array drives the per-entry Time Log card. Display-only.
+   */
+  timeEntries?: TimeEntry[];
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
@@ -597,7 +705,7 @@ export type BranchRollup = Omit<
   WorkItemSummary,
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
   | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual' | 'roi'
-  | 'generated'
+  | 'generated' | 'timeEntries'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -714,8 +822,16 @@ export interface ProjectRoi extends RoiFigures {
  * round-trips untouched; a 0 or garbage delta — which the effective-time math
  * would treat as a no-op anyway — is removed), so a v8 → v9 load never NaNs and
  * never loses data.
+ *
+ * v10 (issue #60) adds the top-level `timeEntries` array — an append-only,
+ * itemised time LOG (discrete start/end or direct-duration rows) that rolls up
+ * additively into the effective time. {@link migrateStore} defaults it to `[]`
+ * for any pre-v10 file (envelope or legacy flat map) and runs
+ * {@link sanitizeTimeEntries}, exactly as `manualEffort`/`reassignments` are
+ * defaulted/sanitized, so a v9 → v10 load is a pure, idempotent, zero-loss
+ * upgrade that never NaNs and never loses data.
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -959,6 +1075,7 @@ export function migrateStore(parsed: unknown): PersistedStore {
   let projects: Record<string, Project>;
   let manualEffort: ManualEffortEntry[];
   let reassignments: ReassignmentRecord[];
+  let timeEntries: TimeEntry[];
   if (isEnvelope(parsed)) {
     branches = (parsed.branches ?? {}) as Store;
     workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
@@ -973,6 +1090,8 @@ export function migrateStore(parsed: unknown): PersistedStore {
     manualEffort = sanitizeManualEffort((parsed as PersistedStore).manualEffort);
     // #22: default to [] for any pre-v7 file, which had no reassignments array.
     reassignments = sanitizeReassignments((parsed as PersistedStore).reassignments);
+    // #60: default to [] for any pre-v10 file, which had no timeEntries array.
+    timeEntries = sanitizeTimeEntries((parsed as PersistedStore).timeEntries);
   } else {
     branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
     workItems = {};
@@ -980,6 +1099,7 @@ export function migrateStore(parsed: unknown): PersistedStore {
     projects = {};
     manualEffort = [];
     reassignments = [];
+    timeEntries = [];
   }
   backfillWorkItems(branches, workItems);
   // #46: default/sanitize the optional billableHours override on every work item
@@ -999,7 +1119,8 @@ export function migrateStore(parsed: unknown): PersistedStore {
     creditLedger,
     projects,
     manualEffort,
-    reassignments
+    reassignments,
+    timeEntries
   };
 }
 
@@ -1123,6 +1244,58 @@ export function sanitizeManualEffort(input: unknown): ManualEffortEntry[] {
   return out;
 }
 
+/** True when `m` is one of the four {@link TrackingMode} values. */
+function isTrackingMode(m: unknown): m is TrackingMode {
+  return m === 'humanCoding' || m === 'aiGenerating' || m === 'reviewing' || m === 'idle';
+}
+
+/** True when `c` is one of the allowed {@link TimeEntryCategory} values. */
+function isTimeEntryCategory(c: unknown): c is TimeEntryCategory {
+  return typeof c === 'string' && (TIME_ENTRY_CATEGORIES as readonly string[]).includes(c);
+}
+
+/**
+ * Coerce persisted time-log JSON into a clean {@link TimeEntry}[] (issue #60).
+ * Mirrors {@link sanitizeManualEffort}: drops non-object rows and rows without a
+ * usable duration (a finite `durationMs` ≥ 0, else derived from a valid
+ * `startTs`/`endTs` interval), fills a missing `id`/`createdAt`, pins `source` to
+ * `'manual'`/`'auto'` (default `'manual'`), and keeps only valid optional fields.
+ * Pure + idempotent so a re-migration of already-clean data is a no-op with zero
+ * data loss.
+ */
+export function sanitizeTimeEntries(input: unknown): TimeEntry[] {
+  if (!Array.isArray(input)) return [];
+  const out: TimeEntry[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue;
+    const r = raw as Partial<TimeEntry>;
+    const start = typeof r.startTs === 'number' && Number.isFinite(r.startTs) ? r.startTs : undefined;
+    const end = typeof r.endTs === 'number' && Number.isFinite(r.endTs) ? r.endTs : undefined;
+    let dur = typeof r.durationMs === 'number' && Number.isFinite(r.durationMs) ? r.durationMs : NaN;
+    if (!Number.isFinite(dur) && start !== undefined && end !== undefined && end >= start) {
+      dur = end - start;
+    }
+    if (!Number.isFinite(dur) || dur < 0) continue;
+    const entry: TimeEntry = {
+      id: typeof r.id === 'string' && r.id ? r.id : newLedgerId(),
+      durationMs: dur,
+      source: r.source === 'auto' ? 'auto' : 'manual',
+      createdAt:
+        typeof r.createdAt === 'number' && Number.isFinite(r.createdAt) ? r.createdAt : Date.now()
+    };
+    if (typeof r.workItemId === 'string' && r.workItemId) entry.workItemId = r.workItemId;
+    if (typeof r.branch === 'string' && r.branch) entry.branch = r.branch;
+    if (typeof r.projectId === 'string' && r.projectId) entry.projectId = r.projectId;
+    if (start !== undefined) entry.startTs = start;
+    if (end !== undefined) entry.endTs = end;
+    if (isTrackingMode(r.mode)) entry.mode = r.mode;
+    if (isTimeEntryCategory(r.category)) entry.category = r.category;
+    if (typeof r.note === 'string') entry.note = r.note;
+    out.push(entry);
+  }
+  return out;
+}
+
 /** Maps a {@link TrackingMode} to its millisecond bucket key on a rollup. */
 const MODE_TO_MS_FIELD: Record<
   TrackingMode,
@@ -1202,6 +1375,43 @@ export function mergeManualRollup(target: BranchRollup, m: ManualRollup): void {
   }
 }
 
+/** A per-{@link TrackingMode} millisecond accumulator (issue #60). */
+export type ModeMs = Record<TrackingMode, number>;
+
+/** A fresh, all-zero {@link ModeMs}. */
+export function emptyModeMs(): ModeMs {
+  return { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0 };
+}
+
+/** The effective timestamp of a {@link TimeEntry} for ordering/grouping (issue
+ * #60): its explicit `startTs` when present, else `createdAt`. */
+export function timeEntryTs(e: TimeEntry): number {
+  return typeof e.startTs === 'number' && Number.isFinite(e.startTs) ? e.startTs : e.createdAt;
+}
+
+/**
+ * Accumulate ONE manual {@link TimeEntry}'s duration into a {@link ModeMs} on its
+ * mode bucket (issue #60). The mode is the entry's `mode` when set, else the
+ * default billable bucket `humanCoding`, so a plain/category-only entry still adds
+ * to billable time + ROI (documented choice). Non-finite/non-positive durations
+ * are ignored so the result can never be NaN or negative. Pure (mutates `acc`).
+ */
+export function accumulateTimeEntryMs(acc: ModeMs, e: TimeEntry): void {
+  const dur = Number(e.durationMs);
+  if (!Number.isFinite(dur) || dur <= 0) return;
+  const mode: TrackingMode = isTrackingMode(e.mode) ? e.mode : 'humanCoding';
+  acc[mode] += dur;
+}
+
+/** Add a {@link ModeMs} into a {@link BranchRollup}'s per-mode ms fields (issue
+ * #60). Pure (mutates only `target`); a zero {@link ModeMs} is a no-op. */
+export function addModeMsToRollup(target: BranchRollup, ms: ModeMs): void {
+  target.humanCodingMs += ms.humanCoding;
+  target.aiGeneratingMs += ms.aiGenerating;
+  target.reviewingMs += ms.reviewing;
+  target.idleMs += ms.idle;
+}
+
 /**
  * Apply one optional field of a {@link ManualEffortPatch} to an entry (issue
  * #21): `undefined` leaves it unchanged, `null` clears it, any other value sets
@@ -1216,6 +1426,30 @@ function applyManualOptional<K extends OptionalManualKey>(
 ): void {
   if (value === undefined) return;
   if (value === null) delete entry[key];
+  else entry[key] = value;
+}
+
+/** Apply an optional STRING patch field to a {@link TimeEntry} (issue #60):
+ * `undefined` leaves it, `null`/'' clears it, a non-empty string sets it. */
+function applyTimeEntryString(
+  entry: TimeEntry,
+  key: 'workItemId' | 'branch' | 'projectId',
+  value: string | null | undefined
+): void {
+  if (value === undefined) return;
+  if (value === null || value === '') delete entry[key];
+  else entry[key] = value;
+}
+
+/** Apply an optional NUMBER patch field to a {@link TimeEntry} (issue #60):
+ * `undefined` leaves it, `null`/non-finite clears it, a finite number sets it. */
+function applyTimeEntryNumber(
+  entry: TimeEntry,
+  key: 'startTs' | 'endTs',
+  value: number | null | undefined
+): void {
+  if (value === undefined) return;
+  if (value === null || !Number.isFinite(value)) delete entry[key];
   else entry[key] = value;
 }
 
@@ -1334,6 +1568,7 @@ export class Database {
   private projects: Record<string, Project>;
   private manualEffort: ManualEffortEntry[];
   private reassignments: ReassignmentRecord[];
+  private timeEntries: TimeEntry[];
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -1354,6 +1589,7 @@ export class Database {
     this.projects = loaded.projects;
     this.manualEffort = loaded.manualEffort;
     this.reassignments = loaded.reassignments;
+    this.timeEntries = loaded.timeEntries;
   }
 
   /** Build the on-disk envelope from the in-memory state. */
@@ -1365,7 +1601,8 @@ export class Database {
       creditLedger: this.creditLedger,
       projects: this.projects,
       manualEffort: this.manualEffort,
-      reassignments: this.reassignments
+      reassignments: this.reassignments,
+      timeEntries: this.timeEntries
     };
     return JSON.stringify(envelope, null, 2);
   }
@@ -1839,6 +2076,185 @@ export class Database {
     return roll;
   }
 
+  // ---------------------------------------------------------------------------
+  // Time Log (issue #60 / milestone M5)
+  //
+  // Roll-up precedence — each MANUAL entry contributes to effective time at
+  // EXACTLY ONE level so it is never double-counted: `branch` → branch level (it
+  // flows up to the work item/project through the existing branch rollup); else
+  // `workItemId` → work-item level (mirrors #21 manual effort; flows up to the
+  // project); else `projectId` → project level. `source:'auto'` entries never
+  // roll up (display-only) so a future auto-surfacing can't double-count the auto
+  // buckets. This layer is fully independent of the auto buckets, the #47 delta
+  // and #21 manual effort.
+  // ---------------------------------------------------------------------------
+
+  /** Branch-scoped manual time entries → per-mode ms (issue #60). */
+  private timeEntryMsForBranch(branch: string): ModeMs {
+    const acc = emptyModeMs();
+    for (const e of this.timeEntries) {
+      if (e.source !== 'manual') continue;
+      if (typeof e.branch === 'string' && e.branch === branch) accumulateTimeEntryMs(acc, e);
+    }
+    return acc;
+  }
+
+  /** Branch-LESS manual time entries attached directly to a work item → per-mode
+   * ms (issue #60). Branch-scoped entries are counted at the branch level. */
+  private timeEntryMsForWorkItemDirect(workItemId: string): ModeMs {
+    const acc = emptyModeMs();
+    for (const e of this.timeEntries) {
+      if (e.source !== 'manual') continue;
+      if (e.branch) continue;
+      if (e.workItemId === workItemId) accumulateTimeEntryMs(acc, e);
+    }
+    return acc;
+  }
+
+  /** Branch-LESS, work-item-LESS manual time entries attached directly to a
+   * project → per-mode ms (issue #60). */
+  private timeEntryMsForProjectDirect(projectId: string): ModeMs {
+    const acc = emptyModeMs();
+    for (const e of this.timeEntries) {
+      if (e.source !== 'manual') continue;
+      if (e.branch || e.workItemId) continue;
+      if (e.projectId === projectId) accumulateTimeEntryMs(acc, e);
+    }
+    return acc;
+  }
+
+  /** The time entries attached to a branch (issue #60), newest first. */
+  private timeEntriesForBranch(branch: string): TimeEntry[] {
+    return this.timeEntries
+      .filter(e => e.branch === branch)
+      .sort((a, b) => timeEntryTs(b) - timeEntryTs(a));
+  }
+
+  /** The time entries that roll up into a work item (issue #60), newest first:
+   * branch-scoped entries on the work item's mapped branches + branch-less
+   * entries attached directly to it. */
+  private timeEntriesForWorkItem(workItemId: string): TimeEntry[] {
+    const branches = new Set(this.getBranchesForWorkItem(workItemId));
+    return this.timeEntries
+      .filter(
+        e =>
+          (typeof e.branch === 'string' && branches.has(e.branch)) ||
+          (!e.branch && e.workItemId === workItemId)
+      )
+      .sort((a, b) => timeEntryTs(b) - timeEntryTs(a));
+  }
+
+  /**
+   * Add one time-log entry (issue #60). `durationMs` is derived from
+   * `startTs`/`endTs` when omitted; the row is dropped-safe via
+   * {@link sanitizeTimeEntries} on the next load anyway, but we compute a clean
+   * duration up front. A target work item (when given) is ensured so the entry
+   * shows in roll-ups even if no branch maps to it yet. Persists via {@link save}.
+   */
+  addTimeEntry(input: TimeEntryInput): TimeEntry {
+    if (input.workItemId) this.ensureWorkItem(input.workItemId);
+    const start =
+      typeof input.startTs === 'number' && Number.isFinite(input.startTs) ? input.startTs : undefined;
+    const end =
+      typeof input.endTs === 'number' && Number.isFinite(input.endTs) ? input.endTs : undefined;
+    let dur =
+      typeof input.durationMs === 'number' && Number.isFinite(input.durationMs)
+        ? input.durationMs
+        : NaN;
+    if (!Number.isFinite(dur) && start !== undefined && end !== undefined && end >= start) {
+      dur = end - start;
+    }
+    const entry: TimeEntry = {
+      id: newLedgerId(),
+      durationMs: Number.isFinite(dur) && dur > 0 ? dur : 0,
+      source: input.source === 'auto' ? 'auto' : 'manual',
+      createdAt: Date.now()
+    };
+    if (input.workItemId) entry.workItemId = input.workItemId;
+    if (input.branch) entry.branch = input.branch;
+    if (input.projectId) entry.projectId = input.projectId;
+    if (start !== undefined) entry.startTs = start;
+    if (end !== undefined) entry.endTs = end;
+    if (isTrackingMode(input.mode)) entry.mode = input.mode;
+    if (isTimeEntryCategory(input.category)) entry.category = input.category;
+    if (typeof input.note === 'string' && input.note) entry.note = input.note;
+    this.timeEntries.push(entry);
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Edit a time-log entry in place (issue #60). Only the fields present in `patch`
+   * change; `id`/`source`/`createdAt` are preserved. Passing `null` clears an
+   * optional field. When `startTs`/`endTs` change (and no explicit `durationMs` is
+   * given) the duration is recomputed from the resulting interval. When
+   * `workItemId` is set the destination work item is ensured. Safe no-op returning
+   * `undefined` when `id` is not found. Persists via {@link save}.
+   */
+  updateTimeEntry(id: string, patch: TimeEntryPatch): TimeEntry | undefined {
+    const entry = this.timeEntries.find(e => e.id === id);
+    if (!entry) return undefined;
+    applyTimeEntryString(entry, 'workItemId', patch.workItemId);
+    if (patch.workItemId) this.ensureWorkItem(patch.workItemId);
+    applyTimeEntryString(entry, 'branch', patch.branch);
+    applyTimeEntryString(entry, 'projectId', patch.projectId);
+    applyTimeEntryNumber(entry, 'startTs', patch.startTs);
+    applyTimeEntryNumber(entry, 'endTs', patch.endTs);
+    if (isTrackingMode(patch.mode)) entry.mode = patch.mode;
+    else if (patch.mode === null) delete entry.mode;
+    if (isTimeEntryCategory(patch.category)) entry.category = patch.category;
+    else if (patch.category === null) delete entry.category;
+    if (patch.note !== undefined) {
+      if (patch.note === null || !patch.note) delete entry.note;
+      else entry.note = patch.note;
+    }
+    if (typeof patch.durationMs === 'number' && Number.isFinite(patch.durationMs)) {
+      entry.durationMs = patch.durationMs > 0 ? patch.durationMs : 0;
+    } else if (
+      (patch.startTs !== undefined || patch.endTs !== undefined) &&
+      typeof entry.startTs === 'number' &&
+      typeof entry.endTs === 'number' &&
+      entry.endTs >= entry.startTs
+    ) {
+      entry.durationMs = entry.endTs - entry.startTs;
+    }
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Remove a time-log entry by id (issue #60). Returns `true` when a row was
+   * removed, `false` when `id` was not found (safe no-op). Because roll-ups derive
+   * from `timeEntries`, deleting a row drops its contribution automatically.
+   */
+  deleteTimeEntry(id: string): boolean {
+    const idx = this.timeEntries.findIndex(e => e.id === id);
+    if (idx === -1) return false;
+    this.timeEntries.splice(idx, 1);
+    this.save();
+    return true;
+  }
+
+  /**
+   * List time-log entries (issue #60), newest-first by effective timestamp
+   * (`startTs ?? createdAt`). Optional filter narrows by attachment and/or an
+   * inclusive timestamp window. Returns a shallow copy so callers can't mutate the
+   * stored array.
+   */
+  getTimeEntries(filter?: TimeEntryQuery): TimeEntry[] {
+    return this.timeEntries
+      .filter(e => {
+        if (filter?.workItemId !== undefined && e.workItemId !== filter.workItemId) return false;
+        if (filter?.branch !== undefined && e.branch !== filter.branch) return false;
+        if (filter?.projectId !== undefined && e.projectId !== filter.projectId) return false;
+        const ts = timeEntryTs(e);
+        if (filter?.from !== undefined && ts < filter.from) return false;
+        if (filter?.to !== undefined && ts > filter.to) return false;
+        return true;
+      })
+      .sort((a, b) => timeEntryTs(b) - timeEntryTs(a));
+  }
+
   /**
    * Auto-associate a branch with a work item (from branch-name detection).
    * Sticky manual overrides are respected: if the branch was mapped manually
@@ -2122,6 +2538,9 @@ export class Database {
     // expose them separately as `manual` so the UI can show the auto/manual split.
     const manual = this.manualRollupForWorkItem(workItemId);
     mergeManualRollup(rollup, manual);
+    // #60: fold branch-less time-log entries attached directly to this work item
+    // (branch-scoped entries are already in `rollup` via their branch summaries).
+    addModeMsToRollup(rollup, this.timeEntryMsForWorkItemDirect(workItemId));
     const billableMs = rollup.humanCodingMs + rollup.aiGeneratingMs + rollup.reviewingMs;
     // #46: decouple the 'could-charge' billable hours from the actual worked
     // hours before computing ROI, so invoice value / net gain / profit reflect
@@ -2160,7 +2579,8 @@ export class Database {
       ...rollup,
       manual,
       roi,
-      generated
+      generated,
+      timeEntries: this.timeEntriesForWorkItem(workItemId)
     };
   }
 
@@ -2370,6 +2790,14 @@ export class Database {
     // correction flows into this summary, the work-item/project rollups and ROI.
     // The raw buckets are exposed separately so the UI can prove they're intact.
     const eff = this.effectiveTime(data);
+    // #60: fold this branch's manual time-log entries additively onto the
+    // effective buckets so the branch summary, its work-item/project rollups and
+    // ROI all include them (counted once, at the branch level).
+    const teMs = this.timeEntryMsForBranch(branch);
+    eff.humanCoding += teMs.humanCoding;
+    eff.aiGenerating += teMs.aiGenerating;
+    eff.reviewing += teMs.reviewing;
+    eff.idle += teMs.idle;
     const billableMs = eff.humanCoding + eff.aiGenerating + eff.reviewing;
     return {
       branch,
@@ -2405,6 +2833,7 @@ export class Database {
       creditsByModel: creditTotals.byModel,
       byExt: data.lineChanges,
       byCategory,
+      timeEntries: this.timeEntriesForBranch(branch),
       roi: this.roiForSubject(projectId, billableMs, creditTotals)
     };
   }
@@ -2807,7 +3236,7 @@ export class Database {
     const project = this.projects[projectId];
     const workItemIds = this.getWorkItemIdsForProject(projectId);
     const branches = this.getBranchesForProject(projectId);
-    const rollup = this.projectRollupWithManual(branches, workItemIds);
+    const rollup = this.projectRollupWithManual(projectId, branches, workItemIds);
     const credits = this.getCreditsForProject(projectId);
     return {
       projectId,
@@ -2926,7 +3355,7 @@ export class Database {
   getProjectRoi(projectId: string): ProjectRoi {
     const branches = this.getBranchesForProject(projectId);
     const workItemIds = this.getWorkItemIdsForProject(projectId);
-    const rollup = this.projectRollupWithManual(branches, workItemIds);
+    const rollup = this.projectRollupWithManual(projectId, branches, workItemIds);
     return this.computeProjectRoi(projectId, rollup, this.getCreditsForProject(projectId));
   }
 
@@ -2937,11 +3366,15 @@ export class Database {
    * {@link getProjectRoi} so their numbers can never drift. When no manual
    * effort exists this is byte-for-byte the old branch-only rollup.
    */
-  private projectRollupWithManual(branches: string[], workItemIds: string[]): BranchRollup {
+  private projectRollupWithManual(projectId: string, branches: string[], workItemIds: string[]): BranchRollup {
     const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
     for (const id of workItemIds) {
       mergeManualRollup(rollup, this.manualRollupForWorkItem(id));
+      // #60: branch-less time-log entries attached directly to each work item.
+      addModeMsToRollup(rollup, this.timeEntryMsForWorkItemDirect(id));
     }
+    // #60: time-log entries attached directly to the project (no branch/work item).
+    addModeMsToRollup(rollup, this.timeEntryMsForProjectDirect(projectId));
     return rollup;
   }
 }
