@@ -465,11 +465,57 @@ export interface ProjectRoi extends RoiFigures {
  * legacy work item keeps its scalar `estimate` (the total falls back to it when
  * no breakdown is present) and simply has `estimateBreakdown`/`estimateUnit`
  * undefined. A v4 → v5 load is therefore pure, idempotent and zero-loss.
+ *
+ * v5 also hosts the issue #12 branch → work item back-migration
+ * ({@link assignUnmappedBranches}): every previously-orphaned branch (one whose
+ * `workItemId` was `null` because it pre-dated auto-detection or its name did
+ * not match) is either auto-detected into its work item or parked in the
+ * {@link UNASSIGNED_WORK_ITEM_ID} holding item. This only SETS a
+ * previously-null `workItemId` and may create a work item entity — it does NOT
+ * change the on-disk envelope SHAPE (both fields already exist), so NO schema
+ * bump is required and the pass stays pure, idempotent and zero-loss.
  */
 export const CURRENT_SCHEMA_VERSION = 5;
 
-/** Branch buckets that never map to a real work item (detached HEAD / worktrees). */
-const NON_WORK_ITEM_IDS = new Set<string>(['unknown']);
+/**
+ * Well-known holding work item (issue #12) for branches that carry effort but
+ * cannot be resolved to a real work item after auto-detection. Parking them here
+ * keeps their historical effort/credits VISIBLE in the work-item model instead
+ * of orphaned under a `null` mapping. It is deliberately KEPT DISTINCT from the
+ * detached-HEAD `unknown` bucket (see {@link RESERVED_BRANCH_BUCKETS}).
+ */
+export const UNASSIGNED_WORK_ITEM_ID = '__unassigned__';
+
+/**
+ * Branch buckets that never map to a real work item and must never be folded
+ * into the {@link UNASSIGNED_WORK_ITEM_ID} holding item. `unknown` is the
+ * detached-HEAD / no-branch fallback used across the extension and stays its own
+ * standalone bucket by design (issue #12).
+ */
+const RESERVED_BRANCH_BUCKETS = new Set<string>(['unknown']);
+
+/**
+ * Work item ids that are NOT real, user-facing work items and must be shielded
+ * from being force-merged into a project (see {@link Database.setProjectForWorkItem}).
+ * `unknown` is the detached-HEAD bucket; `__unassigned__` is the issue #12
+ * holding item — it is a visible work item in listings but should not be dragged
+ * into a project by automation.
+ */
+const NON_WORK_ITEM_IDS = new Set<string>(['unknown', UNASSIGNED_WORK_ITEM_ID]);
+
+/**
+ * Derive a work item id from a branch name (issue #12 single source of truth).
+ *
+ * This is the SAME detection the live tracker applies on branch switch — the
+ * tracker's `GitTracker.extractWorkItemId` delegates here so the regex lives in
+ * exactly ONE place and migration + live tracking can never drift. Matches
+ * `feature/1234-something`, `bugfix/1234`, `1234-auth`, etc. Pure.
+ */
+export function extractWorkItemId(branch: string): string | undefined {
+  // Matches patterns like: feature/1234-something, bugfix/1234, 1234-something
+  const match = branch.match(/(?:^|[/_-])(\d{3,6})(?:[_-]|$)/);
+  return match?.[1];
+}
 
 function isEnvelope(parsed: unknown): parsed is PersistedStore {
   return (
@@ -505,7 +551,66 @@ export function backfillWorkItems(
   }
 }
 
-/** Generate a collision-resistant ledger id without adding a runtime dependency. */
+/**
+ * Back-migrate every ORPHANED branch (issue #12) into the work-item model so no
+ * historical effort is left invisible under a `null` mapping. For each branch
+ * whose `workItemId` is still `null` (and which is NOT a sticky manual mapping):
+ *  1. run the SAME branch-name `detect` used by the live tracker; if it yields
+ *     an id, adopt it and ensure the work item entity exists;
+ *  2. otherwise, if the branch is a reserved bucket (detached-HEAD `unknown`),
+ *     leave it as its own standalone bucket — never fold it into the holding item;
+ *  3. otherwise park it in the {@link UNASSIGNED_WORK_ITEM_ID} holding work item
+ *     (created lazily with a clear 'Unassigned' title) so its effort stays visible.
+ *
+ * Strictly additive and idempotent: it only ever SETS a previously-null
+ * `workItemId` (and may create a work item), never clears, overwrites or drops
+ * any branch field. A branch already mapped — manual or auto — is skipped, so a
+ * second run changes nothing. Pure over the passed structures (the `detect`
+ * function is injected) for easy unit testing.
+ */
+export function assignUnmappedBranches(
+  branches: Store,
+  workItems: Record<string, WorkItem>,
+  detect: (branch: string) => string | undefined
+): void {
+  for (const [name, data] of Object.entries(branches)) {
+    if (!data || typeof data !== 'object') continue;
+    // Only touch orphaned branches; never override an existing (manual OR auto) mapping.
+    if (data.workItemId != null || data.workItemIdManual) continue;
+
+    const detected = detect(name);
+    if (detected && !NON_WORK_ITEM_IDS.has(detected)) {
+      data.workItemId = detected;
+      if (!workItems[detected]) {
+        workItems[detected] = {
+          id: detected,
+          title: null,
+          projectId: null,
+          estimate: null,
+          externalRef: null,
+          createdAt: Date.now()
+        };
+      }
+      continue;
+    }
+
+    // Detached-HEAD `unknown` (and other reserved buckets) stay standalone.
+    if (RESERVED_BRANCH_BUCKETS.has(name)) continue;
+
+    // Everything else that carries effort but has no work item lands in the holding item.
+    data.workItemId = UNASSIGNED_WORK_ITEM_ID;
+    if (!workItems[UNASSIGNED_WORK_ITEM_ID]) {
+      workItems[UNASSIGNED_WORK_ITEM_ID] = {
+        id: UNASSIGNED_WORK_ITEM_ID,
+        title: 'Unassigned',
+        projectId: null,
+        estimate: null,
+        externalRef: null,
+        createdAt: Date.now()
+      };
+    }
+  }
+}
 export function newLedgerId(): string {
   try {
     return crypto.randomUUID();
@@ -629,6 +734,9 @@ export function migrateStore(parsed: unknown): PersistedStore {
     projects = {};
   }
   backfillWorkItems(branches, workItems);
+  // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
+  // their legacy credit log is attributed to the resolved/holding work item.
+  assignUnmappedBranches(branches, workItems, extractWorkItemId);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
   return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems, creditLedger, projects };
 }
