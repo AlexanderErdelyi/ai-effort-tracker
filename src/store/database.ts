@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES } from '../util/fileTypes';
+import type { FileCategory } from '../util/fileTypes';
 
 export interface LineStats {
   added: number;
@@ -232,6 +233,56 @@ export interface WorkItem {
   estimate: number | null;
   externalRef: string | null;
   createdAt: number;
+  /**
+   * Optional per-category estimate breakdown (issue #16 / milestone M3). Keyed by
+   * {@link FileCategory} so it reuses the same category vocabulary as tracked
+   * effort. When present and non-empty it is the source of truth for the TOTAL
+   * estimate ({@link workItemTotalEstimate} = sum of the parts) and the scalar
+   * {@link WorkItem.estimate} is kept in sync as that sum. When absent, the
+   * scalar `estimate` remains the canonical total. Missing/omitted categories
+   * count as 0.
+   */
+  estimateBreakdown?: EstimateBreakdown;
+  /** Unit the estimate numbers are expressed in (issue #16). Defaults to 'hours'. */
+  estimateUnit?: EstimateUnit;
+}
+
+/** Categories an estimate can be broken down by — reuses {@link FileCategory}. */
+export type EstimateCategory = FileCategory;
+
+/** Unit an estimate is expressed in (issue #16). */
+export type EstimateUnit = 'hours' | 'points';
+
+/** Sparse per-category estimate map. Omitted categories are treated as 0. */
+export type EstimateBreakdown = Partial<Record<EstimateCategory, number>>;
+
+/**
+ * Resolve a work item's TOTAL estimate (issue #16). Rule: if a non-empty
+ * {@link WorkItem.estimateBreakdown} exists, the total is the SUM of its parts;
+ * otherwise it falls back to the scalar {@link WorkItem.estimate}. Returns null
+ * only when neither a breakdown nor a scalar estimate is present. Pure.
+ */
+export function workItemTotalEstimate(
+  wi: Pick<WorkItem, 'estimate' | 'estimateBreakdown'>
+): number | null {
+  const sum = sumBreakdown(wi.estimateBreakdown);
+  if (sum !== null) return sum;
+  return wi.estimate ?? null;
+}
+
+/** Sum a breakdown's numeric parts, or null when it is missing/empty. Pure. */
+export function sumBreakdown(breakdown: EstimateBreakdown | undefined): number | null {
+  if (!breakdown || typeof breakdown !== 'object') return null;
+  let total = 0;
+  let seen = false;
+  for (const cat of ALL_CATEGORIES) {
+    const v = breakdown[cat];
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      total += v;
+      seen = true;
+    }
+  }
+  return seen ? total : null;
 }
 
 /**
@@ -281,6 +332,10 @@ export interface WorkItemSummary {
   title: string | null;
   projectId: string | null;
   estimate: number | null;
+  /** Per-category estimate breakdown, if one was entered (issue #16). */
+  estimateBreakdown?: EstimateBreakdown;
+  /** Unit the estimate is expressed in (issue #16). Defaults to 'hours'. */
+  estimateUnit?: EstimateUnit;
   externalRef: string | null;
   createdAt: number;
   /** Branch names that currently roll up into this work item. */
@@ -314,8 +369,32 @@ export interface WorkItemSummary {
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
 export type BranchRollup = Omit<
   WorkItemSummary,
-  'workItemId' | 'title' | 'projectId' | 'estimate' | 'externalRef' | 'createdAt' | 'branches'
+  | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
+  | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches'
 >;
+
+/** One category's estimate vs tracked actual for a work item (issue #16). */
+export interface EstimateActualRow {
+  category: EstimateCategory;
+  /** Planned estimate for this category (0 when none was entered). */
+  estimate: number;
+  /** Tracked actual for this category (see {@link Database.getEstimateVsActual}). */
+  actual: number;
+}
+
+/**
+ * Estimate-vs-actual comparison for a work item (issue #16). `unit` is the
+ * estimate's unit; `actual` numbers are lines-added (not the same unit) and are
+ * provided for relative comparison only. `total` mirrors the per-category rows.
+ */
+export interface EstimateVsActual {
+  workItemId: string;
+  unit: EstimateUnit;
+  /** True when the work item has no estimate at all (total + breakdown absent). */
+  hasEstimate: boolean;
+  byCategory: EstimateActualRow[];
+  total: { estimate: number | null; actual: number };
+}
 
 /**
  * Aggregated effort for a single {@link Project}, rolled up across every work
@@ -345,8 +424,15 @@ export interface ProjectSummary extends BranchRollup {
  * marker. No data rewrite is needed: {@link migrateStore} carries every branch
  * record through untouched and a missing marker is treated as `auto`, so a v3 →
  * v4 load is a pure, idempotent, zero-loss default.
+ *
+ * v5 (issue #16) adds optional `WorkItem.estimateBreakdown` (per-category
+ * estimate) and `WorkItem.estimateUnit`. No data rewrite is needed either:
+ * {@link migrateStore} carries the `workItems` map through untouched, so a
+ * legacy work item keeps its scalar `estimate` (the total falls back to it when
+ * no breakdown is present) and simply has `estimateBreakdown`/`estimateUnit`
+ * undefined. A v4 → v5 load is therefore pure, idempotent and zero-loss.
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /** Branch buckets that never map to a real work item (detached HEAD / worktrees). */
 const NON_WORK_ITEM_IDS = new Set<string>(['unknown']);
@@ -1054,15 +1140,21 @@ export class Database {
         projectId: seed?.projectId ?? null,
         estimate: seed?.estimate ?? null,
         externalRef: seed?.externalRef ?? null,
-        createdAt: seed?.createdAt ?? Date.now()
+        createdAt: seed?.createdAt ?? Date.now(),
+        ...(seed?.estimateBreakdown !== undefined
+          ? { estimateBreakdown: seed.estimateBreakdown }
+          : {}),
+        ...(seed?.estimateUnit !== undefined ? { estimateUnit: seed.estimateUnit } : {})
       };
     }
     return this.workItems[id];
   }
 
   /**
-   * Create or update a work item's metadata (title/estimate/projectId/externalRef).
-   * Only provided fields are changed; `id`/`createdAt` are preserved.
+   * Create or update a work item's metadata (title/estimate/projectId/externalRef/
+   * estimateBreakdown/estimateUnit). Only provided fields are changed; `id`/
+   * `createdAt` are preserved. When an `estimateBreakdown` is supplied the scalar
+   * `estimate` is resynced to its sum so it stays the canonical total (issue #16).
    */
   upsertWorkItem(
     id: string,
@@ -1073,8 +1165,54 @@ export class Database {
     if (fields.projectId !== undefined) wi.projectId = fields.projectId;
     if (fields.estimate !== undefined) wi.estimate = fields.estimate;
     if (fields.externalRef !== undefined) wi.externalRef = fields.externalRef;
+    if (fields.estimateUnit !== undefined) wi.estimateUnit = fields.estimateUnit;
+    if (fields.estimateBreakdown !== undefined) {
+      this.applyBreakdown(wi, fields.estimateBreakdown);
+    }
     this.save();
     return wi;
+  }
+
+  /**
+   * Set (or clear) a work item's per-category estimate breakdown and keep the
+   * scalar total in sync (issue #16). Passing `null`/`undefined` clears the
+   * breakdown and leaves the scalar `estimate` untouched as the fallback total.
+   * `unit` is optional and only updated when provided.
+   */
+  setEstimateBreakdown(
+    workItemId: string,
+    breakdown: EstimateBreakdown | null | undefined,
+    unit?: EstimateUnit
+  ): WorkItem {
+    const wi = this.ensureWorkItem(workItemId);
+    this.applyBreakdown(wi, breakdown);
+    if (unit !== undefined) wi.estimateUnit = unit;
+    this.save();
+    return wi;
+  }
+
+  /**
+   * Normalize + store a breakdown on a work item and resync the scalar total.
+   * Keeps only finite numeric category entries; an empty/absent breakdown is
+   * removed and the scalar `estimate` is left as-is. Does not persist on its own.
+   */
+  private applyBreakdown(wi: WorkItem, breakdown: EstimateBreakdown | null | undefined): void {
+    if (!breakdown) {
+      delete wi.estimateBreakdown;
+      return;
+    }
+    const clean: EstimateBreakdown = {};
+    for (const cat of ALL_CATEGORIES) {
+      const v = breakdown[cat];
+      if (typeof v === 'number' && Number.isFinite(v)) clean[cat] = v;
+    }
+    const sum = sumBreakdown(clean);
+    if (sum === null) {
+      delete wi.estimateBreakdown;
+      return;
+    }
+    wi.estimateBreakdown = clean;
+    wi.estimate = sum;
   }
 
   getWorkItem(id: string): WorkItem | undefined {
@@ -1109,7 +1247,13 @@ export class Database {
       workItemId: wi.id,
       title: wi.title ?? null,
       projectId: wi.projectId ?? null,
-      estimate: wi.estimate ?? null,
+      // `estimate` is the canonical TOTAL: sum of the breakdown when present,
+      // otherwise the scalar (issue #16).
+      estimate: workItemTotalEstimate(wi),
+      ...(wi.estimateBreakdown !== undefined
+        ? { estimateBreakdown: wi.estimateBreakdown }
+        : {}),
+      estimateUnit: wi.estimateUnit ?? 'hours',
       externalRef: wi.externalRef ?? null,
       createdAt: wi.createdAt,
       branches,
@@ -1119,6 +1263,40 @@ export class Database {
 
   getAllWorkItemSummaries(): WorkItemSummary[] {
     return this.getAllWorkItemIds().map(id => this.getWorkItemSummary(id));
+  }
+
+  /**
+   * Compare a work item's per-category ESTIMATE against its tracked ACTUAL
+   * (issue #16). The `actual` measure is LINES ADDED per category
+   * (`human.added + ai.added` from the rolled-up {@link WorkItemSummary.byCategory}),
+   * because tracked TIME is bucketed by mode — not by file category — so it
+   * cannot be attributed per category. Estimate numbers come from the work
+   * item's breakdown (a missing category counts as 0); when no breakdown exists
+   * every category estimate is 0 and `hasEstimate` is false. Safe by
+   * construction: it only sums, never divides, so an unestimated work item (or
+   * effort logged before any estimate existed) yields plain zeros — never NaN.
+   */
+  getEstimateVsActual(workItemId: string): EstimateVsActual {
+    const wi = this.ensureWorkItem(workItemId);
+    const summary = this.getWorkItemSummary(workItemId);
+    const breakdown = wi.estimateBreakdown;
+    const total = workItemTotalEstimate(wi);
+    const rows: EstimateActualRow[] = ALL_CATEGORIES.map(cat => {
+      const est = breakdown && typeof breakdown[cat] === 'number' ? breakdown[cat]! : 0;
+      const bucket = summary.byCategory[cat];
+      const actual = bucket ? bucket.human.added + bucket.ai.added : 0;
+      return { category: cat, estimate: est, actual };
+    });
+    return {
+      workItemId: wi.id,
+      unit: wi.estimateUnit ?? 'hours',
+      hasEstimate: total !== null,
+      byCategory: rows,
+      total: {
+        estimate: total,
+        actual: rows.reduce((n, r) => n + r.actual, 0)
+      }
+    };
   }
 
   getSummaryForBranch(branch: string): BranchSummary {

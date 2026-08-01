@@ -5,6 +5,9 @@ import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { Database } from './store/database';
+import type { EstimateBreakdown, EstimateUnit } from './store/database';
+import { CATEGORY_LABELS } from './util/fileTypes';
+import type { FileCategory } from './util/fileTypes';
 import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
 import { GitHubService, BillingUsage } from './services/githubService';
@@ -124,6 +127,9 @@ export function activate(context: vscode.ExtensionContext) {
     // already-mapped branch to a different work item (issue #10).
     vscode.commands.registerCommand('aiEffortTracker.reassignBranch', () =>
       assignBranchToWorkItem()
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', () =>
+      setWorkItemEstimate()
     ),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
@@ -275,6 +281,113 @@ async function assignBranchToWorkItem() {
   }
   vscode.window.showInformationMessage(
     `Branch "${branch}" assigned to work item #${workItemId}.`
+  );
+  refreshDashboard();
+}
+
+/**
+ * Enter a granular estimate for a work item (issue #16 / M3). Flow: pick a work
+ * item (reusing the #10 QuickPick pattern) → choose a unit (hours/points) →
+ * choose to enter a single TOTAL or a per-category breakdown. A per-category
+ * breakdown is captured through a short sequence of input boxes for the four
+ * primary categories (programming / specification / documentation / deployment);
+ * a blank entry means "skip" (0). Persists via the store API and refreshes the
+ * dashboard. Kept intentionally minimal — the estimate-vs-actual report UI is
+ * milestone M7 (#28/#29).
+ */
+async function setWorkItemEstimate() {
+  type WiPick = vscode.QuickPickItem & { id?: string; create?: boolean };
+  const picks: WiPick[] = db.getAllWorkItems().map(wi => {
+    const total = db.getWorkItemSummary(wi.id).estimate;
+    const unit = wi.estimateUnit ?? 'hours';
+    return {
+      label: '#' + wi.id,
+      description: wi.title ?? undefined,
+      detail: total !== null ? `current estimate: ${total} ${unit}` : 'no estimate yet',
+      id: wi.id
+    };
+  });
+  picks.push({ label: '$(add) New work item\u2026', create: true });
+  const picked = await vscode.window.showQuickPick(picks, {
+    placeHolder: 'Set the estimate for which work item?'
+  });
+  if (!picked) return;
+
+  let workItemId: string;
+  if (picked.create) {
+    const id = await vscode.window.showInputBox({
+      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+    });
+    if (!id) return;
+    workItemId = id.trim();
+    db.upsertWorkItem(workItemId);
+  } else {
+    if (!picked.id) return;
+    workItemId = picked.id;
+  }
+
+  const existingUnit = db.getWorkItem(workItemId)?.estimateUnit ?? 'hours';
+  type UnitItem = vscode.QuickPickItem & { unit: EstimateUnit };
+  const unitItems: UnitItem[] = [
+    { label: 'Hours', unit: 'hours', description: existingUnit === 'hours' ? 'current' : undefined },
+    { label: 'Story points', unit: 'points', description: existingUnit === 'points' ? 'current' : undefined }
+  ];
+  const unitPick = await vscode.window.showQuickPick(unitItems, {
+    placeHolder: 'Estimate unit'
+  });
+  if (!unitPick) return;
+  const unit = unitPick.unit;
+
+  type ModePick = vscode.QuickPickItem & { mode: 'total' | 'breakdown' };
+  const modePick = await vscode.window.showQuickPick<ModePick>(
+    [
+      { label: 'Single total', mode: 'total', detail: 'Enter one overall estimate' },
+      { label: 'Per-category breakdown', mode: 'breakdown', detail: 'Programming / specification / documentation / deployment' }
+    ],
+    { placeHolder: 'How do you want to estimate?' }
+  );
+  if (!modePick) return;
+
+  const parseNum = (v: string): string | null => {
+    if (!v.trim()) return null;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? null : 'Enter a non-negative number';
+  };
+
+  if (modePick.mode === 'total') {
+    const raw = await vscode.window.showInputBox({
+      prompt: `Total estimate for #${workItemId} (${unit})`,
+      value: db.getWorkItemSummary(workItemId).estimate?.toString() ?? '',
+      validateInput: v => (v.trim() ? parseNum(v) : 'Enter a number')
+    });
+    if (raw === undefined) return;
+    // Setting a scalar total clears any prior breakdown so the two never disagree.
+    db.setEstimateBreakdown(workItemId, null);
+    db.upsertWorkItem(workItemId, { estimate: Number(raw), estimateUnit: unit });
+  } else {
+    const categories: FileCategory[] = ['programming', 'specification', 'documentation', 'deployment'];
+    const existing = db.getWorkItem(workItemId)?.estimateBreakdown;
+    const breakdown: EstimateBreakdown = {};
+    for (const cat of categories) {
+      const raw = await vscode.window.showInputBox({
+        prompt: `${CATEGORY_LABELS[cat]} estimate (${unit}) — blank to skip`,
+        value: existing && typeof existing[cat] === 'number' ? String(existing[cat]) : '',
+        validateInput: parseNum
+      });
+      if (raw === undefined) return; // user cancelled the whole flow
+      if (raw.trim()) breakdown[cat] = Number(raw);
+    }
+    if (Object.keys(breakdown).length === 0) {
+      vscode.window.showWarningMessage('No estimate entered — nothing changed.');
+      return;
+    }
+    db.setEstimateBreakdown(workItemId, breakdown, unit);
+  }
+
+  const total = db.getWorkItemSummary(workItemId).estimate;
+  vscode.window.showInformationMessage(
+    `Estimate for #${workItemId} set to ${total} ${unit}.`
   );
   refreshDashboard();
 }
