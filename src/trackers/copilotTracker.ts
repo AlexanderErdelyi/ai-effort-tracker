@@ -38,14 +38,25 @@ export class CopilotTracker implements vscode.Disposable {
       deletedChars += change.rangeLength;
     }
     const changeCount = event.contentChanges.length;
+    const insertedText = changeCount === 1 ? event.contentChanges[0].text : '';
 
-    // Hand typing = exactly one edit, single line, at most one char in/out
-    // (covers a keystroke and a backspace). Everything else is AI/agent/paste.
-    const looksHandTyped =
-      changeCount === 1 &&
-      insertedLines === 0 && deletedLines === 0 &&
-      insertedChars <= 1 && deletedChars <= 1;
+    // Hand typing = exactly one small edit into a single region. This covers the
+    // everyday keystrokes that ALSO change the line count, which must count as
+    // human:
+    //   - a single typed char or a backspace           (tiny edit)
+    //   - pressing Enter / Tab / auto-indent            (single-region insert of
+    //     newline + whitespace only — AI never suggests pure whitespace)
+    //   - Backspace that merges two lines               (tiny deletion, ≤1 char)
+    // Anything multi-region, larger, or containing real (non-whitespace) code
+    // text is an AI/agent apply, an inline-completion accept, or a paste → AI.
+    const tinyEdit = insertedChars <= 1 && deletedChars <= 1;
+    const whitespaceInsert =
+      insertedText.length > 0 && /^\s+$/.test(insertedText) && deletedChars <= 1;
+    const looksHandTyped = changeCount === 1 && (tinyEdit || whitespaceInsert);
 
+    // The `aiGenerating` gate keeps AI-context edits as AI: while chat / an agent
+    // is writing (mode stays aiGenerating for a few seconds after any AI edit),
+    // even a small edit is attributed to AI, so AI-inserted lines stay AI.
     const source: 'human' | 'ai' =
       looksHandTyped && mode !== 'aiGenerating' ? 'human' : 'ai';
 
