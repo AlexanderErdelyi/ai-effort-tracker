@@ -632,6 +632,9 @@ function renderLedger(){
     +'<div class="card"><table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
 }
 
+// Remembers which detail sub-tab (insights/time/lines/types) the user is viewing so the
+// periodic 5s refresh re-renders the detail view without snapping back to Insights.
+var detailSubTab='insights';
 function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
   if(!d) return;
@@ -677,6 +680,17 @@ function showDetail(branch){
   document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="val" style="color:var(--human)">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="val" style="color:var(--ai)">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="val" style="color:var(--cost)">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>';  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
+  // Honor the user's current sub-tab instead of the hard-coded Insights default, so a
+  // background refresh (which re-invokes showDetail) keeps them on Time/Lines/File Types.
+  if(detailSubTab!=='insights'){
+    var tp=document.getElementById('ds-'+detailSubTab),tb=document.querySelector('#detail .dtab[data-value="'+detailSubTab+'"]');
+    if(tp&&tb){
+      document.getElementById('ds-insights').classList.remove('active');
+      document.querySelector('#detail .dtab[data-value="insights"]').classList.remove('active');
+      tp.classList.add('active');tb.classList.add('active');
+      if(detailSubTab==='time'&&charts.donut)charts.donut.resize();
+    }else{detailSubTab='insights';}
+  }
 }
 
 function renderLinesChart(d){
@@ -687,6 +701,7 @@ function renderLinesChart(d){
 }
 
 function showDS(id,btn){
+  detailSubTab=id;
   document.querySelectorAll('.ds').forEach(function(s){s.classList.remove('active');});
   document.querySelectorAll('.dtab').forEach(function(b){b.classList.remove('active');});
   document.getElementById('ds-'+id).classList.add('active');
