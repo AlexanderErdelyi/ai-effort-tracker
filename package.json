@@ -246,7 +246,24 @@
         "aiEffortTracker.autoCapturePollSeconds": {
           "type": "number",
           "default": 15,
-          "description": "How often (seconds) to check the Copilot Chat log for new requests. Minimum 5."
+          "description": "How often (seconds) to check the Copilot Chat log for new requests. Minimum 5 (the real-credit capture uses this too, with a minimum of 3s so it can catch the transient exact-cost payload before VS Code compacts it away)."
+        },
+        "aiEffortTracker.autoCaptureRealCredits": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically capture REAL per-request chat tokens (promptTokens/completionTokens + resolved model) from VS Code's chat session storage and log them to credits (issue #59). Credits are estimated per-model from tokens via aiuRatesOverride, and UPGRADED to the exact AIU cost when the fast poll catches a request's transient copilot_usage.total_nano_aiu before it is compacted away. The GitHub billing import stays the authoritative reconciliation source."
+        },
+        "aiEffortTracker.aiuRatesOverride": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "inputNanoAiuPerToken": { "type": "number" },
+              "outputNanoAiuPerToken": { "type": "number" }
+            }
+          },
+          "default": {},
+          "description": "Optional overrides for the per-model AIU rate table used to ESTIMATE real-credit cost from tokens (issue #59). Keys are model-family stems matched by substring against the model id (longest match wins), e.g. 'claude-opus', 'gpt-5', 'gemini'. Each value is { inputNanoAiuPerToken, outputNanoAiuPerToken } in nano-AIU per token (1 AIU = 1e9 nano-AIU). Unset families fall back to the built-in table, then a safe default; the exact total_nano_aiu capture always overrides an estimate when available."
         },
         "aiEffortTracker.autoCreditDefaultMultiplier": {
           "type": "number",

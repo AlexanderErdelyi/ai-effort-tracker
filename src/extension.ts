@@ -4,6 +4,7 @@ import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
+import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
 import { Database } from './store/database';
 import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
@@ -22,6 +23,7 @@ let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
 let copilotTracker: CopilotTracker;
 let chatUsageTracker: ChatUsageTracker;
+let chatSessionUsageTracker: ChatSessionUsageTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
@@ -72,6 +74,7 @@ export function activate(context: vscode.ExtensionContext) {
   gitTracker = new GitTracker(db, timeTracker);
   copilotTracker = new CopilotTracker(db, timeTracker);
   chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
+  chatSessionUsageTracker = new ChatSessionUsageTracker(db, timeTracker, context.storageUri);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
@@ -264,6 +267,7 @@ export function activate(context: vscode.ExtensionContext) {
     gitTracker,
     copilotTracker,
     chatUsageTracker,
+    chatSessionUsageTracker,
     statusBar
   );
 
@@ -271,6 +275,7 @@ export function activate(context: vscode.ExtensionContext) {
   gitTracker.start(context);
   copilotTracker.start(context);
   chatUsageTracker.start(context);
+  chatSessionUsageTracker.start(context);
 }
 
 export function deactivate() {
