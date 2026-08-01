@@ -28,6 +28,14 @@
         "title": "AI Effort Tracker: Log a Chat Turn"
       },
       {
+        "command": "aiEffortTracker.assignBranchToWorkItem",
+        "title": "AI Effort Tracker: Assign Branch to Work Item"
+      },
+      {
+        "command": "aiEffortTracker.reassignBranch",
+        "title": "AI Effort Tracker: Reassign Branch to a Different Work Item"
+      },
+      {
         "command": "aiEffortTracker.startSession",
         "title": "AI Effort Tracker: Start Tracking Session"
       },

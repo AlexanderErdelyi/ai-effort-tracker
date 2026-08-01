@@ -117,6 +117,14 @@ export function activate(context: vscode.ExtensionContext) {
       db.recordChatTurn(branch);
       refreshDashboard();
     }),
+    vscode.commands.registerCommand('aiEffortTracker.assignBranchToWorkItem', () =>
+      assignBranchToWorkItem()
+    ),
+    // Reassignment is the same manual-override flow, framed as moving an
+    // already-mapped branch to a different work item (issue #10).
+    vscode.commands.registerCommand('aiEffortTracker.reassignBranch', () =>
+      assignBranchToWorkItem()
+    ),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
     vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
@@ -222,6 +230,53 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
     clearInterval(refreshInterval);
     dashboardPanel = undefined;
   });
+}
+
+/**
+ * Manually assign — or reassign — the CURRENT branch to a work item (issue #10).
+ * Offers existing work items plus a "new work item" option, then applies a
+ * sticky manual override that also moves the branch's accrued effort/credits to
+ * the chosen work item. Works for detached-HEAD / `unknown` branches too, so a
+ * mis-detected or unlabeled branch can be corrected after the fact.
+ */
+async function assignBranchToWorkItem() {
+  const branch = await GitTracker.getCurrentBranch() ?? timeTracker.getBranch() ?? 'unknown';
+  const current = db.getWorkItemForBranch(branch);
+  type WiPick = vscode.QuickPickItem & { id?: string; create?: boolean };
+  const picks: WiPick[] = db.getAllWorkItems().map(wi => ({
+    label: (wi.id === current ? '\u25b6 ' : '') + '#' + wi.id,
+    description: wi.title ?? undefined,
+    detail: wi.id === current ? 'current mapping' : undefined,
+    id: wi.id
+  }));
+  picks.push({ label: '$(add) New work item\u2026', create: true });
+  const picked = await vscode.window.showQuickPick(picks, {
+    placeHolder: `Assign branch "${branch}" to a work item` + (current ? ` (current: #${current})` : '')
+  });
+  if (!picked) return;
+
+  let workItemId: string;
+  if (picked.create) {
+    const id = await vscode.window.showInputBox({
+      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+    });
+    if (!id) return;
+    workItemId = id.trim();
+    const title = await vscode.window.showInputBox({
+      prompt: `Title for work item #${workItemId} (optional)`
+    });
+    db.reassignBranchToWorkItem(branch, workItemId);
+    if (title && title.trim()) db.upsertWorkItem(workItemId, { title: title.trim() });
+  } else {
+    if (!picked.id) return;
+    workItemId = picked.id;
+    db.reassignBranchToWorkItem(branch, workItemId);
+  }
+  vscode.window.showInformationMessage(
+    `Branch "${branch}" assigned to work item #${workItemId}.`
+  );
+  refreshDashboard();
 }
 
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */
