@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
+import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { Database } from './store/database';
 import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
@@ -11,6 +12,7 @@ import { GitHubService, BillingUsage } from './services/githubService';
 let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
 let copilotTracker: CopilotTracker;
+let chatUsageTracker: ChatUsageTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
@@ -60,6 +62,7 @@ export function activate(context: vscode.ExtensionContext) {
   timeTracker = new TimeTracker(db, statusBar);
   gitTracker = new GitTracker(db, timeTracker);
   copilotTracker = new CopilotTracker(db, timeTracker);
+  chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
@@ -83,18 +86,27 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('aiEffortTracker.logCredits', async () => {
       const branch = await GitTracker.getCurrentBranch() ?? timeTracker.getBranch();
-      const model = await vscode.window.showQuickPick(KNOWN_MODELS, {
-        placeHolder: 'Which model did you use?'
+      // Lower-friction manual entry: default to the model/value you used last.
+      const lastModel = context.globalState.get<string>('lastCreditModel');
+      const lastCredits = context.globalState.get<number>('lastCreditValue');
+      const ordered = lastModel
+        ? [lastModel, ...KNOWN_MODELS.filter(m => m !== lastModel)]
+        : KNOWN_MODELS;
+      const model = await vscode.window.showQuickPick(ordered, {
+        placeHolder: lastModel ? `Which model? (last: ${lastModel})` : 'Which model did you use?'
       });
       if (!model) return;
       const input = await vscode.window.showInputBox({
         prompt: `Credits used on "${branch}" with ${model} (number shown in the chat response)`,
         placeHolder: 'e.g. 272.3',
+        value: lastCredits != null ? String(lastCredits) : undefined,
         validateInput: v => (v && !isNaN(parseFloat(v))) ? null : 'Enter a number'
       });
       if (input == null) return;
       const credits = parseFloat(input);
       db.recordCredits(branch, model, credits);
+      void context.globalState.update('lastCreditModel', model);
+      void context.globalState.update('lastCreditValue', credits);
       vscode.window.showInformationMessage(
         `Logged ${credits} credits (${model}) on ${branch}.`
       );
@@ -141,12 +153,14 @@ export function activate(context: vscode.ExtensionContext) {
     timeTracker,
     gitTracker,
     copilotTracker,
+    chatUsageTracker,
     statusBar
   );
 
   timeTracker.startTracking();
   gitTracker.start(context);
   copilotTracker.start(context);
+  chatUsageTracker.start(context);
 }
 
 export function deactivate() {
