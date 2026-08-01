@@ -28,6 +28,14 @@
         "title": "AI Effort Tracker: Log a Chat Turn"
       },
       {
+        "command": "aiEffortTracker.editLedgerEntry",
+        "title": "AI Effort Tracker: Edit Credit Entry"
+      },
+      {
+        "command": "aiEffortTracker.deleteLedgerEntry",
+        "title": "AI Effort Tracker: Delete Credit Entry"
+      },
+      {
         "command": "aiEffortTracker.assignBranchToWorkItem",
         "title": "AI Effort Tracker: Assign Branch to Work Item"
       },

@@ -1,4 +1,4 @@
-import type { BranchSummary, ProjectSummary, WorkItemSummary } from '../store/database';
+import type { BranchSummary, ProjectSummary, WorkItemSummary, LedgerEntry } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 
@@ -33,7 +33,8 @@ export function renderDashboardHtml(
   analytics: DashboardAnalytics = { daily: [], heatmap: [], focus: { sessionsToday: 0, sessionsWeek: 0, totalFocusMsToday: 0, totalFocusMsWeek: 0, longestMs: 0, avgMs: 0, goalProgressPct: 0 } },
   billing: BillingUsage | null = null,
   projectSummaries: ProjectSummary[] = [],
-  workItemSummaries: WorkItemSummary[] = []
+  workItemSummaries: WorkItemSummary[] = [],
+  ledger: LedgerEntry[] = []
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
@@ -44,6 +45,7 @@ export function renderDashboardHtml(
   const blData = JSON.stringify(billing);
   const projData = JSON.stringify(projectSummaries);
   const wiData = JSON.stringify(workItemSummaries);
+  const ledData = JSON.stringify(ledger);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -108,6 +110,7 @@ let AN=${anData};
 let BL=${blData};
 let PROJ=${projData};
 let WI=${wiData};
+let LEDGER=${ledData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -533,6 +536,29 @@ function renderProjectsView(){
   if(projView==='workitem')return renderWorkItemDetail();
   return renderProjectList();
 }
+// Credit ledger list (issue #19). The ledger is the single source of truth, so
+// editing/deleting a row here corrects every derived total automatically.
+function renderLedger(){
+  var el=document.getElementById('ledger');
+  var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button>';
+  if(!LEDGER||!LEDGER.length){
+    el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div><div class="card"><p style="color:var(--vscode-descriptionForeground)">No credit entries yet. Use \\u201cAdd Entry\\u201d to record one.</p></div>';
+    return;
+  }
+  var rows=LEDGER.map(function(e){
+    var when=new Date(e.ts).toLocaleString();
+    var attr=e.branch?esc(e.branch):'\\u2014';
+    if(e.workItemId)attr+=' <span class="badge ba">#'+esc(e.workItemId)+'</span>';
+    var cost=(e.cost!=null)?'$'+Number(e.cost).toFixed(4):'\\u2014';
+    var note=e.note?esc(e.note):'';
+    var sc=e.source==='manual'?'bh':(e.source==='auto'?'ba':'bp');
+    var src='<span class="badge '+sc+'">'+esc(e.source)+'</span>';
+    return'<tr><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td>'+Number(e.credits).toFixed(1)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap"><button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
+  }).join('');
+  el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'
+    +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.</p>'
+    +'<div class="card"><table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+}
 
 function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
@@ -605,6 +631,7 @@ function showTab(name){
   else if(name==='focus'){document.getElementById('tab-focus').classList.add('active');renderFocus();}
   else if(name==='ghview'){document.getElementById('tab-ghview').classList.add('active');renderGhMetrics();}
   else if(name==='projects'){document.getElementById('tab-projects').classList.add('active');renderProjectsView();}
+  else if(name==='ledger'){document.getElementById('tab-ledger').classList.add('active');renderLedger();}
   else{document.getElementById('dtab').classList.add('active');}
 }
 
@@ -618,12 +645,14 @@ window.addEventListener('message',function(e){
     if(msg.billing!==undefined)BL=msg.billing;
     if(msg.projectSummaries!==undefined&&msg.projectSummaries)PROJ=msg.projectSummaries;
     if(msg.workItemSummaries!==undefined&&msg.workItemSummaries)WI=msg.workItemSummaries;
+    if(msg.ledger!==undefined&&msg.ledger)LEDGER=msg.ledger;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
     else if(av&&av.id==='focus')renderFocus();
     else if(av&&av.id==='ghview')renderGhMetrics();
     else if(av&&av.id==='projects')renderProjectsView();
+    else if(av&&av.id==='ledger')renderLedger();
     else if(av&&av.id==='detail'){var dt=document.getElementById('dtab');if(dt&&dt.dataset.branch)showDetail(dt.dataset.branch);}
   }
 });
@@ -635,6 +664,7 @@ document.getElementById('tab-trends').addEventListener('click',function(){showTa
 document.getElementById('tab-focus').addEventListener('click',function(){showTab('focus');});
 document.getElementById('tab-ghview').addEventListener('click',function(){showTab('ghview');});
 document.getElementById('tab-projects').addEventListener('click',function(){showTab('projects');});
+document.getElementById('tab-ledger').addEventListener('click',function(){showTab('ledger');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -651,6 +681,8 @@ document.addEventListener('click',function(e){
   else if(a==='wi'){selWi=v;projView='workitem';renderProjectsView();}
   else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
+  else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
+  else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
 });`;
 
   return [
@@ -668,6 +700,7 @@ document.addEventListener('click',function(e){
     '  <button class="tab" id="tab-trends">\uD83D\uDCC8 Trends</button>',
     '  <button class="tab" id="tab-focus">\uD83C\uDFAF Focus</button>',
     '  <button class="tab" id="tab-projects">\uD83D\uDCC1 Projects</button>',
+    '  <button class="tab" id="tab-ledger">\uD83E\uDDFE Ledger</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
@@ -675,6 +708,7 @@ document.addEventListener('click',function(e){
     '<div id="trends" class="view"></div>',
     '<div id="focus" class="view"></div>',
     '<div id="projects" class="view"></div>',
+    '<div id="ledger" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,

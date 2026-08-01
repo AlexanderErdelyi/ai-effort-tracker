@@ -100,6 +100,22 @@ export interface CreditQuery {
   to?: number;
 }
 
+/**
+ * Editable fields for {@link Database.updateLedgerEntry} (issue #19). Only keys
+ * that are present are applied; `cost: null` clears the optional cost. `id`,
+ * `source`, `branch` and `chatSessionId` are intentionally NOT editable so a
+ * row's identity and provenance survive a manual correction. `projectId` is not
+ * listed because it is derived from `workItemId`, not set directly.
+ */
+export interface LedgerEntryPatch {
+  model?: string;
+  credits?: number;
+  cost?: number | null;
+  note?: string;
+  workItemId?: string | null;
+  ts?: number;
+}
+
 /** Summable credit/cost totals for a ledger slice. */
 export interface CreditTotals {
   credits: number;
@@ -1213,6 +1229,54 @@ export class Database {
     this.appendLedger(branch, model, credits, 'auto', note ?? 'auto');
     data.autoModelRequests = (data.autoModelRequests ?? 0) + 1;
     this.save();
+  }
+
+  /**
+   * Edit an existing ledger row in place (issue #19 — manual correction). Only
+   * the fields present in `patch` are changed; everything else (id, source,
+   * branch, chatSessionId) is preserved so the row's identity and provenance
+   * stay intact. When `workItemId` is changed the row's `projectId` is
+   * re-resolved from the destination work item — mirroring the resolution
+   * {@link appendLedger} does at write time — so credit roll-ups by project stay
+   * correct. Passing `cost: null` clears the optional cost. Safe no-op returning
+   * `undefined` when `id` is not found (never throws). Totals/ROI recompute
+   * automatically because they derive from the ledger.
+   */
+  updateLedgerEntry(id: string, patch: LedgerEntryPatch): LedgerEntry | undefined {
+    const entry = this.creditLedger.find(e => e.id === id);
+    if (!entry) return undefined;
+    if (patch.model !== undefined) entry.model = patch.model;
+    if (patch.credits !== undefined) entry.credits = patch.credits;
+    if (patch.note !== undefined) entry.note = patch.note;
+    if (patch.ts !== undefined) entry.ts = patch.ts;
+    if (patch.cost !== undefined) {
+      if (patch.cost === null) delete entry.cost;
+      else entry.cost = patch.cost;
+    }
+    if (patch.workItemId !== undefined) {
+      const workItemId = patch.workItemId ?? null;
+      entry.workItemId = workItemId;
+      entry.projectId =
+        workItemId && this.workItems[workItemId]
+          ? this.workItems[workItemId].projectId ?? null
+          : null;
+    }
+    this.save();
+    return entry;
+  }
+
+  /**
+   * Remove a ledger row by id (issue #19 — manual correction). Returns `true`
+   * when a row was removed, `false` when `id` was not found (safe no-op, never
+   * throws). Because the ledger is the single source of truth, deleting a row
+   * automatically drops its credits/cost from every derived total.
+   */
+  deleteLedgerEntry(id: string): boolean {
+    const idx = this.creditLedger.findIndex(e => e.id === id);
+    if (idx === -1) return false;
+    this.creditLedger.splice(idx, 1);
+    this.save();
+    return true;
   }
 
   /**
