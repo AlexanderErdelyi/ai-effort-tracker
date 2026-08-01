@@ -205,6 +205,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setProjectRates', (projectId?: string) =>
       setProjectRates(projectId)
     ),
+    vscode.commands.registerCommand('aiEffortTracker.setDeveloperProfile', () =>
+      setDeveloperProfile()
+    ),
     vscode.commands.registerCommand('aiEffortTracker.createProject', () => createProject()),
     vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
     vscode.commands.registerCommand('aiEffortTracker.createWorkItem', () => createWorkItem()),
@@ -789,6 +792,133 @@ async function resetTrackedTime(arg?: string) {
       ? `Tracked-time adjustments for "${branch}" reset to auto.`
       : `"${branch}" has no time adjustments — already on auto.`
   );
+  refreshDashboard();
+}
+
+/**
+ * Seniority presets for issue #13: a sensible hand-coding baseline (lines of code
+ * per minute) per seniority level. These PRE-FILL the single global
+ * `aiEffortTracker.baselineLocPerMinute` setting the ROI/generated-value math reads
+ * ({@link getInsightsConfig}, `Database.readBaselineLocPerMinute`) — they are only a
+ * starting point and the user's adjusted value always wins and persists. `custom`
+ * intentionally has no preset: it means "leave the baseline as-is, don't auto-fill".
+ */
+const SENIORITY_PRESETS: Record<'junior' | 'mid' | 'senior', number> = {
+  junior: 3,
+  mid: 5,
+  senior: 8,
+};
+
+type Seniority = keyof typeof SENIORITY_PRESETS | 'custom';
+
+/**
+ * Resolve the effective baseline lines/min for a work category (issue #13, optional
+ * per-category baselines). Prefers a finite, positive value from
+ * `aiEffortTracker.baselineLocPerMinuteByCategory[category]`, else falls back to the
+ * flat `aiEffortTracker.baselineLocPerMinute` (default 5). Exposed additively for
+ * future wiring; the #48 generated-value math still uses the flat baseline as its
+ * effective input (see `Database.readBaselineLocPerMinute`), so this never changes
+ * existing behaviour. Never throws; returns the flat baseline when the per-category
+ * map is missing/unusable.
+ */
+export function resolveBaselineLocPerMinute(category?: string): number {
+  const c = vscode.workspace.getConfiguration('aiEffortTracker');
+  const flat = c.get<number>('baselineLocPerMinute');
+  const flatBaseline =
+    typeof flat === 'number' && Number.isFinite(flat) && flat > 0 ? flat : 5;
+  if (!category) return flatBaseline;
+  const byCat = c.get<Record<string, number>>('baselineLocPerMinuteByCategory');
+  const v = byCat?.[category];
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : flatBaseline;
+}
+
+/**
+ * Set the developer profile (issue #13): pick a seniority level whose preset
+ * PRE-FILLS the global baseline lines-of-code-per-minute, then adjust that value in
+ * an InputBox. The seniority is stored in `aiEffortTracker.seniority` and the
+ * (possibly-adjusted) number is written to `aiEffortTracker.baselineLocPerMinute` —
+ * the single source the generated-value / ROI math reads, so no read path is forked.
+ *
+ * Acceptance: the preset fills a sensible default that REMAINS EDITABLE — the user's
+ * adjusted value wins and persists. Choosing `custom` skips the auto-fill and simply
+ * lets them edit the raw baseline, and leaving it blank/unchanged never clobbers an
+ * existing baseline. All writes go through the VS Code settings API
+ * (`ConfigurationTarget.Global`), never the store.
+ */
+export async function setDeveloperProfile() {
+  const c = vscode.workspace.getConfiguration('aiEffortTracker');
+  const currentLevel = (c.get<string>('seniority') ?? 'custom') as Seniority;
+  const currentBaselineRaw = c.get<number>('baselineLocPerMinute');
+  const currentBaseline =
+    typeof currentBaselineRaw === 'number' && Number.isFinite(currentBaselineRaw) && currentBaselineRaw > 0
+      ? currentBaselineRaw
+      : 5;
+
+  type LevelPick = vscode.QuickPickItem & { level: Seniority };
+  const picks: LevelPick[] = [
+    {
+      level: 'junior',
+      label: (currentLevel === 'junior' ? '\u25b6 ' : '') + 'Junior',
+      detail: `Preset baseline ${SENIORITY_PRESETS.junior} lines/min`,
+    },
+    {
+      level: 'mid',
+      label: (currentLevel === 'mid' ? '\u25b6 ' : '') + 'Mid-level',
+      detail: `Preset baseline ${SENIORITY_PRESETS.mid} lines/min`,
+    },
+    {
+      level: 'senior',
+      label: (currentLevel === 'senior' ? '\u25b6 ' : '') + 'Senior',
+      detail: `Preset baseline ${SENIORITY_PRESETS.senior} lines/min`,
+    },
+    {
+      level: 'custom',
+      label: (currentLevel === 'custom' ? '\u25b6 ' : '') + 'Custom',
+      detail: `No auto-fill — keep your current baseline (${currentBaseline} lines/min)`,
+    },
+  ];
+
+  const chosen = await vscode.window.showQuickPick(picks, {
+    title: 'Developer Profile — Seniority',
+    placeHolder: 'Pick a seniority level; its preset pre-fills your baseline (still editable)',
+  });
+  if (!chosen) return;
+
+  const level = chosen.level;
+  await c.update('seniority', level, vscode.ConfigurationTarget.Global);
+
+  // A preset fills a sensible default; `custom` keeps the current baseline. Either
+  // way the value stays editable and whatever the user types wins.
+  const prefill = level === 'custom' ? currentBaseline : SENIORITY_PRESETS[level];
+
+  const raw = await vscode.window.showInputBox({
+    title: `Developer Profile — Baseline (${level})`,
+    prompt:
+      `Baseline hand-coding speed in lines of code per minute (used to estimate time saved by AI). ` +
+      (level === 'custom'
+        ? 'Adjust as you like.'
+        : `Pre-filled from the ${level} preset — adjust up or down to fit you.`),
+    value: String(prefill),
+    validateInput: v => {
+      if (!v.trim()) return null; // blank = keep current baseline
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? null : 'Enter a positive number';
+    },
+  });
+  if (raw === undefined) return; // cancelled — seniority was still updated above
+
+  if (!raw.trim()) {
+    // Blank: never clobber the existing baseline.
+    vscode.window.showInformationMessage(
+      `Developer profile set to ${level}. Baseline left at ${currentBaseline} lines/min.`
+    );
+  } else {
+    const value = Number(raw);
+    await c.update('baselineLocPerMinute', value, vscode.ConfigurationTarget.Global);
+    vscode.window.showInformationMessage(
+      `Developer profile set to ${level}. Baseline is now ${value} lines/min.`
+    );
+  }
   refreshDashboard();
 }
 

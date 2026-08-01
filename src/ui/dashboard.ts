@@ -475,6 +475,7 @@ function projToolbar(){
     +'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button>'
     +'<button class="dtab" data-action="cmd" data-value="editWorkItem">\\u270E Edit Work Item</button>'
     +'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button>'
+    +'<button class="dtab" data-action="cmd" data-value="setDeveloperProfile">\\uD83D\\uDC64 Developer Profile</button>'
     +'</div>';
 }
 function projectRowsHtml(){
