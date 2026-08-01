@@ -6,7 +6,7 @@ import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { Database } from './store/database';
 import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
-import type { EstimateBreakdown, EstimateUnit } from './store/database';
+import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import { CATEGORY_LABELS } from './util/fileTypes';
 import type { FileCategory } from './util/fileTypes';
 import { StatusBarManager } from './ui/statusBar';
@@ -108,7 +108,36 @@ export function activate(context: vscode.ExtensionContext) {
       });
       if (input == null) return;
       const credits = parseFloat(input);
-      db.recordCredits(branch, model, credits);
+      // Optional free-text note (issue #19). Empty = no note.
+      const note = await vscode.window.showInputBox({
+        prompt: 'Note for this entry (optional)',
+        placeHolder: 'e.g. refactor pass, missed by auto-capture'
+      });
+      if (note === undefined) return;
+      // Optional work-item override (issue #19). Default: attribute via the
+      // branch's current mapping (what recordCredits does on its own).
+      const wiOverride = await pickWorkItemOverride(
+        'Attribute to a work item?',
+        `$(check) Use branch mapping${db.getWorkItemForBranch(branch) ? ' (#' + db.getWorkItemForBranch(branch) + ')' : ''}`,
+        db.getWorkItemForBranch(branch)
+      );
+      if (wiOverride === CANCELLED) return;
+      // Optional timestamp override (issue #19). Blank = now.
+      const ts = await promptTimestamp('When did this happen? (blank = now)', Date.now());
+      if (ts === CANCELLED) return;
+
+      db.recordCredits(branch, model, credits, note.trim() ? note.trim() : undefined);
+      // recordCredits appends to the end of the ledger; it is the newest manual
+      // entry for this branch, so getCreditEntries (newest-first) returns it at [0].
+      if (wiOverride !== undefined || ts !== undefined) {
+        const justAdded = db.getCreditEntries({ branch, source: 'manual' })[0];
+        if (justAdded) {
+          const patch: LedgerEntryPatch = {};
+          if (wiOverride !== undefined) patch.workItemId = wiOverride;
+          if (ts !== undefined) patch.ts = ts;
+          db.updateLedgerEntry(justAdded.id, patch);
+        }
+      }
       void context.globalState.update('lastCreditModel', model);
       void context.globalState.update('lastCreditValue', credits);
       vscode.window.showInformationMessage(
@@ -121,6 +150,12 @@ export function activate(context: vscode.ExtensionContext) {
       db.recordChatTurn(branch);
       refreshDashboard();
     }),
+    vscode.commands.registerCommand('aiEffortTracker.editLedgerEntry', (id?: string) =>
+      editLedgerEntry(id)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.deleteLedgerEntry', (id?: string) =>
+      deleteLedgerEntry(id)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.assignBranchToWorkItem', () =>
       assignBranchToWorkItem()
     ),
@@ -209,11 +244,11 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries());
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries());
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
-      await vscode.commands.executeCommand('aiEffortTracker.' + m.value);
+      await vscode.commands.executeCommand('aiEffortTracker.' + m.value, m.arg);
       refreshDashboard();
     }
   });
@@ -239,7 +274,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       analytics: getAnalytics(),
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
-      workItemSummaries: db.getAllWorkItemSummaries()
+      workItemSummaries: db.getAllWorkItemSummaries(),
+      ledger: db.getCreditEntries()
     });
   }, 5000);
 
@@ -604,11 +640,193 @@ async function pickProjectOrNone(placeHolder: string, current?: string | null): 
   return picked.none ? null : (picked.id ?? null);
 }
 
+// ---- Manual credit ledger correction (issue #19) --------------------------
+
 /**
- * Create a new work item (issue #27): id + optional title, then optionally
- * assign it to a project. Rejects ids that already exist so this stays a pure
- * "create" (edits go through {@link editWorkItem}).
+ * Sentinel returned by the ledger prompt helpers when the user cancels (Esc).
+ * Distinct from `undefined`, which those helpers use to mean "keep the existing
+ * value / use the default" — a real choice we must not confuse with a cancel.
  */
+const CANCELLED = Symbol('cancelled');
+
+/**
+ * QuickPick a work-item override for a ledger entry (issue #19). Returns:
+ *  - `undefined` — keep the default/current attribution (no change),
+ *  - `null` — explicitly clear the work item,
+ *  - a work-item id string, or
+ *  - {@link CANCELLED} when the user escapes.
+ */
+async function pickWorkItemOverride(
+  placeHolder: string,
+  keepLabel: string,
+  current?: string | null
+): Promise<string | null | undefined | typeof CANCELLED> {
+  type WiPick = vscode.QuickPickItem & { id?: string; keep?: boolean; none?: boolean };
+  const items = db.getAllWorkItems().filter(
+    w => w.id !== 'unknown' && w.id !== UNASSIGNED_WORK_ITEM_ID
+  );
+  const picks: WiPick[] = [
+    { label: keepLabel, keep: true },
+    { label: '$(circle-slash) No work item', none: true, description: current == null ? 'current' : undefined },
+    ...items.map(w => ({
+      label: (w.id === current ? '\u25b6 ' : '') + '#' + w.id,
+      description: w.title ?? undefined,
+      id: w.id
+    }))
+  ];
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return CANCELLED;
+  if (picked.keep) return undefined;
+  if (picked.none) return null;
+  return picked.id ?? null;
+}
+
+/**
+ * Prompt for a timestamp (issue #19). Accepts an ISO date-time (or anything
+ * `Date.parse` understands) or an epoch-ms number. Returns:
+ *  - a millisecond timestamp when the user enters one,
+ *  - `undefined` when left blank (caller decides what "blank" means), or
+ *  - {@link CANCELLED} when the user escapes.
+ */
+async function promptTimestamp(
+  prompt: string,
+  defaultMs: number
+): Promise<number | undefined | typeof CANCELLED> {
+  const input = await vscode.window.showInputBox({
+    prompt,
+    value: new Date(defaultMs).toISOString(),
+    placeHolder: 'e.g. 2026-08-01T09:30:00Z (blank to skip)',
+    validateInput: v => {
+      if (!v || !v.trim()) return null;
+      const t = v.trim();
+      const asNum = Number(t);
+      if (Number.isFinite(asNum)) return null;
+      return Number.isNaN(Date.parse(t)) ? 'Enter an ISO date-time or epoch-ms number' : null;
+    }
+  });
+  if (input === undefined) return CANCELLED;
+  const t = input.trim();
+  if (!t) return undefined;
+  const asNum = Number(t);
+  return Number.isFinite(asNum) ? asNum : Date.parse(t);
+}
+
+/** Short human label for a ledger entry, used in QuickPicks and messages. */
+function ledgerLabel(e: LedgerEntry): string {
+  const when = new Date(e.ts).toLocaleString();
+  const attr = e.workItemId ? ` #${e.workItemId}` : e.branch ? ` ${e.branch}` : '';
+  const note = e.note ? ` — ${e.note}` : '';
+  return `${e.credits} cr · ${e.model} · ${e.source}${attr} · ${when}${note}`;
+}
+
+/** QuickPick an existing ledger entry (newest-first). */
+async function pickLedgerEntry(placeHolder: string): Promise<LedgerEntry | undefined> {
+  const entries = db.getCreditEntries();
+  if (entries.length === 0) {
+    vscode.window.showWarningMessage('No credit entries to correct yet. Log one with "Log Credits" first.');
+    return undefined;
+  }
+  type EntryPick = vscode.QuickPickItem & { entry: LedgerEntry };
+  const picks: EntryPick[] = entries.map(e => ({ label: ledgerLabel(e), entry: e }));
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  return picked?.entry;
+}
+
+/**
+ * Resolve a ledger entry either from an id passed by the dashboard row buttons
+ * or, when invoked from the command palette without one, via a QuickPick.
+ */
+async function resolveLedgerEntry(id: string | undefined, placeHolder: string): Promise<LedgerEntry | undefined> {
+  if (id) {
+    const found = db.getCreditEntries().find(e => e.id === id);
+    if (!found) {
+      vscode.window.showWarningMessage('That credit entry no longer exists.');
+      return undefined;
+    }
+    return found;
+  }
+  return pickLedgerEntry(placeHolder);
+}
+
+/**
+ * Edit an existing ledger entry by hand (issue #19): model, credits, cost, note,
+ * work-item attribution and timestamp. Any prompt escaped mid-flow cancels the
+ * whole edit. Totals/ROI recompute automatically because they derive from the
+ * ledger (the single source of truth).
+ */
+async function editLedgerEntry(id?: string) {
+  const entry = await resolveLedgerEntry(id, 'Edit which credit entry?');
+  if (!entry) return;
+
+  const model = await vscode.window.showInputBox({
+    prompt: 'Model', value: entry.model,
+    validateInput: v => (v && v.trim()) ? null : 'Enter a model name'
+  });
+  if (model === undefined) return;
+
+  const creditsIn = await vscode.window.showInputBox({
+    prompt: 'Credits', value: String(entry.credits),
+    validateInput: v => (v && !isNaN(parseFloat(v))) ? null : 'Enter a number'
+  });
+  if (creditsIn === undefined) return;
+
+  const costIn = await vscode.window.showInputBox({
+    prompt: 'Cost in USD (blank to clear)',
+    value: entry.cost != null ? String(entry.cost) : '',
+    validateInput: v => (!v || !v.trim() || !isNaN(parseFloat(v))) ? null : 'Enter a number or leave blank'
+  });
+  if (costIn === undefined) return;
+
+  const noteIn = await vscode.window.showInputBox({ prompt: 'Note (optional)', value: entry.note ?? '' });
+  if (noteIn === undefined) return;
+
+  const wi = await pickWorkItemOverride(
+    'Work item attribution', '$(check) Keep current', entry.workItemId ?? null
+  );
+  if (wi === CANCELLED) return;
+
+  const ts = await promptTimestamp('Timestamp (blank to keep current)', entry.ts);
+  if (ts === CANCELLED) return;
+
+  const patch: LedgerEntryPatch = {
+    model: model.trim(),
+    credits: parseFloat(creditsIn),
+    cost: costIn.trim() ? parseFloat(costIn) : null,
+    note: noteIn.trim()
+  };
+  if (wi !== undefined) patch.workItemId = wi;
+  if (ts !== undefined) patch.ts = ts;
+
+  const updated = db.updateLedgerEntry(entry.id, patch);
+  if (!updated) {
+    vscode.window.showWarningMessage('That credit entry no longer exists.');
+    return;
+  }
+  vscode.window.showInformationMessage(`Updated credit entry (${updated.credits} cr · ${updated.model}).`);
+  refreshDashboard();
+}
+
+/**
+ * Delete a ledger entry by hand (issue #19), after a confirmation modal. Because
+ * the ledger is the single source of truth, removing a row drops its credits/cost
+ * from every derived total automatically.
+ */
+async function deleteLedgerEntry(id?: string) {
+  const entry = await resolveLedgerEntry(id, 'Delete which credit entry?');
+  if (!entry) return;
+  const ok = await vscode.window.showWarningMessage(
+    `Delete this credit entry?\n\n${ledgerLabel(entry)}`,
+    { modal: true },
+    'Delete'
+  );
+  if (ok !== 'Delete') return;
+  if (db.deleteLedgerEntry(entry.id)) {
+    vscode.window.showInformationMessage('Credit entry deleted.');
+    refreshDashboard();
+  }
+}
+
+
 async function createWorkItem() {
   const id = await vscode.window.showInputBox({
     prompt: 'New work item id (e.g. 1234 or JIRA-42)',
@@ -681,7 +899,8 @@ function refreshDashboard() {
       analytics: getAnalytics(),
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
-      workItemSummaries: db.getAllWorkItemSummaries()
+      workItemSummaries: db.getAllWorkItemSummaries(),
+      ledger: db.getCreditEntries()
     });
   });
 }
