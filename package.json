@@ -40,6 +40,10 @@
         "title": "AI Effort Tracker: Set Work Item Estimate"
       },
       {
+        "command": "aiEffortTracker.setProjectRates",
+        "title": "AI Effort Tracker: Set Project Rates (Cost & Sell)"
+      },
+      {
         "command": "aiEffortTracker.startSession",
         "title": "AI Effort Tracker: Start Tracking Session"
       },
@@ -90,7 +94,24 @@
         "aiEffortTracker.hourlyRateUsd": {
           "type": "number",
           "default": 80,
-          "description": "Developer hourly cost in USD, used to value the time saved (ROI)."
+          "description": "Developer hourly cost in USD, used to value the time saved (ROI). Legacy/global default cost rate: a project without its own hourly cost, and no 'defaultHourlyCostRate' set, falls back to this."
+        },
+        "aiEffortTracker.defaultHourlyCostRate": {
+          "type": "number",
+          "description": "Global default for what one developer hour COSTS, used for projects that don't set their own hourly cost. When unset, falls back to the legacy 'hourlyRateUsd'. Precedence: project setting > this > hourlyRateUsd."
+        },
+        "aiEffortTracker.defaultHourlySellRate": {
+          "type": "number",
+          "description": "Global default for what one developer hour is BILLED/SOLD for, used for projects that don't set their own sell rate. When unset, sold value is left unresolved (null) rather than assumed. Precedence: project setting > this."
+        },
+        "aiEffortTracker.currency": {
+          "type": "string",
+          "default": "USD",
+          "description": "Currency the rate/ROI figures are expressed in (e.g. 'USD', 'EUR'). A project may override this in its settings."
+        },
+        "aiEffortTracker.creditCostPerUnit": {
+          "type": "number",
+          "description": "Money cost per 1 credit / premium request, used to fold AI credit spend into project cost. When unset, falls back to the legacy 'usdPerCredit'. Precedence: project setting > this > usdPerCredit."
         },
         "aiEffortTracker.usdPerCredit": {
           "type": "number",
