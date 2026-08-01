@@ -147,7 +147,13 @@ function insights(d){
   var savedValue=(R.soldValue!=null)?R.soldValue:null; // value produced via sell rate
   var roi=(R.netValue!=null)?R.netValue:null;          // net ROI, nullable
   var currency=R.currency||'USD';
-  return {activeMin:activeMin,totalNet:totalNet,aiNet:aiNet,humanNet:humanNet,aiShare:aiShare,velocity:velocity,manualEquivMin:manualEquivMin,timeSavedMin:timeSavedMin,credits:credits,aiCost:aiCost,savedValue:savedValue,roi:roi,currency:currency,chatTurns:d.chatTurnsHuman||0,chatChars:d.chatCharsHuman||0};
+  // #46: billable ('could-charge') hours decoupled from actual worked hours.
+  var actualHours=(typeof R.actualHours==='number')?R.actualHours:null;
+  var billableHours=(typeof R.chargeableHours==='number')?R.chargeableHours:null;
+  var invoiceValue=(R.invoiceValue!=null)?R.invoiceValue:null;   // billable*sell
+  var netGain=(R.netGain!=null)?R.netGain:null;                  // headline AI gain
+  var profit=(R.profit!=null)?R.profit:null;                     // needs cost rate
+  return {activeMin:activeMin,totalNet:totalNet,aiNet:aiNet,humanNet:humanNet,aiShare:aiShare,velocity:velocity,manualEquivMin:manualEquivMin,timeSavedMin:timeSavedMin,credits:credits,aiCost:aiCost,savedValue:savedValue,roi:roi,currency:currency,actualHours:actualHours,billableHours:billableHours,invoiceValue:invoiceValue,netGain:netGain,profit:profit,chatTurns:d.chatTurnsHuman||0,chatChars:d.chatCharsHuman||0};
 }
 function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
 function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
@@ -457,7 +463,7 @@ function fmtMoney(v,cur,dp){if(v==null)return ROI_NONE;var n=Number(v).toFixed(d
 function moneyColor(v){return v==null?'inherit':(v>=0?'var(--added)':'var(--deleted)');}
 // Effective ROI figures for a branch/work item, always an object (never crashes
 // if an older payload lacks .roi). All money already resolved server-side.
-function roiOf(x){return (x&&x.roi)?x.roi:{currency:'USD',creditCost:null,netValue:null,soldValue:null,creditCostPerUnit:null};}
+function roiOf(x){return (x&&x.roi)?x.roi:{currency:'USD',creditCost:null,netValue:null,soldValue:null,creditCostPerUnit:null,actualHours:null,chargeableHours:null,invoiceValue:null,netGain:null,profit:null};}
 // Currency an attributed ledger row should render in: its project's effective
 // currency when resolvable, else USD (issue #45 — no hardcoded '$').
 function projCurrency(pid){var p=pid&&PROJ.find(function(x){return x.projectId===pid;});return (p&&p.roi&&p.roi.currency)||'USD';}
@@ -567,7 +573,6 @@ function renderWorkItemDetail(){
   if(!w){projView='list';return renderProjectList();}
   var I=insights(w);
   var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
-  var roiColor=moneyColor(I.roi);
   var backTarget=w.projectId?w.projectId:'__none__';
   var branchRows=(w.branches||[]).map(function(b){
     var d=allData.find(function(x){return x.branch===b;});
@@ -579,7 +584,13 @@ function renderWorkItemDetail(){
     +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></div>'
     +'<div class="st"><div class="lbl">Estimate</div><div class="val">'+est+'</div></div>'
     +'<div class="st"><div class="lbl">Actual</div><div class="val">'+fmt(activeMsOf(w))+'</div></div>'
-    +'<div class="st"><div class="lbl">Net ROI</div><div class="val" style="color:'+roiColor+'">'+fmtMoney(I.roi,I.currency)+'</div></div></div>'
+    +'<div class="st"><div class="lbl">Net ROI / AI gain</div><div class="val" style="color:'+moneyColor(I.netGain)+'">'+fmtMoney(I.netGain,I.currency)+'</div></div></div>'
+    +'<div class="sg" style="margin-top:4px">'
+    +sc('Invoice value',fmtMoney(I.invoiceValue,I.currency),moneyColor(I.invoiceValue))
+    +sc('Profit',fmtMoney(I.profit,I.currency),moneyColor(I.profit))
+    +sc('Actual hrs',(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h'),'var(--human)')
+    +sc('Billable hrs',(I.billableHours==null?ROI_NONE:(Math.round(I.billableHours*100)/100)+'h'),'var(--ai)')
+    +'</div>'
     +'<div class="sg" style="margin-top:4px">'
     +sc('AI Share',aiPctOf(w)+'%','var(--ai)')
     +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)')
@@ -587,7 +598,7 @@ function renderWorkItemDetail(){
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
     +manualSplitHtml(w)
-    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
     +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Reassignment History</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Audit trail of branch \\u2192 work item moves touching this work item (newest first).</p></div>';
@@ -752,6 +763,7 @@ document.addEventListener('click',function(e){
   else if(a==='meDel')vscode.postMessage({type:'cmd',value:'deleteManualEffort',arg:t.dataset.id});
   else if(a==='moveBranch')vscode.postMessage({type:'cmd',value:'moveBranchToWorkItem',arg:t.dataset.id});
   else if(a==='reassignBulk')vscode.postMessage({type:'cmd',value:'reassignBranchesBulk',arg:t.dataset.id});
+  else if(a==='bhSet')vscode.postMessage({type:'cmd',value:'setBillableHours',arg:t.dataset.id});
 });`;
 
   return [
