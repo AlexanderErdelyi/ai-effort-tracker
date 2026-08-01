@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
+import { ALL_CATEGORIES } from '../util/fileTypes';
 
 export interface LineStats {
   added: number;
@@ -223,7 +224,7 @@ export interface WorkItemSummary {
   creditsTotal: number;
   creditsByModel: { model: string; credits: number; turns: number }[];
   byExt: Record<string, ExtStats>;
-  byCategory: Record<FileCategory, { human: LineStats; ai: LineStats }>;
+  byCategory: Record<string, { human: LineStats; ai: LineStats }>;
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
@@ -291,13 +292,12 @@ export function migrateStore(parsed: unknown): PersistedStore {
   return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems };
 }
 
-function emptyCategoryMap(): Record<FileCategory, { human: LineStats; ai: LineStats }> {
-  return {
-    code: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
-    spec: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
-    config: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } },
-    other: { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } }
-  };
+function emptyCategoryMap(): Record<string, { human: LineStats; ai: LineStats }> {
+  const map: Record<string, { human: LineStats; ai: LineStats }> = {};
+  for (const cat of ALL_CATEGORIES) {
+    map[cat] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+  }
+  return map;
 }
 
 /**
@@ -351,9 +351,10 @@ export function rollupBranchSummaries(summaries: BranchSummary[]): BranchRollup 
       byExt[ext].ai.deleted += st.ai.deleted;
     }
 
-    for (const cat of Object.keys(byCategory) as FileCategory[]) {
-      const src = s.byCategory[cat];
-      if (!src) continue;
+    for (const [cat, src] of Object.entries(s.byCategory)) {
+      if (!byCategory[cat]) {
+        byCategory[cat] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+      }
       byCategory[cat].human.added += src.human.added;
       byCategory[cat].human.deleted += src.human.deleted;
       byCategory[cat].ai.added += src.ai.added;
