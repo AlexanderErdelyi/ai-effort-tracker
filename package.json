@@ -84,6 +84,10 @@
         "title": "AI Effort Tracker: Set Project Rates (Cost & Sell)"
       },
       {
+        "command": "aiEffortTracker.setDeveloperProfile",
+        "title": "AI Effort Tracker: Set Developer Profile (Seniority & Baseline)"
+      },
+      {
         "command": "aiEffortTracker.createProject",
         "title": "AI Effort Tracker: Create Project"
       },
@@ -149,7 +153,46 @@
         "aiEffortTracker.baselineLocPerMinute": {
           "type": "number",
           "default": 5,
-          "description": "Your baseline hand-coding speed (lines of code per minute) used to estimate time saved by AI."
+          "description": "Your baseline hand-coding speed (lines of code per minute) used to estimate time saved by AI. Tip: run 'AI Effort Tracker: Set Developer Profile' to pre-fill this from a seniority preset (still fully editable)."
+        },
+        "aiEffortTracker.seniority": {
+          "type": "string",
+          "enum": [
+            "junior",
+            "mid",
+            "senior",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "Junior — preset baseline 3 lines/min",
+            "Mid — preset baseline 5 lines/min",
+            "Senior — preset baseline 8 lines/min",
+            "Custom — no auto-fill; use whatever 'baselineLocPerMinute' is set to"
+          ],
+          "default": "custom",
+          "description": "Your developer seniority. Presets pre-fill 'baselineLocPerMinute' with a sensible hand-coding speed (junior=3, mid=5, senior=8 lines/min) that you can still adjust. 'custom' leaves your baseline untouched. Set this via 'AI Effort Tracker: Set Developer Profile'."
+        },
+        "aiEffortTracker.baselineLocPerMinuteByCategory": {
+          "type": "object",
+          "default": {},
+          "properties": {
+            "code": {
+              "type": "number",
+              "description": "Baseline lines/min for code files."
+            },
+            "spec": {
+              "type": "number",
+              "description": "Baseline lines/min for spec/test files."
+            },
+            "docs": {
+              "type": "number",
+              "description": "Baseline lines/min for docs/markdown files."
+            }
+          },
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Optional per-category baseline hand-coding speeds (lines/min), e.g. { \"code\": 5, \"spec\": 8, \"docs\": 12 }. When a category has no value, the flat 'baselineLocPerMinute' is used. The generated-value/ROI math currently uses the flat baseline as the effective input; per-category values are read by the profile resolver for future use."
         },
         "aiEffortTracker.hourlyRateUsd": {
           "type": "number",
