@@ -1,4 +1,4 @@
-import type { BranchSummary, ProjectSummary, WorkItemSummary, LedgerEntry, ManualEffortEntry } from '../store/database';
+import type { BranchSummary, ProjectSummary, WorkItemSummary, LedgerEntry, ManualEffortEntry, ReassignmentRecord } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 
@@ -35,7 +35,8 @@ export function renderDashboardHtml(
   projectSummaries: ProjectSummary[] = [],
   workItemSummaries: WorkItemSummary[] = [],
   ledger: LedgerEntry[] = [],
-  manualEffort: ManualEffortEntry[] = []
+  manualEffort: ManualEffortEntry[] = [],
+  reassignments: ReassignmentRecord[] = []
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
@@ -48,6 +49,7 @@ export function renderDashboardHtml(
   const wiData = JSON.stringify(workItemSummaries);
   const ledData = JSON.stringify(ledger);
   const meData = JSON.stringify(manualEffort);
+  const reData = JSON.stringify(reassignments);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -114,6 +116,7 @@ let PROJ=${projData};
 let WI=${wiData};
 let LEDGER=${ledData};
 let ME=${meData};
+let RE=${reData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -531,6 +534,18 @@ function manualRowsHtml(wid){
     return'<tr><td style="white-space:nowrap">'+esc(when)+'</td><td>'+time+'</td><td>'+lines+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap"><button class="dtab" data-action="meEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="meDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
 }
+function reFor(wid){return (RE||[]).filter(function(r){return r.toWorkItemId===wid||r.fromWorkItemId===wid;});}
+function reassignRowsHtml(wid){
+  var list=reFor(wid);
+  if(!list.length)return'<tr><td colspan="4" style="color:var(--vscode-descriptionForeground)">No reassignments touch this work item yet.</td></tr>';
+  return list.map(function(r){
+    var when=new Date(r.ts).toLocaleString();
+    var from=r.fromWorkItemId?('#'+esc(r.fromWorkItemId)):'\\u2014';
+    var dir=from+' \\u2192 #'+esc(r.toWorkItemId);
+    var note=r.note?esc(r.note):'';
+    return'<tr><td style="white-space:nowrap">'+esc(when)+'</td><td><strong>'+esc(r.branch)+'</strong></td><td style="white-space:nowrap">'+dir+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td></tr>';
+  }).join('');
+}
 function renderWorkItemDetail(){
   var el=document.getElementById('projects');
   var w=WI.find(function(x){return x.workItemId===selWi;});
@@ -542,9 +557,9 @@ function renderWorkItemDetail(){
   var branchRows=(w.branches||[]).map(function(b){
     var d=allData.find(function(x){return x.branch===b;});
     var act=d?tms(d):0;var ai=d?aiPct(d):0;
-    return'<tr data-action="detail" data-value="'+esc(b)+'"><td><strong>'+esc(b)+'</strong></td><td>'+fmt(act)+'</td><td><span class="badge '+(ai>50?'ba':'bh')+'">'+ai+'%</span></td><td>'+(d?'$'+d.estimatedCostUsd.toFixed(4):ROI_NONE)+'</td></tr>';
+    return'<tr data-action="detail" data-value="'+esc(b)+'"><td><strong>'+esc(b)+'</strong></td><td>'+fmt(act)+'</td><td><span class="badge '+(ai>50?'ba':'bh')+'">'+ai+'%</span></td><td>'+(d?'$'+d.estimatedCostUsd.toFixed(4):ROI_NONE)+'</td><td style="white-space:nowrap"><button class="dtab" data-action="moveBranch" data-id="'+esc(b)+'" title="Move to another work item">\\u2192 Move</button></td></tr>';
   });
-  if(!branchRows.length)branchRows=['<tr><td colspan="4" style="color:var(--vscode-descriptionForeground)">No branches roll up into this work item yet.</td></tr>'];
+  if(!branchRows.length)branchRows=['<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No branches roll up into this work item yet.</td></tr>'];
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
     +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></div>'
     +'<div class="st"><div class="lbl">Estimate</div><div class="val">'+est+'</div></div>'
@@ -557,9 +572,10 @@ function renderWorkItemDetail(){
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
     +manualSplitHtml(w)
-    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
-    +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail.</p></div>'
-    +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>';
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
+    +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
+    +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
+    +'<div class="card" style="margin-top:12px"><h3>Reassignment History</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Audit trail of branch \\u2192 work item moves touching this work item (newest first).</p></div>';
 }
 function renderProjectsView(){
   if(projView==='project')return renderProjectDetail();
@@ -677,6 +693,7 @@ window.addEventListener('message',function(e){
     if(msg.workItemSummaries!==undefined&&msg.workItemSummaries)WI=msg.workItemSummaries;
     if(msg.ledger!==undefined&&msg.ledger)LEDGER=msg.ledger;
     if(msg.manualEffort!==undefined&&msg.manualEffort)ME=msg.manualEffort;
+    if(msg.reassignments!==undefined&&msg.reassignments)RE=msg.reassignments;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
@@ -717,6 +734,8 @@ document.addEventListener('click',function(e){
   else if(a==='meAdd')vscode.postMessage({type:'cmd',value:'addManualEffort',arg:t.dataset.id});
   else if(a==='meEdit')vscode.postMessage({type:'cmd',value:'editManualEffort',arg:t.dataset.id});
   else if(a==='meDel')vscode.postMessage({type:'cmd',value:'deleteManualEffort',arg:t.dataset.id});
+  else if(a==='moveBranch')vscode.postMessage({type:'cmd',value:'moveBranchToWorkItem',arg:t.dataset.id});
+  else if(a==='reassignBulk')vscode.postMessage({type:'cmd',value:'reassignBranchesBulk',arg:t.dataset.id});
 });`;
 
   return [
