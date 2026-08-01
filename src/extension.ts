@@ -616,14 +616,28 @@ async function setWorkItemEstimate(preselectedId?: string) {
 /**
  * Set (or clear) a work item's manual 'could-charge' billable-hours override
  * (issue #46), DECOUPLED from the actual tracked time. Accepts an optional
- * `workItemId` (mirroring the `m.arg` pattern) so a dashboard button can target
- * a specific item; otherwise it QuickPicks one. The InputBox is prefilled with
- * the CURRENT effective billable hours (the override when set, else the
- * estimate-in-hours / actual-hours default) and its prompt names that default;
- * submitting blank CLEARS the override so it falls back to the default again.
+ * `arg` (mirroring the `m.arg` pattern) so a dashboard button can target a
+ * specific item; otherwise it QuickPicks one. The arg may be either a bare
+ * `workItemId`, or `"workItemId\u0000hours"` (issue #48) so the "Use as billable
+ * hours" affordance can PREFILL a suggested value (the equivalent hours of the
+ * generated lines) — NUL is an unambiguous delimiter, matching
+ * {@link adjustTrackedTime}. The InputBox is prefilled with that suggested value
+ * when supplied, else the CURRENT effective billable hours (the override when
+ * set, else the estimate-in-hours / actual-hours default); its prompt names that
+ * default; submitting blank CLEARS the override so it falls back to the default.
  */
-async function setBillableHours(workItemId?: string) {
-  let id = workItemId;
+async function setBillableHours(arg?: string) {
+  let id = arg;
+  let prefill: number | undefined;
+  // #48: split an optional `id\u0000hours` suggestion (mirrors adjustTrackedTime).
+  if (id) {
+    const sep = id.indexOf('\u0000');
+    if (sep >= 0) {
+      const h = Number(id.slice(sep + 1));
+      if (Number.isFinite(h) && h >= 0) prefill = h;
+      id = id.slice(0, sep);
+    }
+  }
   if (!id) {
     id = await pickWorkItem('Set billable (could-charge) hours for which work item?');
     if (!id) return;
@@ -646,12 +660,19 @@ async function setBillableHours(workItemId?: string) {
       : `actual ${actualHours}h`;
   // Effective = what invoicing uses right now (override else default).
   const effective = round2(roi.chargeableHours ?? defaultHours);
+  // #48: a suggested value (generated-lines equivalent hours) wins the prefill.
+  const initialValue =
+    prefill !== undefined
+      ? String(round2(prefill))
+      : override !== undefined
+        ? String(round2(override))
+        : String(effective);
 
   const raw = await vscode.window.showInputBox({
     prompt:
       `Billable (could-charge) hours for #${id} — blank to clear the override ` +
       `(default = ${defaultLabel}, actual worked = ${actualHours}h)`,
-    value: override !== undefined ? String(round2(override)) : String(effective),
+    value: initialValue,
     placeHolder: `e.g. ${defaultHours} — leverage lets you charge more hours than you worked`,
     validateInput: v => {
       if (!v.trim()) return null; // blank = clear

@@ -572,6 +572,9 @@ function renderWorkItemDetail(){
   var w=WI.find(function(x){return x.workItemId===selWi;});
   if(!w){projView='list';return renderProjectList();}
   var I=insights(w);
+  var G=w.generated||{};
+  var genH=(typeof G.equivalentHours==='number')?(Math.round(G.equivalentHours*100)/100):null;
+  var genNote=(genH==null)?'':' <span style="color:var(--vscode-descriptionForeground);font-size:.75em">\\u2248 '+genH+'h generated</span>';
   var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
   var backTarget=w.projectId?w.projectId:'__none__';
   var branchRows=(w.branches||[]).map(function(b){
@@ -588,8 +591,9 @@ function renderWorkItemDetail(){
     +'<div class="sg" style="margin-top:4px">'
     +sc('Invoice value',fmtMoney(I.invoiceValue,I.currency),moneyColor(I.invoiceValue))
     +sc('Profit',fmtMoney(I.profit,I.currency),moneyColor(I.profit))
-    +sc('Actual hrs',(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h'),'var(--human)')
+    +sc('Actual hrs',(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h')+genNote,'var(--human)')
     +sc('Billable hrs',(I.billableHours==null?ROI_NONE:(Math.round(I.billableHours*100)/100)+'h'),'var(--ai)')
+    +sc('Generated value',fmtMoney(G.generatedValue,I.currency),moneyColor(G.generatedValue))
     +'</div>'
     +'<div class="sg" style="margin-top:4px">'
     +sc('AI Share',aiPctOf(w)+'%','var(--ai)')
@@ -598,7 +602,7 @@ function renderWorkItemDetail(){
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
     +manualSplitHtml(w)
-    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button>'+(genH==null?'':'<button class="dtab" data-action="bhUse" data-id="'+esc(w.workItemId)+'" data-hours="'+esc(genH)+'" title="Prefill billable hours with the generated-lines equivalent (\\u2248 '+genH+'h)">\\u26A1 Use as Billable Hours</button>')+'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button></div>'
     +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Reassignment History</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Audit trail of branch \\u2192 work item moves touching this work item (newest first).</p></div>';
@@ -782,6 +786,7 @@ document.addEventListener('click',function(e){
   else if(a==='moveBranch')vscode.postMessage({type:'cmd',value:'moveBranchToWorkItem',arg:t.dataset.id});
   else if(a==='reassignBulk')vscode.postMessage({type:'cmd',value:'reassignBranchesBulk',arg:t.dataset.id});
   else if(a==='bhSet')vscode.postMessage({type:'cmd',value:'setBillableHours',arg:t.dataset.id});
+  else if(a==='bhUse')vscode.postMessage({type:'cmd',value:'setBillableHours',arg:t.dataset.id+'\\u0000'+t.dataset.hours});
   else if(a==='tadjSet')vscode.postMessage({type:'cmd',value:'adjustTrackedTime',arg:t.dataset.id+'\\u0000'+t.dataset.mode});
   else if(a==='tadjReset')vscode.postMessage({type:'cmd',value:'resetTrackedTime',arg:t.dataset.id});
   else if(a==='estSet')vscode.postMessage({type:'cmd',value:'setWorkItemEstimate',arg:t.dataset.id});

@@ -8,10 +8,12 @@ import type { FileCategory } from '../util/fileTypes';
 import {
   resolveEffectiveRates,
   computeRoiFigures,
+  computeGeneratedValue,
   MS_PER_HOUR,
   type EffectiveRates,
   type RateGlobals,
-  type RoiFigures
+  type RoiFigures,
+  type GeneratedValue
 } from '../util/rates';
 
 export interface LineStats {
@@ -578,6 +580,16 @@ export interface WorkItemSummary {
    * three can never disagree. Display-only.
    */
   roi: RoiFigures;
+  /**
+   * The monetary VALUE OF GENERATED LINES for this work item (issue #48): its
+   * rolled-up added lines (human + AI) expressed as equivalent authoring hours at
+   * the global baseline speed, and what that time is worth at the project's
+   * effective sell rate + currency. `generatedValue` is `null` when the sell rate
+   * (or baseline) is unconfigured — never NaN — and `equivalentHours` doubles as
+   * the SUGGESTED `billableHours` the UI offers. Shares the same effective-rate
+   * source as {@link roi} so they can never disagree. Display-only / derived.
+   */
+  generated: GeneratedValue;
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
@@ -585,6 +597,7 @@ export type BranchRollup = Omit<
   WorkItemSummary,
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
   | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual' | 'roi'
+  | 'generated'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -2121,6 +2134,15 @@ export class Database {
       this.getCreditsForWorkItem(workItemId),
       billableHours
     );
+    // #48: value of the generated lines (human + AI added, rolled up) at the
+    // global baseline authoring speed and the project's effective sell rate.
+    // equivalentHours doubles as the suggested billable-hours input. Shares the
+    // same effective-rate source as `roi`; null (never NaN) when a rate is unset.
+    const generated = computeGeneratedValue({
+      linesAdded: rollup.linesHumanAdded + rollup.linesAiAdded,
+      baselineLocPerMinute: this.readBaselineLocPerMinute(),
+      sellRate: roi.hourlySellRate
+    });
     return {
       workItemId: wi.id,
       title: wi.title ?? null,
@@ -2137,7 +2159,8 @@ export class Database {
       branches,
       ...rollup,
       manual,
-      roi
+      roi,
+      generated
     };
   }
 
@@ -2824,6 +2847,22 @@ export class Database {
       legacyHourlyRateUsd: c.get<number>('hourlyRateUsd'),
       legacyUsdPerCredit: c.get<number>('usdPerCredit')
     };
+  }
+
+  /**
+   * Read the global baseline authoring speed (`aiEffortTracker.baselineLocPerMinute`,
+   * default 5) used by the generated-value math (issue #48). Mirrors
+   * {@link readRateGlobals}: reads the same VS Code configuration the ROI rates
+   * come from so the work-item summary can be computed without threading extra
+   * arguments. Returns `null` when the setting is unusable (≤0 / non-finite) so
+   * {@link computeGeneratedValue} falls through to a null (never NaN) result.
+   * There is intentionally no per-project override: none exists in the persisted
+   * shape and this feature adds no new persisted settings.
+   */
+  private readBaselineLocPerMinute(): number | null {
+    const c = vscode.workspace.getConfiguration('aiEffortTracker');
+    const v = c.get<number>('baselineLocPerMinute') ?? 5;
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
   }
 
   /**
