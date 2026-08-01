@@ -195,6 +195,69 @@ export interface RoiFigures {
   profit: number | null;
 }
 
+/**
+ * The value of a work item's GENERATED lines (issue #48): how many hours of
+ * "content" the added lines represent at the baseline authoring speed, and what
+ * that equivalent time is worth at the effective sell rate. Both figures are
+ * `number | null` — `null` means a required input (baseline or sell rate) is
+ * unconfigured — and by construction neither is ever NaN. Purely a leverage
+ * sanity-check + a suggested `billableHours` input; never persisted.
+ */
+export interface GeneratedValue {
+  /**
+   * Suggested billable hours = `linesAdded / baselineLocPerMinute / 60`. Null
+   * only when the baseline is unusable (≤0 / non-finite). `0` when there are no
+   * lines but the baseline is valid.
+   */
+  equivalentHours: number | null;
+  /**
+   * `equivalentHours × sellRate` in the project currency. Null when the sell
+   * rate is unset OR the baseline is unusable (so `equivalentHours` is null);
+   * `0` when there are no lines but both rates are present.
+   */
+  generatedValue: number | null;
+}
+
+/** Raw inputs for {@link computeGeneratedValue}. */
+export interface GeneratedValueInput {
+  /** Rolled-up lines added for the subject (human + AI). */
+  linesAdded: number;
+  /**
+   * Baseline authoring speed in lines-of-code per minute. Treated as UNSET when
+   * ≤0 or non-finite (mirrors how a missing rate falls through), yielding null
+   * outputs instead of a divide-by-zero / NaN.
+   */
+  baselineLocPerMinute: number | null | undefined;
+  /** Effective sell rate (money per hour) for the subject's project, or null when unset. */
+  sellRate: number | null | undefined;
+}
+
+/**
+ * Compute the {@link GeneratedValue} for a subject from its added lines, the
+ * baseline authoring speed and the effective sell rate. FRAMEWORK-FREE and PURE
+ * (unit-testable in isolation), mirroring {@link computeRoiFigures}. Guards every
+ * input so a missing/invalid baseline or sell rate yields `null` (never NaN), and
+ * zero lines with valid rates yield a genuine `0` (not null, not NaN).
+ */
+export function computeGeneratedValue(input: GeneratedValueInput): GeneratedValue {
+  const lines =
+    typeof input.linesAdded === 'number' && Number.isFinite(input.linesAdded) && input.linesAdded > 0
+      ? input.linesAdded
+      : 0;
+  const baseline = input.baselineLocPerMinute;
+  const baselineOk = typeof baseline === 'number' && Number.isFinite(baseline) && baseline > 0;
+  if (!baselineOk) {
+    return { equivalentHours: null, generatedValue: null };
+  }
+  const equivalentHours = lines / baseline / 60;
+  const sellRate = input.sellRate;
+  const sellOk = typeof sellRate === 'number' && Number.isFinite(sellRate) && sellRate >= 0;
+  return {
+    equivalentHours,
+    generatedValue: sellOk ? equivalentHours * sellRate : null
+  };
+}
+
 /** Add two `number | null` values, returning null only when BOTH are null. Pure. */
 function addNullable(a: number | null, b: number | null): number | null {
   if (a === null && b === null) return null;
