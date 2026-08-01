@@ -175,6 +175,16 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.reassignBranch', () =>
       assignBranchToWorkItem()
     ),
+    // #22: move a SINGLE named branch (from a work-item drill-down row) to another
+    // work item, recording an audit entry.
+    vscode.commands.registerCommand('aiEffortTracker.moveBranchToWorkItem', (branch?: string) =>
+      moveBranchToWorkItem(branch)
+    ),
+    // #22: BULK reassign — multi-select branches of a work item and move them all
+    // to a chosen destination in one audited batch.
+    vscode.commands.registerCommand('aiEffortTracker.reassignBranchesBulk', (workItemId?: string) =>
+      reassignBranchesBulk(workItemId)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', () =>
       setWorkItemEstimate()
     ),
@@ -255,7 +265,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort());
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments());
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
@@ -287,7 +297,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       projectSummaries: db.getAllProjectSummaries(),
       workItemSummaries: db.getAllWorkItemSummaries(),
       ledger: db.getCreditEntries(),
-      manualEffort: db.getManualEffort()
+      manualEffort: db.getManualEffort(),
+      reassignments: db.getReassignments()
     });
   }, 5000);
 
@@ -341,6 +352,132 @@ async function assignBranchToWorkItem() {
   vscode.window.showInformationMessage(
     `Branch "${branch}" assigned to work item #${workItemId}.`
   );
+  refreshDashboard();
+}
+
+/**
+ * QuickPick a branch from all tracked branches (issue #22 command-palette
+ * fallback). Returns the branch name or undefined on cancel.
+ */
+async function pickBranch(placeHolder: string): Promise<string | undefined> {
+  const picks = db.getAllBranchesSummaries().map(s => ({
+    label: s.branch,
+    description: s.workItemId ? '#' + s.workItemId : undefined
+  }));
+  if (picks.length === 0) {
+    vscode.window.showWarningMessage('No branches tracked yet.');
+    return undefined;
+  }
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  return picked?.label;
+}
+
+/**
+ * QuickPick a DESTINATION work item for a reassignment (issue #22). Offers all
+ * real work items (marking `currentId`) plus a "New work item…" option that
+ * creates the entity. Returns the chosen/created work item id, or undefined on
+ * cancel. Mirrors the {@link assignBranchToWorkItem} picker so the reassign flows
+ * feel identical to the existing #10 assign flow.
+ */
+async function pickDestinationWorkItem(placeHolder: string, currentId?: string): Promise<string | undefined> {
+  type WiPick = vscode.QuickPickItem & { id?: string; create?: boolean };
+  const picks: WiPick[] = db.getAllWorkItems()
+    .filter(w => w.id !== 'unknown' && w.id !== UNASSIGNED_WORK_ITEM_ID)
+    .map(w => ({
+      label: (w.id === currentId ? '\u25b6 ' : '') + '#' + w.id,
+      description: w.title ?? undefined,
+      detail: w.id === currentId ? 'current work item' : undefined,
+      id: w.id
+    }));
+  picks.push({ label: '$(add) New work item\u2026', create: true });
+  const picked = await vscode.window.showQuickPick(picks, { placeHolder });
+  if (!picked) return undefined;
+  if (picked.create) {
+    const id = await vscode.window.showInputBox({
+      prompt: 'New work item id (e.g. 1234 or JIRA-42)',
+      validateInput: v => (v && v.trim()) ? null : 'Enter a work item id'
+    });
+    if (!id) return undefined;
+    const workItemId = id.trim();
+    const title = await vscode.window.showInputBox({
+      prompt: `Title for work item #${workItemId} (optional)`
+    });
+    if (title === undefined) return undefined;
+    db.upsertWorkItem(workItemId, title.trim() ? { title: title.trim() } : {});
+    return workItemId;
+  }
+  return picked.id;
+}
+
+/**
+ * Move a SINGLE branch to another work item (issue #22), invoked from a
+ * work-item drill-down row (or the command palette, which falls back to a branch
+ * QuickPick). Picks a destination work item, takes an optional note, and calls
+ * the audited single-branch reassignment. Accrued effort/lines and reconciled
+ * credit-ledger rows follow the branch (see {@link Database.reassignBranchToWorkItem}).
+ */
+async function moveBranchToWorkItem(branch?: string) {
+  let target = branch;
+  if (!target) {
+    target = await pickBranch('Move which branch to a different work item?');
+    if (!target) return;
+  }
+  const current = db.getWorkItemForBranch(target);
+  const dest = await pickDestinationWorkItem(
+    `Move branch "${target}" to which work item?`,
+    current ?? undefined
+  );
+  if (!dest) return;
+  const note = await vscode.window.showInputBox({
+    prompt: 'Reassignment note (optional)',
+    placeHolder: 'e.g. was tracked under the wrong work item'
+  });
+  if (note === undefined) return; // Esc cancels the whole move.
+  db.reassignBranchToWorkItem(target, dest, note.trim() || undefined);
+  vscode.window.showInformationMessage(`Branch "${target}" moved to work item #${dest}.`);
+  refreshDashboard();
+}
+
+/**
+ * BULK reassign the branches of a work item (issue #22). Invoked from a work-item
+ * drill-down (or the palette, which falls back to picking a source work item):
+ * multi-selects branches of the source, picks a destination work item, takes an
+ * optional shared note, and calls the audited bulk method so all moves share one
+ * `batchId`. All accrued effort/credits follow the branches, and one audit row is
+ * recorded per branch.
+ */
+async function reassignBranchesBulk(workItemId?: string) {
+  let sourceId = workItemId;
+  if (!sourceId) {
+    sourceId = await pickWorkItem('Reassign branches FROM which work item?');
+    if (!sourceId) return;
+  }
+  const branches = db.getWorkItemSummary(sourceId).branches;
+  if (branches.length === 0) {
+    vscode.window.showWarningMessage(`Work item #${sourceId} has no branches to reassign.`);
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    branches.map(b => ({ label: b, picked: true })),
+    { canPickMany: true, placeHolder: `Select branches to move from #${sourceId}` }
+  );
+  if (!picked || picked.length === 0) return;
+  const dest = await pickDestinationWorkItem(
+    `Move ${picked.length} branch(es) to which work item?`,
+    sourceId
+  );
+  if (!dest) return;
+  const note = await vscode.window.showInputBox({
+    prompt: 'Reassignment note (optional)',
+    placeHolder: 'e.g. re-homing mis-detected branches'
+  });
+  if (note === undefined) return;
+  const moved = db.reassignBranchesToWorkItem(
+    picked.map(p => p.label),
+    dest,
+    note.trim() || undefined
+  );
+  vscode.window.showInformationMessage(`Moved ${moved.length} branch(es) to work item #${dest}.`);
   refreshDashboard();
 }
 
@@ -1272,7 +1409,8 @@ function refreshDashboard() {
       projectSummaries: db.getAllProjectSummaries(),
       workItemSummaries: db.getAllWorkItemSummaries(),
       ledger: db.getCreditEntries(),
-      manualEffort: db.getManualEffort()
+      manualEffort: db.getManualEffort(),
+      reassignments: db.getReassignments()
     });
   });
 }

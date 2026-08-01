@@ -117,6 +117,30 @@ export interface ManualEffortEntry {
 }
 
 /**
+ * An immutable audit-trail entry recording that a branch was re-homed from one
+ * work item to another (issue #22 / milestone M5). Unlike the branch → work item
+ * mapping itself (which is stored on {@link BranchData} and simply overwritten on
+ * each reassignment), these rows live at the TOP LEVEL of the store so the full
+ * HISTORY of corrections survives — a user can see exactly when effort was
+ * re-homed, from where, to where, and why. `fromWorkItemId` captures the branch's
+ * PREVIOUS mapping (null when it was unmapped) taken BEFORE the re-point, so the
+ * record is a faithful before/after snapshot. `batchId` groups the rows written
+ * by a single bulk reassignment; a single-branch move is simply a batch of one.
+ */
+export interface ReassignmentRecord {
+  id: string;
+  ts: number;
+  branch: string;
+  /** The branch's work item BEFORE this move, or null when it was unmapped. */
+  fromWorkItemId: string | null;
+  /** The work item the branch was moved TO. */
+  toWorkItemId: string;
+  note?: string;
+  /** Groups records written together by one bulk operation. */
+  batchId?: string;
+}
+
+/**
  * Caller-supplied fields for {@link Database.addManualEffort}. `id`/`source` are
  * assigned by the store; `ts` defaults to now when omitted.
  */
@@ -446,6 +470,12 @@ export interface PersistedStore {
    * separable from the automatic capture path.
    */
   manualEffort: ManualEffortEntry[];
+  /**
+   * Immutable branch → work item reassignment audit trail (issue #22). Top-level,
+   * like the credit ledger and manual effort, so the HISTORY of corrections spans
+   * branches and work items and survives future re-points. Added in schema v7.
+   */
+  reassignments: ReassignmentRecord[];
 }
 
 /** Aggregated effort for a single work item, rolled up across all its branches. */
@@ -585,8 +615,14 @@ export interface ProjectRoi extends RoiFigures {
  * previously-null `workItemId` and may create a work item entity — it does NOT
  * change the on-disk envelope SHAPE (both fields already exist), so NO schema
  * bump is required and the pass stays pure, idempotent and zero-loss.
+ *
+ * v7 (issue #22) adds the top-level `reassignments` audit trail — the immutable
+ * history of branch → work item re-homings. {@link migrateStore} defaults it to
+ * `[]` for every pre-v7 file (both the current envelope and the legacy flat map)
+ * exactly as `manualEffort`/`creditLedger` are defaulted, so a v6 → v7 load is a
+ * pure, idempotent, zero-loss default with no rewrite of existing data.
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -829,6 +865,7 @@ export function migrateStore(parsed: unknown): PersistedStore {
   let creditLedger: LedgerEntry[];
   let projects: Record<string, Project>;
   let manualEffort: ManualEffortEntry[];
+  let reassignments: ReassignmentRecord[];
   if (isEnvelope(parsed)) {
     branches = (parsed.branches ?? {}) as Store;
     workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
@@ -841,12 +878,15 @@ export function migrateStore(parsed: unknown): PersistedStore {
         : {};
     // #21: default to [] for any pre-v6 file, which had no manualEffort array.
     manualEffort = sanitizeManualEffort((parsed as PersistedStore).manualEffort);
+    // #22: default to [] for any pre-v7 file, which had no reassignments array.
+    reassignments = sanitizeReassignments((parsed as PersistedStore).reassignments);
   } else {
     branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
     workItems = {};
     creditLedger = [];
     projects = {};
     manualEffort = [];
+    reassignments = [];
   }
   backfillWorkItems(branches, workItems);
   // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
@@ -859,8 +899,38 @@ export function migrateStore(parsed: unknown): PersistedStore {
     workItems,
     creditLedger,
     projects,
-    manualEffort
+    manualEffort,
+    reassignments
   };
+}
+
+/**
+ * Coerce persisted reassignment JSON into a clean {@link ReassignmentRecord}[]
+ * (issue #22). Drops non-object rows and rows without a usable `branch` +
+ * `toWorkItemId`, fills a missing `id`, and normalizes `fromWorkItemId` to
+ * `string | null`. Pure + idempotent so a re-migration of already-clean data is
+ * a no-op with zero data loss — mirrors {@link sanitizeManualEffort}.
+ */
+export function sanitizeReassignments(input: unknown): ReassignmentRecord[] {
+  if (!Array.isArray(input)) return [];
+  const out: ReassignmentRecord[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue;
+    const r = raw as Partial<ReassignmentRecord>;
+    if (typeof r.branch !== 'string' || !r.branch) continue;
+    if (typeof r.toWorkItemId !== 'string' || !r.toWorkItemId) continue;
+    const rec: ReassignmentRecord = {
+      id: typeof r.id === 'string' && r.id ? r.id : newLedgerId(),
+      ts: typeof r.ts === 'number' && Number.isFinite(r.ts) ? r.ts : Date.now(),
+      branch: r.branch,
+      fromWorkItemId: typeof r.fromWorkItemId === 'string' ? r.fromWorkItemId : null,
+      toWorkItemId: r.toWorkItemId
+    };
+    if (typeof r.note === 'string') rec.note = r.note;
+    if (typeof r.batchId === 'string') rec.batchId = r.batchId;
+    out.push(rec);
+  }
+  return out;
 }
 
 /**
@@ -1104,6 +1174,7 @@ export class Database {
   private creditLedger: LedgerEntry[];
   private projects: Record<string, Project>;
   private manualEffort: ManualEffortEntry[];
+  private reassignments: ReassignmentRecord[];
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
@@ -1123,6 +1194,7 @@ export class Database {
     this.creditLedger = loaded.creditLedger;
     this.projects = loaded.projects;
     this.manualEffort = loaded.manualEffort;
+    this.reassignments = loaded.reassignments;
   }
 
   /** Build the on-disk envelope from the in-memory state. */
@@ -1133,7 +1205,8 @@ export class Database {
       workItems: this.workItems,
       creditLedger: this.creditLedger,
       projects: this.projects,
-      manualEffort: this.manualEffort
+      manualEffort: this.manualEffort,
+      reassignments: this.reassignments
     };
     return JSON.stringify(envelope, null, 2);
   }
@@ -1639,20 +1712,90 @@ export class Database {
    * the ledger loop does the same for recorded credits/cost. A detached-HEAD /
    * `unknown` branch can be attached here after the fact and its accrued effort
    * follows — but such branches are never force-merged automatically.
+   *
+   * Also records ONE {@link ReassignmentRecord} audit row per call (issue #22):
+   * the previous mapping is captured as `fromWorkItemId` BEFORE the re-point, so
+   * the history survives even though the live mapping is overwritten. `note` is
+   * optional and stored verbatim on the audit row.
    */
-  reassignBranchToWorkItem(branch: string, workItemId: string) {
-    const data = this.ensureBranch(branch);
+  reassignBranchToWorkItem(branch: string, workItemId: string, note?: string) {
+    // A single move is just a bulk batch of one — share the core so the ledger
+    // reconciliation and audit write are never duplicated.
+    this.reassignBranchesToWorkItem([branch], workItemId, note);
+  }
+
+  /**
+   * BULK reassign: re-home MANY branches to one work item in a single operation
+   * (issue #22). Reuses the exact per-branch logic of the single move via
+   * {@link reassignBranchCore} (sticky manual override + effort follows the
+   * branch + credit-ledger reconciliation), then records the whole set under one
+   * shared `batchId` so the audit trail can group them. Idempotent-safe: a branch
+   * already on `workItemId` is still recorded (from == to) but loses no field, and
+   * the end state is identical to calling the single move once per branch. Blank/
+   * duplicate branch names are ignored; a single `save()` covers the batch.
+   */
+  reassignBranchesToWorkItem(branches: string[], workItemId: string, note?: string): ReassignmentRecord[] {
     this.ensureWorkItem(workItemId);
+    const projectId = this.workItems[workItemId]?.projectId ?? null;
+    // De-duplicate while preserving order; drop empty names.
+    const seen = new Set<string>();
+    const targets = branches.filter(b => {
+      if (typeof b !== 'string' || !b || seen.has(b)) return false;
+      seen.add(b);
+      return true;
+    });
+    if (targets.length === 0) return [];
+    const batchId = newLedgerId();
+    const ts = Date.now();
+    const records: ReassignmentRecord[] = [];
+    for (const branch of targets) {
+      const from = this.reassignBranchCore(branch, workItemId, projectId);
+      const rec: ReassignmentRecord = {
+        id: newLedgerId(),
+        ts,
+        branch,
+        fromWorkItemId: from,
+        toWorkItemId: workItemId,
+        batchId
+      };
+      if (note && note.trim()) rec.note = note.trim();
+      this.reassignments.push(rec);
+      records.push(rec);
+    }
+    this.save();
+    return records;
+  }
+
+  /**
+   * The shared core of a single/bulk reassignment (issue #22). Captures and
+   * RETURNS the branch's previous work item (for the audit `fromWorkItemId`),
+   * re-points the branch, marks it a sticky manual override, and reconciles the
+   * branch's credit-ledger rows onto `workItemId`/`projectId`. Does NOT persist or
+   * write an audit row — the caller owns batching, the audit trail and `save()`.
+   */
+  private reassignBranchCore(branch: string, workItemId: string, projectId: string | null): string | null {
+    const data = this.ensureBranch(branch);
+    const from = data.workItemId ?? null;
     data.workItemId = workItemId;
     data.workItemIdManual = true;
-    const projectId = this.workItems[workItemId]?.projectId ?? null;
     for (const e of this.creditLedger) {
       if (e.branch === branch) {
         e.workItemId = workItemId;
         e.projectId = projectId;
       }
     }
-    this.save();
+    return from;
+  }
+
+  /**
+   * List reassignment audit records (issue #22), newest-first. Pass a `branch` to
+   * scope to a single branch's history, or omit it for the full trail. Returns a
+   * shallow copy so callers can't mutate the stored array.
+   */
+  getReassignments(branch?: string): ReassignmentRecord[] {
+    return this.reassignments
+      .filter(r => branch === undefined || r.branch === branch)
+      .sort((a, b) => b.ts - a.ts);
   }
 
   /** The work item id currently mapped to a branch (or null). */
