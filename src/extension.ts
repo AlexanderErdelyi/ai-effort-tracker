@@ -1421,6 +1421,19 @@ function fmtDuration(ms: number): string {
   return h > 0 ? `${h}h ${min % 60}m` : `${min}m`;
 }
 
+/** Currency symbol for common codes; falls back to the code itself (issue #45). */
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: '$', EUR: '\u20ac', GBP: '\u00a3', JPY: '\u00a5', CHF: 'CHF ',
+  CAD: 'CA$', AUD: 'A$', INR: '\u20b9', CNY: '\u00a5'
+};
+
+/** Format money in a currency (symbol when known, else the code). Pure. */
+function fmtCurrency(value: number, currency: string): string {
+  const sym = CURRENCY_SYMBOLS[(currency || 'USD').toUpperCase()];
+  const n = value.toFixed(2);
+  return sym ? `${sym}${n}` : `${currency || 'USD'} ${n}`;
+}
+
 function pctDelta(now: number, prev: number): string {
   if (prev === 0) return now > 0 ? '▲ new' : '–';
   const d = ((now - prev) / prev) * 100;
@@ -1434,11 +1447,18 @@ async function generateWeeklyReport(db: Database) {
   const streak = db.getStreak();
   const series = db.getDailySeries(7);
   const summaries = db.getAllBranchesSummaries();
-  const cfg = getInsightsConfig();
 
   const totLinesAi = summaries.reduce((a, s) => a + s.linesAiAdded, 0);
   const totLinesHuman = summaries.reduce((a, s) => a + s.linesHumanAdded, 0);
   const credits = summaries.reduce((a, s) => a + (s.creditsTotal || 0), 0);
+  // Credit cost via the ECONOMIC model's global effective rates (issue #45),
+  // not the legacy usdPerCredit constant. Cross-project totals use the global
+  // currency; '' when no credit rate is configured (never a bogus $ figure).
+  const rates = db.getEffectiveRates();
+  const creditCostNote =
+    rates.creditCostPerUnit != null
+      ? ` (~${fmtCurrency(credits * rates.creditCostPerUnit, rates.currency)})`
+      : '';
 
   const lines: string[] = [];
   lines.push('# AI Effort Tracker — Weekly Report');
@@ -1476,7 +1496,7 @@ async function generateWeeklyReport(db: Database) {
   const aiShareAll = totLines > 0 ? Math.round((totLinesAi / totLines) * 100) : 0;
   lines.push(`- **AI-written lines (all time):** ${totLinesAi} (${aiShareAll}% of ${totLines})`);
   lines.push(`- **Human-written lines (all time):** ${totLinesHuman}`);
-  lines.push(`- **Credits logged:** ${credits.toFixed(1)} (~$${(credits * cfg.usdPerCredit).toFixed(2)})`);
+  lines.push(`- **Credits logged:** ${credits.toFixed(1)}${creditCostNote}`);
   lines.push('');
 
   const doc = await vscode.workspace.openTextDocument({ content: lines.join('\n'), language: 'markdown' });

@@ -140,10 +140,14 @@ function insights(d){
   var manualEquivMin=totalNet/base;
   var timeSavedMin=manualEquivMin-activeMin;
   var credits=d.creditsTotal||0;
-  var aiCost=credits*CFG.usdPerCredit;
-  var savedValue=(timeSavedMin/60)*CFG.hourlyRateUsd;
-  var roi=savedValue-aiCost;
-  return {activeMin:activeMin,totalNet:totalNet,aiNet:aiNet,humanNet:humanNet,aiShare:aiShare,velocity:velocity,manualEquivMin:manualEquivMin,timeSavedMin:timeSavedMin,credits:credits,aiCost:aiCost,savedValue:savedValue,roi:roi,chatTurns:d.chatTurnsHuman||0,chatChars:d.chatCharsHuman||0};
+  // Money now comes from the economic model resolved server-side on d.roi
+  // (issue #45): project effective rates, ledger cost wins, project currency.
+  var R=roiOf(d);
+  var aiCost=(R.creditCost!=null)?R.creditCost:null;   // credit spend, nullable
+  var savedValue=(R.soldValue!=null)?R.soldValue:null; // value produced via sell rate
+  var roi=(R.netValue!=null)?R.netValue:null;          // net ROI, nullable
+  var currency=R.currency||'USD';
+  return {activeMin:activeMin,totalNet:totalNet,aiNet:aiNet,humanNet:humanNet,aiShare:aiShare,velocity:velocity,manualEquivMin:manualEquivMin,timeSavedMin:timeSavedMin,credits:credits,aiCost:aiCost,savedValue:savedValue,roi:roi,currency:currency,chatTurns:d.chatTurnsHuman||0,chatChars:d.chatCharsHuman||0};
 }
 function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
 function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
@@ -445,7 +449,18 @@ function wiOfProject(pid){
   if(pid==='__none__')return WI.filter(function(w){return!w.projectId;});
   return WI.filter(function(w){return w.projectId===pid;});
 }
-function fmtMoney(v,cur){return v==null?ROI_NONE:(cur||'USD')+' '+v.toFixed(2);}
+var CUR_SYM={USD:'$',EUR:'\\u20ac',GBP:'\\u00a3',JPY:'\\u00a5',CHF:'CHF ',CAD:'CA$',AUD:'A$',INR:'\\u20b9',CNY:'\\u00a5',SEK:'kr ',NOK:'kr ',DKK:'kr ',PLN:'z\\u0142 '};
+function curSym(cur){return CUR_SYM[String(cur||'USD').toUpperCase()]||null;}
+// Format money in the subject's effective currency (issue #45): symbol when known,
+// else the currency code. null means a required rate was unconfigured -> ROI_NONE.
+function fmtMoney(v,cur,dp){if(v==null)return ROI_NONE;var n=Number(v).toFixed(dp==null?2:dp);var s=curSym(cur);return s?s+n:(cur||'USD')+' '+n;}
+function moneyColor(v){return v==null?'inherit':(v>=0?'var(--added)':'var(--deleted)');}
+// Effective ROI figures for a branch/work item, always an object (never crashes
+// if an older payload lacks .roi). All money already resolved server-side.
+function roiOf(x){return (x&&x.roi)?x.roi:{currency:'USD',creditCost:null,netValue:null,soldValue:null,creditCostPerUnit:null};}
+// Currency an attributed ledger row should render in: its project's effective
+// currency when resolvable, else USD (issue #45 — no hardcoded '$').
+function projCurrency(pid){var p=pid&&PROJ.find(function(x){return x.projectId===pid;});return (p&&p.roi&&p.roi.currency)||'USD';}
 function aiPctOf(x){var t=(x.linesHumanAdded||0)+(x.linesAiAdded||0);return t>0?Math.round((x.linesAiAdded/t)*100):0;}
 function projToolbar(){
   return'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">'
@@ -482,8 +497,8 @@ function wiRowsHtml(items){
   var rows=items.map(function(w){
     var I=insights(w);
     var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
-    var roiColor=I.roi>=0?'var(--added)':'var(--deleted)';
-    return'<tr data-action="wi" data-value="'+esc(w.workItemId)+'"><td><strong>'+esc(w.title||('#'+w.workItemId))+'</strong><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></td><td>'+est+'</td><td>'+fmt(activeMsOf(w))+'</td><td><span class="badge '+(aiPctOf(w)>50?'ba':'bh')+'">'+aiPctOf(w)+'%</span></td><td>'+(w.creditsTotal||0).toFixed(1)+'</td><td style="color:'+roiColor+'">$'+I.roi.toFixed(2)+'</td></tr>';
+    var roiColor=moneyColor(I.roi);
+    return'<tr data-action="wi" data-value="'+esc(w.workItemId)+'"><td><strong>'+esc(w.title||('#'+w.workItemId))+'</strong><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></td><td>'+est+'</td><td>'+fmt(activeMsOf(w))+'</td><td><span class="badge '+(aiPctOf(w)>50?'ba':'bh')+'">'+aiPctOf(w)+'%</span></td><td>'+(w.creditsTotal||0).toFixed(1)+'</td><td style="color:'+roiColor+'">'+fmtMoney(I.roi,I.currency)+'</td></tr>';
   });
   if(!rows.length)return'<tr><td colspan="6" style="color:var(--vscode-descriptionForeground)">No work items here yet.</td></tr>';
   return rows.join('');
@@ -552,7 +567,7 @@ function renderWorkItemDetail(){
   if(!w){projView='list';return renderProjectList();}
   var I=insights(w);
   var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
-  var roiColor=I.roi>=0?'var(--added)':'var(--deleted)';
+  var roiColor=moneyColor(I.roi);
   var backTarget=w.projectId?w.projectId:'__none__';
   var branchRows=(w.branches||[]).map(function(b){
     var d=allData.find(function(x){return x.branch===b;});
@@ -564,11 +579,11 @@ function renderWorkItemDetail(){
     +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></div>'
     +'<div class="st"><div class="lbl">Estimate</div><div class="val">'+est+'</div></div>'
     +'<div class="st"><div class="lbl">Actual</div><div class="val">'+fmt(activeMsOf(w))+'</div></div>'
-    +'<div class="st"><div class="lbl">Net ROI</div><div class="val" style="color:'+roiColor+'">$'+I.roi.toFixed(2)+'</div></div></div>'
+    +'<div class="st"><div class="lbl">Net ROI</div><div class="val" style="color:'+roiColor+'">'+fmtMoney(I.roi,I.currency)+'</div></div></div>'
     +'<div class="sg" style="margin-top:4px">'
     +sc('AI Share',aiPctOf(w)+'%','var(--ai)')
     +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)')
-    +sc('AI Spend','$'+I.aiCost.toFixed(2),'var(--cost)')
+    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)')
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
     +manualSplitHtml(w)
@@ -595,7 +610,7 @@ function renderLedger(){
     var when=new Date(e.ts).toLocaleString();
     var attr=e.branch?esc(e.branch):'\\u2014';
     if(e.workItemId)attr+=' <span class="badge ba">#'+esc(e.workItemId)+'</span>';
-    var cost=(e.cost!=null)?'$'+Number(e.cost).toFixed(4):'\\u2014';
+    var cost=(e.cost!=null)?fmtMoney(Number(e.cost),projCurrency(e.projectId),4):'\\u2014';
     var note=e.note?esc(e.note):'';
     var sc=e.source==='manual'?'bh':(e.source==='auto'?'ba':'bp');
     var src='<span class="badge '+sc+'">'+esc(e.source)+'</span>';
@@ -619,9 +634,10 @@ function showDetail(branch){
   var timeRows=[['\\u2328\\ufe0f Human Coding',d.humanCodingMs,'var(--human)'],['\\uD83E\\uDD16 AI Generating',d.aiGeneratingMs,'var(--ai)'],['\\uD83D\\uDC40 Reviewing',d.reviewingMs,'var(--review)'],['\\u2615 Idle',d.idleMs,'var(--idle)']].map(function(r){return'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--vscode-editor-inactiveSelectionBackground);border-radius:4px"><span>'+r[0]+'</span><strong style="color:'+r[2]+'">'+fmt(r[1])+'</strong></div>';}).join('');
   var I=insights(d);
   var byModel=d.creditsByModel||[];
-  var modelRows=byModel.map(function(r){return'<tr><td>'+r.model+'</td><td class="dc">'+r.credits.toFixed(1)+'</td><td class="dc">$'+(r.credits*CFG.usdPerCredit).toFixed(2)+'</td></tr>';}).join('')||'<tr><td colspan="3" style="color:var(--vscode-descriptionForeground)">No credits logged yet \\u2014 use \\u201cAI Effort Tracker: Log Credits Used\\u201d</td></tr>';
+  var cpu=roiOf(d).creditCostPerUnit; // per-credit cost from the branch's effective rates
+  var modelRows=byModel.map(function(r){return'<tr><td>'+r.model+'</td><td class="dc">'+r.credits.toFixed(1)+'</td><td class="dc">'+fmtMoney(cpu!=null?r.credits*cpu:null,I.currency)+'</td></tr>';}).join('')||'<tr><td colspan="3" style="color:var(--vscode-descriptionForeground)">No credits logged yet \\u2014 use \\u201cAI Effort Tracker: Log Credits Used\\u201d</td></tr>';
   var savedColor=I.timeSavedMin>=0?'var(--added)':'var(--deleted)';
-  var roiColor=I.roi>=0?'var(--added)':'var(--deleted)';
+  var roiColor=moneyColor(I.roi);
   var insHtml='<div class="sg">'
     +sc('AI Share of Lines',I.aiShare.toFixed(0)+'%','var(--ai)')
     +sc('Velocity',I.velocity.toFixed(1)+' loc/min','var(--human)')
@@ -636,17 +652,17 @@ function showDetail(branch){
     +'<div class="sg" style="margin-top:16px">'
     +sc('Manual-Equiv Time',fmtMin(I.manualEquivMin),'var(--review)')
     +sc('Time Saved',fmtMin(I.timeSavedMin),savedColor)
-    +sc('Value of Time Saved','$'+I.savedValue.toFixed(2),savedColor)
+    +sc('Value Produced',fmtMoney(I.savedValue,I.currency),moneyColor(I.savedValue))
     +sc('Chat Turns',String(I.chatTurns),'var(--human)')
     +'</div>'
     +'<div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><h3>\\uD83D\\uDCB0 Credits & Cost</h3><button class="dtab" data-action="cmd" data-value="logCredits">+ Log Credits</button></div>'
     +'<div class="sg" style="margin-top:12px">'
     +sc('Credits Used',I.credits.toFixed(1),'var(--cost)')
-    +sc('AI Spend','$'+I.aiCost.toFixed(2),'var(--cost)')
-    +sc('Net ROI','$'+I.roi.toFixed(2),roiColor)
+    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)')
+    +sc('Net ROI',fmtMoney(I.roi,I.currency),roiColor)
     +'</div>'
     +'<table style="margin-top:14px"><thead><tr><th>Model</th><th>Credits</th><th>Cost</th></tr></thead><tbody>'+modelRows+'</tbody></table>'
-    +'<p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">ROI = (value of time saved) \\u2212 (AI spend). Tune <code>baselineLocPerMinute</code>, <code>hourlyRateUsd</code>, <code>usdPerCredit</code> in settings.</p></div>';
+    +'<p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">Net ROI = value produced \\u2212 total cost (labor + credits) from the project\\u2019s effective rates. Credit cost uses the ledger \\u201cCost\\u201d when set, else credits \\u00d7 the project credit rate. \\u201c\\u2014\\u201d means a required rate is unset \\u2014 use \\u201cSet Rates\\u201d on the project. Baseline loc/min tunes the productivity estimate only.</p></div>';
   document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="val" style="color:var(--human)">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="val" style="color:var(--ai)">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="val" style="color:var(--cost)">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>';  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);

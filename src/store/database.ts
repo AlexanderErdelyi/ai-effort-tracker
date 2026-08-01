@@ -53,6 +53,15 @@ export interface BranchSummary {
   byExt: Record<string, ExtStats>;
   // Breakdown by category (programming/specification/documentation/deployment/config/other)
   byCategory: Record<string, { human: LineStats; ai: LineStats }>;
+  /**
+   * Economic ROI figures (issue #45) for this branch, computed from the EFFECTIVE
+   * rates of the branch's owning project (project override → global default →
+   * legacy) applied to its billable time + ledger credits/cost. Money fields are
+   * `null` when a required rate is unconfigured (never NaN). Display-only: the
+   * webview renders credit cost / ROI net / value produced from THIS instead of a
+   * global heuristic, so branch, work-item and project ROI share one rate source.
+   */
+  roi: RoiFigures;
 }
 
 export interface CreditEntry {
@@ -523,13 +532,21 @@ export interface WorkItemSummary {
    * much of a work item's effort was hand-entered vs auto-tracked.
    */
   manual: ManualRollup;
+  /**
+   * Economic ROI figures (issue #45) for this work item, from its owning
+   * project's EFFECTIVE rates applied to its rolled-up billable time + ledger
+   * credits/cost. Money fields are `null` when a required rate is unconfigured
+   * (never NaN). Shares the same rate source as branch and project ROI so the
+   * three can never disagree. Display-only.
+   */
+  roi: RoiFigures;
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
 export type BranchRollup = Omit<
   WorkItemSummary,
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
-  | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual'
+  | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual' | 'roi'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -1924,6 +1941,12 @@ export class Database {
     // expose them separately as `manual` so the UI can show the auto/manual split.
     const manual = this.manualRollupForWorkItem(workItemId);
     mergeManualRollup(rollup, manual);
+    const billableMs = rollup.humanCodingMs + rollup.aiGeneratingMs + rollup.reviewingMs;
+    const roi = this.roiForSubject(
+      wi.projectId ?? null,
+      billableMs,
+      this.getCreditsForWorkItem(workItemId)
+    );
     return {
       workItemId: wi.id,
       title: wi.title ?? null,
@@ -1939,7 +1962,8 @@ export class Database {
       createdAt: wi.createdAt,
       branches,
       ...rollup,
-      manual
+      manual,
+      roi
     };
   }
 
@@ -2023,6 +2047,11 @@ export class Database {
     }
 
     const creditTotals = this.getCreditsForBranch(branch);
+    const projectId = data.workItemId
+      ? this.workItems[data.workItemId]?.projectId ?? null
+      : null;
+    const billableMs =
+      (data.time.humanCoding ?? 0) + (data.time.aiGenerating ?? 0) + (data.time.reviewing ?? 0);
     return {
       branch,
       workItemId: data.workItemId,
@@ -2049,7 +2078,8 @@ export class Database {
       creditsTotal: creditTotals.credits,
       creditsByModel: creditTotals.byModel,
       byExt: data.lineChanges,
-      byCategory
+      byCategory,
+      roi: this.roiForSubject(projectId, billableMs, creditTotals)
     };
   }
 
@@ -2502,6 +2532,27 @@ export class Database {
   getEffectiveRates(projectId?: string): EffectiveRates {
     const overrides = projectId ? this.projects[projectId]?.settings : undefined;
     return resolveEffectiveRates(overrides, this.readRateGlobals());
+  }
+
+  /**
+   * Compute the economic ROI figures for any subject (branch / work item /
+   * project) from its owning project's EFFECTIVE rates + its billable time and
+   * ledger credits (issue #45). Centralises the rate source so branch, work-item
+   * and project ROI are always mutually consistent. `ledgerCost` (recorded
+   * ledger `cost`) wins over `credits * creditCostPerUnit` when present. Pure
+   * delegation to {@link computeRoiFigures}; never throws, never NaN.
+   */
+  private roiForSubject(
+    projectId: string | null | undefined,
+    billableMs: number,
+    credits: CreditTotals
+  ): RoiFigures {
+    return computeRoiFigures({
+      billableMs,
+      credits: credits.credits,
+      ledgerCost: credits.cost,
+      rates: this.getEffectiveRates(projectId ?? undefined)
+    });
   }
 
   /** Shared ROI computation used by {@link getProjectRoi} and {@link getProjectSummary}. */
