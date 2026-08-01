@@ -72,6 +72,14 @@
         "title": "AI Effort Tracker: Set Billable (Could-Charge) Hours"
       },
       {
+        "command": "aiEffortTracker.adjustTrackedTime",
+        "title": "AI Effort Tracker: Adjust Tracked Time (Correct Auto Value)"
+      },
+      {
+        "command": "aiEffortTracker.resetTrackedTime",
+        "title": "AI Effort Tracker: Reset Tracked Time to Auto"
+      },
+      {
         "command": "aiEffortTracker.setProjectRates",
         "title": "AI Effort Tracker: Set Project Rates (Cost & Sell)"
       },
