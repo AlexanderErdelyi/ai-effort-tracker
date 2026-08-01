@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
+import { ALL_CATEGORIES } from '../util/fileTypes';
 
 export interface LineStats {
   added: number;
@@ -163,6 +164,217 @@ interface BranchData {
 
 type Store = Record<string, BranchData>;
 
+/**
+ * A unit of work that may span multiple branches (issue #9 / milestone M2).
+ * A branch is auto-associated to a work item via {@link GitTracker.extractWorkItemId}.
+ * projectId/externalRef are intentionally nullable — they land in later milestones
+ * (#12 project rollups, Azure DevOps linkage) but the field is reserved now so the
+ * persisted shape is forward-compatible.
+ */
+export interface WorkItem {
+  id: string;
+  title: string | null;
+  projectId: string | null;
+  estimate: number | null;
+  externalRef: string | null;
+  createdAt: number;
+}
+
+/**
+ * On-disk envelope (schemaVersion >= 1). Older files were a flat
+ * `Record<branchName, BranchData>` map with no version; {@link migrateStore}
+ * upgrades those in place while preserving every existing field.
+ */
+export interface PersistedStore {
+  schemaVersion: number;
+  branches: Store;
+  workItems: Record<string, WorkItem>;
+}
+
+/** Aggregated effort for a single work item, rolled up across all its branches. */
+export interface WorkItemSummary {
+  workItemId: string;
+  title: string | null;
+  projectId: string | null;
+  estimate: number | null;
+  externalRef: string | null;
+  createdAt: number;
+  /** Branch names that currently roll up into this work item. */
+  branches: string[];
+  humanCodingMs: number;
+  aiGeneratingMs: number;
+  reviewingMs: number;
+  idleMs: number;
+  linesHumanAdded: number;
+  linesHumanDeleted: number;
+  linesAiAdded: number;
+  linesAiDeleted: number;
+  copilotAcceptances: number;
+  estimatedCostUsd: number;
+  chatCharsHuman: number;
+  chatTurnsHuman: number;
+  humanChars: number;
+  aiChars: number;
+  humanKeystrokes: number;
+  aiInserts: number;
+  aiInlineLines: number;
+  aiChatLines: number;
+  aiInlineChars: number;
+  aiChatChars: number;
+  creditsTotal: number;
+  creditsByModel: { model: string; credits: number; turns: number }[];
+  byExt: Record<string, ExtStats>;
+  byCategory: Record<string, { human: LineStats; ai: LineStats }>;
+}
+
+/** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
+export type BranchRollup = Omit<
+  WorkItemSummary,
+  'workItemId' | 'title' | 'projectId' | 'estimate' | 'externalRef' | 'createdAt' | 'branches'
+>;
+
+/** Current persisted schema version. Bump when the on-disk shape changes. */
+export const CURRENT_SCHEMA_VERSION = 1;
+
+/** Branch buckets that never map to a real work item (detached HEAD / worktrees). */
+const NON_WORK_ITEM_IDS = new Set<string>(['unknown']);
+
+function isEnvelope(parsed: unknown): parsed is PersistedStore {
+  return (
+    !!parsed &&
+    typeof parsed === 'object' &&
+    typeof (parsed as PersistedStore).schemaVersion === 'number' &&
+    !!(parsed as PersistedStore).branches &&
+    typeof (parsed as PersistedStore).branches === 'object'
+  );
+}
+
+/**
+ * Back-fill {@link WorkItem} entities from branch records that already carry a
+ * `workItemId` (set by auto-detection). Existing work items are never overwritten,
+ * so titles/estimates added later survive re-migration. Pure + side-effect-free on
+ * inputs other than the passed `workItems` map, so it is easy to unit test.
+ */
+export function backfillWorkItems(
+  branches: Store,
+  workItems: Record<string, WorkItem>
+): void {
+  for (const data of Object.values(branches)) {
+    const id = data?.workItemId;
+    if (!id || NON_WORK_ITEM_IDS.has(id) || workItems[id]) continue;
+    workItems[id] = {
+      id,
+      title: null,
+      projectId: null,
+      estimate: null,
+      externalRef: null,
+      createdAt: Date.now()
+    };
+  }
+}
+
+/**
+ * Normalize any parsed JSON into the current {@link PersistedStore} shape.
+ * Accepts both the legacy flat `Record<branch, BranchData>` (schemaVersion 0,
+ * unversioned) and the current envelope. Never discards unknown fields on the
+ * branch records — only the top-level container is reshaped.
+ */
+export function migrateStore(parsed: unknown): PersistedStore {
+  if (isEnvelope(parsed)) {
+    const branches = (parsed.branches ?? {}) as Store;
+    const workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
+    backfillWorkItems(branches, workItems);
+    return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems };
+  }
+  const branches = (parsed && typeof parsed === 'object' ? parsed : {}) as Store;
+  const workItems: Record<string, WorkItem> = {};
+  backfillWorkItems(branches, workItems);
+  return { schemaVersion: CURRENT_SCHEMA_VERSION, branches, workItems };
+}
+
+function emptyCategoryMap(): Record<string, { human: LineStats; ai: LineStats }> {
+  const map: Record<string, { human: LineStats; ai: LineStats }> = {};
+  for (const cat of ALL_CATEGORIES) {
+    map[cat] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+  }
+  return map;
+}
+
+/**
+ * Roll up a set of per-branch summaries into a single combined total. Pure
+ * function over {@link BranchSummary} values — used to aggregate a work item's
+ * branches, but framework-free and unit-testable in isolation.
+ */
+export function rollupBranchSummaries(summaries: BranchSummary[]): BranchRollup {
+  const byCategory = emptyCategoryMap();
+  const byExt: Record<string, ExtStats> = {};
+  const creditsMap: Record<string, { credits: number; turns: number }> = {};
+  const t: BranchRollup = {
+    humanCodingMs: 0, aiGeneratingMs: 0, reviewingMs: 0, idleMs: 0,
+    linesHumanAdded: 0, linesHumanDeleted: 0, linesAiAdded: 0, linesAiDeleted: 0,
+    copilotAcceptances: 0, estimatedCostUsd: 0, chatCharsHuman: 0, chatTurnsHuman: 0,
+    humanChars: 0, aiChars: 0, humanKeystrokes: 0, aiInserts: 0,
+    aiInlineLines: 0, aiChatLines: 0, aiInlineChars: 0, aiChatChars: 0,
+    creditsTotal: 0, creditsByModel: [], byExt, byCategory
+  };
+
+  for (const s of summaries) {
+    t.humanCodingMs += s.humanCodingMs;
+    t.aiGeneratingMs += s.aiGeneratingMs;
+    t.reviewingMs += s.reviewingMs;
+    t.idleMs += s.idleMs;
+    t.linesHumanAdded += s.linesHumanAdded;
+    t.linesHumanDeleted += s.linesHumanDeleted;
+    t.linesAiAdded += s.linesAiAdded;
+    t.linesAiDeleted += s.linesAiDeleted;
+    t.copilotAcceptances += s.copilotAcceptances;
+    t.estimatedCostUsd += s.estimatedCostUsd;
+    t.chatCharsHuman += s.chatCharsHuman;
+    t.chatTurnsHuman += s.chatTurnsHuman;
+    t.humanChars += s.humanChars;
+    t.aiChars += s.aiChars;
+    t.humanKeystrokes += s.humanKeystrokes;
+    t.aiInserts += s.aiInserts;
+    t.aiInlineLines += s.aiInlineLines;
+    t.aiChatLines += s.aiChatLines;
+    t.aiInlineChars += s.aiInlineChars;
+    t.aiChatChars += s.aiChatChars;
+    t.creditsTotal += s.creditsTotal;
+
+    for (const [ext, st] of Object.entries(s.byExt)) {
+      if (!byExt[ext]) {
+        byExt[ext] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+      }
+      byExt[ext].human.added += st.human.added;
+      byExt[ext].human.deleted += st.human.deleted;
+      byExt[ext].ai.added += st.ai.added;
+      byExt[ext].ai.deleted += st.ai.deleted;
+    }
+
+    for (const [cat, src] of Object.entries(s.byCategory)) {
+      if (!byCategory[cat]) {
+        byCategory[cat] = { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+      }
+      byCategory[cat].human.added += src.human.added;
+      byCategory[cat].human.deleted += src.human.deleted;
+      byCategory[cat].ai.added += src.ai.added;
+      byCategory[cat].ai.deleted += src.ai.deleted;
+    }
+
+    for (const c of s.creditsByModel) {
+      if (!creditsMap[c.model]) creditsMap[c.model] = { credits: 0, turns: 0 };
+      creditsMap[c.model].credits += c.credits;
+      creditsMap[c.model].turns += c.turns;
+    }
+  }
+
+  t.creditsByModel = Object.entries(creditsMap)
+    .map(([model, v]) => ({ model, credits: v.credits, turns: v.turns }))
+    .sort((a, b) => b.credits - a.credits);
+
+  return t;
+}
+
 function dayKey(ts: number = Date.now()): string {
   const d = new Date(ts);
   const y = d.getFullYear();
@@ -190,6 +402,8 @@ export class Database {
   private tmpPath: string;
   private bakPath: string;
   private store: Store;
+  private workItems: Record<string, WorkItem>;
+  private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private dirty = false;
   private writing = false;
@@ -201,20 +415,34 @@ export class Database {
     this.bakPath = this.filePath + '.bak';
     // Clean up any stray temp file left behind by a crashed/interrupted write.
     try { fs.unlinkSync(this.tmpPath); } catch { /* nothing to clean */ }
-    this.store = this.load();
+    const loaded = this.load();
+    this.schemaVersion = loaded.schemaVersion;
+    this.store = loaded.branches;
+    this.workItems = loaded.workItems;
   }
 
-  private load(): Store {
+  /** Build the on-disk envelope from the in-memory state. */
+  private serialize(): string {
+    const envelope: PersistedStore = {
+      schemaVersion: this.schemaVersion,
+      branches: this.store,
+      workItems: this.workItems
+    };
+    return JSON.stringify(envelope, null, 2);
+  }
+
+  private load(): PersistedStore {
     let raw: string;
     try {
       raw = fs.readFileSync(this.filePath, 'utf8');
     } catch {
       // Main file missing (first run, or lost). Recover from backup if present,
       // otherwise start fresh — no warning needed for a normal first run.
-      return this.loadFromBackup() ?? {};
+      return this.loadFromBackup() ?? migrateStore({});
     }
     try {
-      const store = JSON.parse(raw) as Store;
+      // migrateStore upgrades legacy flat files to the current envelope in place.
+      const store = migrateStore(JSON.parse(raw));
       // Successful load — refresh the known-good backup.
       this.writeBackup(raw);
       return store;
@@ -223,11 +451,10 @@ export class Database {
     }
   }
 
-  /** Attempt to read and parse the backup file. Returns undefined if unusable. */
-  private loadFromBackup(): Store | undefined {
+  /** Attempt to read, parse and migrate the backup file. Returns undefined if unusable. */
+  private loadFromBackup(): PersistedStore | undefined {
     try {
-      const store = JSON.parse(fs.readFileSync(this.bakPath, 'utf8')) as Store;
-      return store;
+      return migrateStore(JSON.parse(fs.readFileSync(this.bakPath, 'utf8')));
     } catch {
       return undefined;
     }
@@ -238,7 +465,7 @@ export class Database {
    * if that fails, move the corrupt file aside (never overwrite it) and start
    * fresh. The user is warned in both cases.
    */
-  private recoverFromCorruptMain(): Store {
+  private recoverFromCorruptMain(): PersistedStore {
     const recovered = this.loadFromBackup();
     if (recovered) {
       // Promote the good backup back to the main file so future saves build on it.
@@ -264,7 +491,7 @@ export class Database {
         ? `AI Effort Tracker: the data file was corrupt and could not be recovered. It was saved as "${path.basename(corruptPath)}" and tracking has started fresh.`
         : 'AI Effort Tracker: the data file was corrupt and could not be recovered. Tracking has started fresh.'
     );
-    return {};
+    return migrateStore({});
   }
 
   /** Best-effort write of the known-good backup copy. Never throws. */
@@ -293,7 +520,7 @@ export class Database {
     if (this.writing || !this.dirty) return;
     this.writing = true;
     this.dirty = false;
-    const data = JSON.stringify(this.store, null, 2);
+    const data = this.serialize();
     let handle: fs.promises.FileHandle | undefined;
     try {
       // Atomic write: write to a temp file, fsync, then rename over the target.
@@ -325,7 +552,7 @@ export class Database {
     }
     if (!this.dirty) return;
     this.dirty = false;
-    const data = JSON.stringify(this.store, null, 2);
+    const data = this.serialize();
     try {
       // Atomic write: write to a temp file, fsync, then rename over the target.
       const fd = fs.openSync(this.tmpPath, 'w');
@@ -503,7 +730,86 @@ export class Database {
   setWorkItemForBranch(branch: string, workItemId: string) {
     const data = this.ensureBranch(branch);
     data.workItemId = workItemId;
+    // A branch may be auto-detected before the work item entity exists; make sure
+    // the persisted work item is present so aggregation can find it.
+    this.ensureWorkItem(workItemId);
     this.save();
+  }
+
+  /** Create the work item entity if missing. Does not persist on its own. */
+  private ensureWorkItem(id: string, seed?: Partial<WorkItem>): WorkItem {
+    if (!this.workItems[id]) {
+      this.workItems[id] = {
+        id,
+        title: seed?.title ?? null,
+        projectId: seed?.projectId ?? null,
+        estimate: seed?.estimate ?? null,
+        externalRef: seed?.externalRef ?? null,
+        createdAt: seed?.createdAt ?? Date.now()
+      };
+    }
+    return this.workItems[id];
+  }
+
+  /**
+   * Create or update a work item's metadata (title/estimate/projectId/externalRef).
+   * Only provided fields are changed; `id`/`createdAt` are preserved.
+   */
+  upsertWorkItem(
+    id: string,
+    fields: Partial<Omit<WorkItem, 'id' | 'createdAt'>> = {}
+  ): WorkItem {
+    const wi = this.ensureWorkItem(id);
+    if (fields.title !== undefined) wi.title = fields.title;
+    if (fields.projectId !== undefined) wi.projectId = fields.projectId;
+    if (fields.estimate !== undefined) wi.estimate = fields.estimate;
+    if (fields.externalRef !== undefined) wi.externalRef = fields.externalRef;
+    this.save();
+    return wi;
+  }
+
+  getWorkItem(id: string): WorkItem | undefined {
+    return this.workItems[id];
+  }
+
+  getAllWorkItemIds(): string[] {
+    return Object.keys(this.workItems).sort();
+  }
+
+  getAllWorkItems(): WorkItem[] {
+    return this.getAllWorkItemIds().map(id => this.workItems[id]);
+  }
+
+  /** Branch names that currently roll up into the given work item. */
+  private getBranchesForWorkItem(workItemId: string): string[] {
+    return Object.keys(this.store)
+      .filter(b => this.store[b].workItemId === workItemId)
+      .sort();
+  }
+
+  /**
+   * Aggregate a work item's effort across ALL of its branches. Per-branch detail
+   * stays intact underneath; this is a read-only rollup mirroring
+   * {@link getSummaryForBranch}/{@link BranchSummary}.
+   */
+  getWorkItemSummary(workItemId: string): WorkItemSummary {
+    const wi = this.ensureWorkItem(workItemId);
+    const branches = this.getBranchesForWorkItem(workItemId);
+    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    return {
+      workItemId: wi.id,
+      title: wi.title ?? null,
+      projectId: wi.projectId ?? null,
+      estimate: wi.estimate ?? null,
+      externalRef: wi.externalRef ?? null,
+      createdAt: wi.createdAt,
+      branches,
+      ...rollup
+    };
+  }
+
+  getAllWorkItemSummaries(): WorkItemSummary[] {
+    return this.getAllWorkItemIds().map(id => this.getWorkItemSummary(id));
   }
 
   getSummaryForBranch(branch: string): BranchSummary {
