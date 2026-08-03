@@ -252,3 +252,53 @@ export function exactCreditsFromCopilotUsage(usage: unknown): number | null {
 
   return null;
 }
+
+/** Per-tier token counts + their exact AIU credit contribution (issue #74). */
+export interface TokenTierBreakdown {
+  /** Raw token counts per tier. */
+  tokens: { input: number; cacheRead: number; cacheWrite: number; output: number };
+  /** Exact AIU credits contributed by each tier (sums to the request's total). */
+  credits: { input: number; cacheRead: number; cacheWrite: number; output: number };
+}
+
+function emptyTiers(): TokenTierBreakdown['tokens'] {
+  return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+}
+
+/** Map a `token_type` string to a tier key, or `null` when unrecognized. */
+function tierKeyOf(tokenType: unknown): keyof TokenTierBreakdown['tokens'] | null {
+  const s = String(tokenType ?? '').toLowerCase().replace(/[\s-]/g, '_');
+  if (s === 'input' || s === 'prompt') return 'input';
+  if (s === 'cache_read' || s === 'cached' || s === 'cache_read_input') return 'cacheRead';
+  if (s === 'cache_write' || s === 'cache_creation' || s === 'cache_write_input') return 'cacheWrite';
+  if (s === 'output' || s === 'completion') return 'output';
+  return null;
+}
+
+/**
+ * Break a captured `copilot_usage` block into per-tier token counts and their
+ * exact AIU credit contribution (issue #74 — deep credit analysis). Reads
+ * `token_details[]` (`token_count`, `cost_per_batch`, `batch_size`, `token_type`);
+ * the four tiers (fresh input, cache-read at 10× cheaper, cache-write, output)
+ * are the primary optimization signal. Fully defensive: missing/malformed rows
+ * are skipped, never throws, never NaN. Pure.
+ */
+export function tokenTiersFromCopilotUsage(usage: unknown): TokenTierBreakdown {
+  const out: TokenTierBreakdown = { tokens: emptyTiers(), credits: emptyTiers() };
+  if (!usage || typeof usage !== 'object') return out;
+  const details = (usage as { token_details?: unknown }).token_details;
+  if (!Array.isArray(details)) return out;
+  for (const raw of details as TokenDetail[]) {
+    if (!raw || typeof raw !== 'object') continue;
+    const key = tierKeyOf(raw.token_type);
+    if (!key) continue;
+    const count = safeNonNeg(raw.token_count, NaN);
+    if (Number.isFinite(count)) out.tokens[key] += count;
+    const costPerBatch = safeNonNeg(raw.cost_per_batch, NaN);
+    const batchSize = safeNonNeg(raw.batch_size, NaN);
+    if (Number.isFinite(count) && Number.isFinite(costPerBatch) && Number.isFinite(batchSize) && batchSize > 0) {
+      out.credits[key] += (count * costPerBatch) / batchSize / NANO_PER_AIU;
+    }
+  }
+  return out;
+}

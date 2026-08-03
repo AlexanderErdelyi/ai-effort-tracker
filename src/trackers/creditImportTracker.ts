@@ -4,6 +4,7 @@ import * as path from 'path';
 import { Database } from '../store/database';
 import { TimeTracker } from './timeTracker';
 import { parseDebugExport, ImportedTurn } from '../util/debugExport';
+import { categorize } from '../util/fileTypes';
 
 /** Aggregate outcome of importing one or more export files. */
 export interface ImportSummary {
@@ -136,11 +137,19 @@ export class CreditImportTracker implements vscode.Disposable {
       }
       summary.files += 1;
       for (const t of turns) {
+        // Fill each edited file's effort category using the user's rules (the
+        // pure parser stays framework-free, so categorization happens here).
+        if (t.analysis) {
+          for (const f of t.analysis.files) {
+            try { f.category = categorize(f.path); } catch { /* leave uncategorized */ }
+          }
+        }
         const { inserted } = this.db.recordImportedUsage(branch, t.model, t.credits, {
           promptId: t.promptId,
           promptTokens: t.promptTokens,
           completionTokens: t.completionTokens,
-          requests: t.requests
+          requests: t.requests,
+          analysis: t.analysis
         });
         summary.turns += 1;
         summary.requests += t.requests;
