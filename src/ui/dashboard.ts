@@ -660,7 +660,7 @@ function renderProjectsView(){
 // editing/deleting a row here corrects every derived total automatically.
 function renderLedger(){
   var el=document.getElementById('ledger');
-  var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button>';
+  var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button> <button class="dtab" data-action="cmd" data-value="importCredits" title="Import EXACT credits from a Copilot Chat Debug export (matches GitHub billing)">\\u2B07 Import Real Credits</button>';
   if(!LEDGER||!LEDGER.length){
     el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div><div class="card"><p style="color:var(--vscode-descriptionForeground)">No credit entries yet. Use \\u201cAdd Entry\\u201d to record one.</p></div>';
     return;

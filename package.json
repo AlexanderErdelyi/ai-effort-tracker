@@ -24,6 +24,10 @@
         "title": "AI Effort Tracker: Log Credits Used"
       },
       {
+        "command": "aiEffortTracker.importCredits",
+        "title": "AI Effort Tracker: Import Real Credits from Chat Debug Export"
+      },
+      {
         "command": "aiEffortTracker.logChatTurn",
         "title": "AI Effort Tracker: Log a Chat Turn"
       },
@@ -255,7 +259,12 @@
         "aiEffortTracker.autoCaptureRealCredits": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically capture REAL per-request chat tokens (promptTokens/completionTokens + resolved model) from VS Code's chat session storage and log them to credits (issue #59). Credits are estimated per-model from tokens via aiuRatesOverride, and UPGRADED to the exact AIU cost when the fast poll catches a request's transient copilot_usage.total_nano_aiu before it is compacted away. The GitHub billing import stays the authoritative reconciliation source."
+          "description": "Automatically capture REAL per-request chat tokens (promptTokens/completionTokens + resolved model) from VS Code's chat session storage and log them to credits (issue #59). Credits are estimated per-model from tokens via aiuRatesOverride, and UPGRADED to the exact AIU cost when the fast poll catches a request's transient copilot_usage.total_nano_aiu before it is compacted away. The GitHub billing import stays the authoritative reconciliation source. NOTE: this live estimator is automatically DISABLED when 'creditImportFolder' is set, because exact Chat Debug imports then become the source of truth (exact-only mode)."
+        },
+        "aiEffortTracker.creditImportFolder": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a folder watched for Copilot Chat Debug exports (issue #70). Export the Chat Debug log ('all prompts') as JSON into this folder and the extension auto-imports the EXACT per-request AIU cost (copilot_usage.total_nano_aiu) so credit totals match GitHub billing exactly. Imports are deduped/idempotent per chat turn (by promptId), and a later, more complete export upgrades the value. When this is set, EXACT-ONLY mode is active: the live token-rate estimators are disabled and their estimated 'auto' credit rows are removed so they cannot double-count. Leave blank to use the live estimators instead. Imported credits are attributed to the current branch/work item (re-assignable via the ledger row editor)."
         },
         "aiEffortTracker.aiuRatesOverride": {
           "type": "object",

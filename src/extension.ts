@@ -5,6 +5,7 @@ import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
+import { CreditImportTracker } from './trackers/creditImportTracker';
 import { Database } from './store/database';
 import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
@@ -24,6 +25,7 @@ let gitTracker: GitTracker;
 let copilotTracker: CopilotTracker;
 let chatUsageTracker: ChatUsageTracker;
 let chatSessionUsageTracker: ChatSessionUsageTracker;
+let creditImportTracker: CreditImportTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
@@ -75,6 +77,7 @@ export function activate(context: vscode.ExtensionContext) {
   copilotTracker = new CopilotTracker(db, timeTracker);
   chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
   chatSessionUsageTracker = new ChatSessionUsageTracker(db, timeTracker, context.storageUri);
+  creditImportTracker = new CreditImportTracker(db, timeTracker, () => refreshDashboard());
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
@@ -150,6 +153,41 @@ export function activate(context: vscode.ExtensionContext) {
       void context.globalState.update('lastCreditValue', credits);
       vscode.window.showInformationMessage(
         `Logged ${credits} credits (${model}) on ${branch}.`
+      );
+      refreshDashboard();
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
+      // Import EXACT credits from Copilot Chat Debug export(s) (issue #70). Uses
+      // the configured folder when set; otherwise prompts for file(s).
+      let files: string[];
+      const folder = CreditImportTracker.folder();
+      if (folder && CreditImportTracker.isConfigured()) {
+        files = []; // sentinel: import the whole configured folder
+      } else {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectMany: true,
+          filters: { 'Chat Debug export': ['json'] },
+          openLabel: 'Import credits',
+          title: 'Select Copilot Chat Debug export(s)'
+        });
+        if (!picked || picked.length === 0) return;
+        files = picked.map(u => u.fsPath);
+      }
+      const targets = files.length > 0 ? files : CreditImportTracker.listConfiguredFolderFiles();
+      if (targets.length === 0) {
+        vscode.window.showWarningMessage(
+          folder
+            ? `No .json exports found in credit-import folder: ${folder}`
+            : 'No export files selected.'
+        );
+        return;
+      }
+      const summary = creditImportTracker.importFiles(targets);
+      vscode.window.showInformationMessage(
+        `Imported ${summary.credits.toFixed(1)} exact credits — ${summary.turns} turn(s), ` +
+          `${summary.requests} request(s) from ${summary.files} file(s). ` +
+          `${summary.inserted} new, ${summary.updated} updated` +
+          (summary.purgedAuto > 0 ? `, ${summary.purgedAuto} estimate(s) replaced.` : '.')
       );
       refreshDashboard();
     }),
@@ -279,8 +317,17 @@ export function activate(context: vscode.ExtensionContext) {
   timeTracker.startTracking();
   gitTracker.start(context);
   copilotTracker.start(context);
-  chatUsageTracker.start(context);
-  chatSessionUsageTracker.start(context);
+  // Exact-only reconciliation (issue #70): when a credit-import folder is
+  // configured, exact debug-export imports are the source of truth, so the live
+  // token-rate estimators are NOT started (their estimates would double-count and
+  // undercount agent turns ~5×). Otherwise the estimators run as before.
+  if (CreditImportTracker.isConfigured()) {
+    creditImportTracker.start(context);
+  } else {
+    chatUsageTracker.start(context);
+    chatSessionUsageTracker.start(context);
+  }
+  context.subscriptions.push(chatSessionUsageTracker, creditImportTracker);
 }
 
 export function deactivate() {
