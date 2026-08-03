@@ -113,8 +113,8 @@ export class CreditImportTracker implements vscode.Disposable {
    * Purges estimated `auto` rows afterwards (exact-only), and returns an
    * aggregate summary suitable for a status toast.
    */
-  importFiles(files: string[]): ImportSummary {
-    const branch = this.timeTracker.getBranch();
+  importFiles(files: string[], branchOverride?: string): ImportSummary {
+    const branch = (branchOverride && branchOverride.trim()) || this.timeTracker.getBranch();
     const summary: ImportSummary = {
       files: 0,
       turns: 0,
