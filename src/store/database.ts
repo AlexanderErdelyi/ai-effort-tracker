@@ -2594,6 +2594,73 @@ export class Database {
     return this.getAllWorkItemIds().map(id => this.workItems[id]);
   }
 
+  /**
+   * Count what {@link deleteWorkItem} would detach, WITHOUT mutating anything, so
+   * the UI can confirm the impact before removing the entity. Synthetic buckets
+   * (`__unassigned__`, `unknown`) and unknown ids report all zeros.
+   */
+  workItemDeletionImpact(
+    id: string
+  ): { branches: number; ledger: number; manualEffort: number; timeEntries: number } {
+    if (id === UNASSIGNED_WORK_ITEM_ID || id === 'unknown' || !this.workItems[id]) {
+      return { branches: 0, ledger: 0, manualEffort: 0, timeEntries: 0 };
+    }
+    return {
+      branches: Object.keys(this.store).filter(b => this.store[b].workItemId === id).length,
+      ledger: this.creditLedger.filter(e => (e.workItemId ?? null) === id).length,
+      manualEffort: this.manualEffort.filter(m => m.workItemId === id).length,
+      timeEntries: this.timeEntries.filter(t => (t.workItemId ?? null) === id).length
+    };
+  }
+
+  /**
+   * Delete a work item entity the user created by mistake. ZERO-LOSS: any branch,
+   * credit-ledger row, manual-effort correction or work-item-direct time-log entry
+   * that pointed at this work item is DETACHED to the synthetic `__unassigned__`
+   * bucket (derived project cleared) rather than destroyed, so its recorded
+   * effort/credits stay visible under "Unassigned" and can be re-homed later.
+   * Detached branches are marked a sticky manual override so live git
+   * auto-detection cannot immediately re-create the very work item just removed.
+   * Synthetic buckets and unknown ids can never be deleted (returns removed:false).
+   * Reassignment audit rows are left intact as history. Persists via {@link save}.
+   */
+  deleteWorkItem(
+    id: string
+  ): { removed: boolean; branches: number; ledger: number; manualEffort: number; timeEntries: number } {
+    const impact = this.workItemDeletionImpact(id);
+    if (id === UNASSIGNED_WORK_ITEM_ID || id === 'unknown' || !this.workItems[id]) {
+      return { removed: false, ...impact };
+    }
+    // Detach branches -> unassigned, sticky so auto-detect won't re-create `id`.
+    for (const b of Object.keys(this.store)) {
+      if (this.store[b].workItemId === id) {
+        this.store[b].workItemId = UNASSIGNED_WORK_ITEM_ID;
+        this.store[b].workItemIdManual = true;
+      }
+    }
+    // Detach ledger rows -> unassigned, clearing the derived project.
+    for (const e of this.creditLedger) {
+      if ((e.workItemId ?? null) === id) {
+        e.workItemId = UNASSIGNED_WORK_ITEM_ID;
+        e.projectId = null;
+      }
+    }
+    // Detach manual-effort corrections.
+    for (const m of this.manualEffort) {
+      if (m.workItemId === id) m.workItemId = UNASSIGNED_WORK_ITEM_ID;
+    }
+    // Detach work-item-direct time entries (branch-scoped ones follow their branch).
+    for (const t of this.timeEntries) {
+      if ((t.workItemId ?? null) === id) {
+        t.workItemId = UNASSIGNED_WORK_ITEM_ID;
+        t.projectId = undefined;
+      }
+    }
+    delete this.workItems[id];
+    this.save();
+    return { removed: true, ...impact };
+  }
+
   /** Branch names that currently roll up into the given work item. */
   private getBranchesForWorkItem(workItemId: string): string[] {
     return Object.keys(this.store)
