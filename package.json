@@ -2,12 +2,24 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "publisher": "AlexanderErdelyi",
-  "engines": { "vscode": "^1.90.0" },
-  "categories": ["Other"],
-  "keywords": ["copilot", "productivity", "time-tracking", "ai", "metrics"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "productivity",
+    "time-tracking",
+    "ai",
+    "metrics"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -271,8 +283,12 @@
           "additionalProperties": {
             "type": "object",
             "properties": {
-              "inputNanoAiuPerToken": { "type": "number" },
-              "outputNanoAiuPerToken": { "type": "number" }
+              "inputNanoAiuPerToken": {
+                "type": "number"
+              },
+              "outputNanoAiuPerToken": {
+                "type": "number"
+              }
             }
           },
           "default": {},
@@ -285,7 +301,9 @@
         },
         "aiEffortTracker.premiumRequestMultipliers": {
           "type": "object",
-          "additionalProperties": { "type": "number" },
+          "additionalProperties": {
+            "type": "number"
+          },
           "default": {
             "gpt-4o-mini": 0,
             "gpt-4.1": 0,
@@ -329,7 +347,14 @@
           "markdownDescription": "Categorize files by extension. Keys may be `al`, `.al`, or `*.al`; values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. These override the built-in defaults.",
           "additionalProperties": {
             "type": "string",
-            "enum": ["programming", "specification", "documentation", "deployment", "config", "other"]
+            "enum": [
+              "programming",
+              "specification",
+              "documentation",
+              "deployment",
+              "config",
+              "other"
+            ]
           }
         },
         "aiEffortTracker.categoryRules.folders": {
@@ -338,7 +363,14 @@
           "markdownDescription": "Categorize files by folder/path. Keys are folder names or glob patterns (e.g. `docs`, `src/specs`, `**/deploy/**`); values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. Folder rules take precedence over extension rules.",
           "additionalProperties": {
             "type": "string",
-            "enum": ["programming", "specification", "documentation", "deployment", "config", "other"]
+            "enum": [
+              "programming",
+              "specification",
+              "documentation",
+              "deployment",
+              "config",
+              "other"
+            ]
           }
         }
       }
