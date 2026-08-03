@@ -673,11 +673,83 @@ function renderLedger(){
     var note=e.note?esc(e.note):'';
     var sc=e.source==='manual'?'bh':(e.source==='auto'?'ba':'bp');
     var src='<span class="badge '+sc+'">'+esc(e.source)+'</span>';
-    return'<tr><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td>'+Number(e.credits).toFixed(1)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap"><button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
+    var dbtn=e.analysis?'<button class="dtab" data-action="ledDetail" data-id="'+esc(e.id)+'" title="Deep analysis \\u2014 lines, tools, token cost">\\uD83D\\uDD0D</button> ':'';
+    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td>'+Number(e.credits).toFixed(1)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
   el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'
     +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.</p>'
     +'<div class="card"><table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+}
+
+// Deep credit analysis drill-down (issue #74). Toggles an expandable detail row
+// under a ledger entry, rendered entirely client-side from the analysis already
+// embedded on the LEDGER entry (no round-trip). Shows per-file line impact, tool
+// usage, and per-tier token cost so the user can spot optimization potential.
+function ledBase(p){if(!p)return'';var i=Math.max(p.lastIndexOf('/'),p.lastIndexOf('\\\\'));return i>=0?p.slice(i+1):p;}
+function ledTierRow(label,tokens,credits,total,hint){
+  var pct=total>0?((credits/total)*100):0;
+  return'<tr><td>'+label+'</td><td class="dc">'+tokens.toLocaleString()+'</td><td class="dc">'+credits.toFixed(2)+'</td><td class="dc">'+pct.toFixed(0)+'%</td><td style="font-size:.82em;color:var(--vscode-descriptionForeground)">'+hint+'</td></tr>';
+}
+function toggleLedgerDetail(id){
+  var existing=document.getElementById('led-detail-'+id);
+  if(existing){existing.parentNode.removeChild(existing);return;}
+  var row=document.getElementById('led-'+id);
+  if(!row)return;
+  var e=LEDGER.find(function(x){return String(x.id)===String(id);});
+  if(!e||!e.analysis){return;}
+  var an=e.analysis;
+  var tc=an.tierCredits||{input:0,cacheRead:0,cacheWrite:0,output:0};
+  var tt=an.tiers||{input:0,cacheRead:0,cacheWrite:0,output:0};
+  var credTotal=(tc.input||0)+(tc.cacheRead||0)+(tc.cacheWrite||0)+(tc.output||0);
+  var netLines=(an.totalAdded||0)-(an.totalRemoved||0);
+  // Token-efficiency insight
+  var freshPct=credTotal>0?((tc.input||0)/credTotal*100):0;
+  var cachePct=credTotal>0?((tc.cacheRead||0)/credTotal*100):0;
+  var outPct=credTotal>0?((tc.output||0)/credTotal*100):0;
+  var tip;
+  if(freshPct>=55)tip='\\u26A0\\uFE0F '+freshPct.toFixed(0)+'% of credits went to <strong>fresh input</strong> (uncached context). Trimming attached files / shorter context, or reusing the same session, would cut cost the most.';
+  else if(cachePct>=40)tip='\\u2705 '+cachePct.toFixed(0)+'% of credits were <strong>cache reads</strong> (10\\u00D7 cheaper) \\u2014 good context reuse.';
+  else if(outPct>=55)tip='\\uD83D\\uDCA1 '+outPct.toFixed(0)+'% of credits were <strong>output</strong> generation. Cost is driven by how much the model wrote, not context \\u2014 expected for large edits.';
+  else tip='Balanced input/output profile.';
+  var tiersTbl='<table style="margin:4px 0"><thead><tr><th>Token tier</th><th class="dc">Tokens</th><th class="dc">Credits</th><th class="dc">% cost</th><th>\\u00A0</th></tr></thead><tbody>'
+    +ledTierRow('Fresh input',tt.input||0,tc.input||0,credTotal,'new context (most expensive/token)')
+    +ledTierRow('Cache read',tt.cacheRead||0,tc.cacheRead||0,credTotal,'reused context (10\\u00D7 cheaper)')
+    +ledTierRow('Cache write',tt.cacheWrite||0,tc.cacheWrite||0,credTotal,'storing context for reuse')
+    +ledTierRow('Output',tt.output||0,tc.output||0,credTotal,'model-generated tokens')
+    +'</tbody></table>';
+  var files=(an.files||[]).slice().sort(function(a,b){return(b.added+b.removed)-(a.added+a.removed);});
+  var fileRows=files.map(function(f){
+    var cat=f.category?'<span class="badge bp">'+esc(CAT[f.category]||f.category)+'</span>':'\\u2014';
+    var cr=f.created?' <span class="badge ba">new</span>':'';
+    return'<tr><td style="font-family:monospace;font-size:.85em" title="'+esc(f.path)+'">'+esc(ledBase(f.path))+cr+'</td><td>'+cat+'</td><td class="dc"><span style="color:var(--added)">+'+f.added+'</span></td><td class="dc"><span style="color:var(--deleted)">-'+f.removed+'</span></td><td class="dc">'+f.edits+'</td></tr>';
+  }).join('')||'<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No file edits in this turn (read/search-only)</td></tr>';
+  var filesTbl='<table style="margin:4px 0"><thead><tr><th>File</th><th>Category</th><th class="dc">+Added</th><th class="dc">-Removed</th><th class="dc">Edits</th></tr></thead><tbody>'+fileRows+'</tbody></table>';
+  var tools=(an.tools||[]).slice().sort(function(a,b){return b.count-a.count;});
+  var toolChips=tools.map(function(x){return'<span class="badge bp" style="margin:2px">'+esc(x.name)+' \\u00D7'+x.count+'</span>';}).join('')||'<span style="color:var(--vscode-descriptionForeground)">none</span>';
+  // Efficiency ratios
+  var perNet=netLines>0?(e.credits/netLines):null;
+  var effHtml='<div style="display:flex;gap:18px;flex-wrap:wrap;margin:8px 0;font-size:.88em">'
+    +'<span>\\uD83E\\uDDFE <strong>'+Number(e.credits).toFixed(2)+'</strong> credits</span>'
+    +'<span>\\u270F\\uFE0F net <strong style="color:var(--added)">'+(netLines>=0?'+':'')+netLines+'</strong> lines ('+(an.totalAdded||0)+' added / '+(an.totalRemoved||0)+' removed)</span>'
+    +(perNet!=null?'<span>\\u2696\\uFE0F <strong>'+perNet.toFixed(2)+'</strong> credits / net line</span>':'')
+    +'<span>\\uD83D\\uDD27 <strong>'+(an.toolCalls||0)+'</strong> tool calls</span>'
+    +(an.durationMs?'<span>\\u23F1 <strong>'+fmt(an.durationMs)+'</strong> model time</span>':'')
+    +'</div>';
+  var html='<td colspan="8" style="background:var(--vscode-editor-inactiveSelectionBackground);padding:12px 16px">'
+    +'<div style="font-weight:600;margin-bottom:4px">\\uD83D\\uDD0D Deep analysis</div>'
+    +effHtml
+    +'<div style="background:var(--vscode-editorWidget-background,rgba(128,128,128,.08));border-left:3px solid var(--ai);padding:6px 10px;border-radius:4px;margin:6px 0;font-size:.88em">'+tip+'</div>'
+    +'<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start">'
+    +'<div style="flex:1;min-width:320px"><div style="font-weight:600;font-size:.9em;margin:6px 0 2px">Token cost breakdown</div>'+tiersTbl+'</div>'
+    +'<div style="flex:1;min-width:320px"><div style="font-weight:600;font-size:.9em;margin:6px 0 2px">Files changed</div>'+filesTbl+'</div>'
+    +'</div>'
+    +'<div style="font-weight:600;font-size:.9em;margin:8px 0 4px">Tools used</div><div>'+toolChips+'</div>'
+    +'</td>';
+  var tr=document.createElement('tr');
+  tr.id='led-detail-'+id;
+  tr.innerHTML=html;
+  if(row.nextSibling)row.parentNode.insertBefore(tr,row.nextSibling);
+  else row.parentNode.appendChild(tr);
 }
 
 // Remembers which detail sub-tab (insights/time/lines/types) the user is viewing so the
@@ -824,6 +896,7 @@ document.addEventListener('click',function(e){
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
   else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
+  else if(a==='ledDetail')toggleLedgerDetail(t.dataset.id);
   else if(a==='meAdd')vscode.postMessage({type:'cmd',value:'addManualEffort',arg:t.dataset.id});
   else if(a==='meEdit')vscode.postMessage({type:'cmd',value:'editManualEffort',arg:t.dataset.id});
   else if(a==='meDel')vscode.postMessage({type:'cmd',value:'deleteManualEffort',arg:t.dataset.id});

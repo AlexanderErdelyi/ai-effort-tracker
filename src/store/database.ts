@@ -15,6 +15,7 @@ import {
   type RoiFigures,
   type GeneratedValue
 } from '../util/rates';
+import type { TurnAnalysis } from '../util/debugExport';
 
 export interface LineStats {
   added: number;
@@ -137,6 +138,13 @@ export interface LedgerEntry {
    * same requestId in place (never a second row).
    */
   exact?: boolean;
+  /**
+   * Compact, code-free deep-analysis of an IMPORTED chat turn (issue #74): per-file
+   * line counts, tool histogram, and per-request token tiers. Present only on
+   * `source:'import'` rows that carried a debug export. Optional and additive —
+   * pre-#74 rows lack it and load as `undefined`, so no migration is needed.
+   */
+  analysis?: TurnAnalysis;
 }
 
 /**
@@ -2042,6 +2050,7 @@ export class Database {
       promptTokens?: number;
       completionTokens?: number;
       requests?: number;
+      analysis?: TurnAnalysis;
     }
   ): { inserted: boolean } {
     const safeCredits = Number.isFinite(credits) && credits >= 0 ? credits : 0;
@@ -2052,6 +2061,7 @@ export class Database {
       existing.credits = safeCredits;
       if (opts.promptTokens !== undefined) existing.promptTokens = opts.promptTokens;
       if (opts.completionTokens !== undefined) existing.completionTokens = opts.completionTokens;
+      if (opts.analysis !== undefined) existing.analysis = opts.analysis;
       existing.exact = true;
       this.save();
       return { inserted: false };
@@ -2060,6 +2070,7 @@ export class Database {
     const entry = this.appendLedger(branch, model, safeCredits, 'import', note);
     if (opts.promptTokens !== undefined) entry.promptTokens = opts.promptTokens;
     if (opts.completionTokens !== undefined) entry.completionTokens = opts.completionTokens;
+    if (opts.analysis !== undefined) entry.analysis = opts.analysis;
     entry.exact = true;
     this.save();
     return { inserted: true };
