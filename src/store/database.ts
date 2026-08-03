@@ -2013,6 +2013,74 @@ export class Database {
   }
 
   /**
+   * Record the EXACT AIU cost of one chat turn imported from a Copilot Chat Debug
+   * export (issue #70). Unlike {@link recordAutoChatUsage} (a token-rate estimate
+   * tailed live from `chatSessions/*.jsonl`), this stores the authoritative
+   * `copilot_usage.total_nano_aiu` summed across the turn's internal model
+   * requests, so credit totals match GitHub billing exactly.
+   *
+   * Idempotency & upgrade: the row is upserted by its `import:debug:<promptId>`
+   * note. Re-importing the same export (or a periodic "export all" that re-covers
+   * the turn) updates the SAME row in place — never a second entry, never a double
+   * count. A later, MORE COMPLETE export (more requests captured for a turn that
+   * was mid-flight when first exported) simply raises the value. Rows are always
+   * marked `exact` and use `source:'import'`, a distinct namespace from the `auto`
+   * estimators, so the "exact-only" reconciliation ({@link purgeAutoLedger}) can
+   * drop estimates without touching imports or manual entries.
+   *
+   * Attribution (`branch`/`workItemId`/`projectId`) is resolved at import time via
+   * {@link appendLedger} — identical to manual credit logging — so imported
+   * credits flow straight into the existing credits→ROI roll-ups. Defensive:
+   * `credits` is clamped finite/non-negative (never NaN).
+   */
+  recordImportedUsage(
+    branch: string,
+    model: string,
+    credits: number,
+    opts: {
+      promptId: string;
+      promptTokens?: number;
+      completionTokens?: number;
+      requests?: number;
+    }
+  ): { inserted: boolean } {
+    const safeCredits = Number.isFinite(credits) && credits >= 0 ? credits : 0;
+    const note = `import:debug:${opts.promptId}`;
+    const existing = this.creditLedger.find(e => e.source === 'import' && e.note === note);
+    if (existing) {
+      existing.model = model;
+      existing.credits = safeCredits;
+      if (opts.promptTokens !== undefined) existing.promptTokens = opts.promptTokens;
+      if (opts.completionTokens !== undefined) existing.completionTokens = opts.completionTokens;
+      existing.exact = true;
+      this.save();
+      return { inserted: false };
+    }
+    this.ensureBranch(branch);
+    const entry = this.appendLedger(branch, model, safeCredits, 'import', note);
+    if (opts.promptTokens !== undefined) entry.promptTokens = opts.promptTokens;
+    if (opts.completionTokens !== undefined) entry.completionTokens = opts.completionTokens;
+    entry.exact = true;
+    this.save();
+    return { inserted: true };
+  }
+
+  /**
+   * Remove every ESTIMATED `source:'auto'` credit row (issue #70, exact-only
+   * mode). Called when exact debug-export imports become the source of truth, so
+   * the inaccurate live estimates can never double-count against the exact values.
+   * Leaves `manual` and `import` rows untouched. Returns the number of rows
+   * removed. Totals/ROI recompute automatically (they derive from the ledger).
+   */
+  purgeAutoLedger(): number {
+    const before = this.creditLedger.length;
+    this.creditLedger = this.creditLedger.filter(e => e.source !== 'auto');
+    const removed = before - this.creditLedger.length;
+    if (removed > 0) this.save();
+    return removed;
+  }
+
+  /**
    * Edit an existing ledger row in place (issue #19 — manual correction). Only
    * the fields present in `patch` are changed; everything else (id, source,
    * branch, chatSessionId) is preserved so the row's identity and provenance

@@ -42,6 +42,25 @@ export interface AiuRate {
 export const NANO_PER_AIU = 1_000_000_000;
 
 /**
+ * The REAL per-token nano-AIU rates for claude-opus-4.8, read verbatim from a
+ * Copilot Chat Debug export's `copilot_usage.token_details[]` (issue #70). Note
+ * the FOUR tiers — the live token-rate estimate (which only sees a flat
+ * prompt/completion split) cannot distinguish these, which is a second reason it
+ * is inaccurate and why exact import is preferred:
+ *   - `input`       500,000  (uncached prompt tokens)
+ *   - `cache_read`   50,000  (10× cheaper than input)
+ *   - `cache_write` 625,000  (1.25× input)
+ *   - `output`    2,500,000  (5× input)
+ * Kept as documentation + a future-proofing anchor for a cache-aware estimator.
+ */
+export const COPILOT_TOKEN_TIER_NANO_AIU = {
+  input: 500_000,
+  cache_read: 50_000,
+  cache_write: 625_000,
+  output: 2_500_000
+} as const;
+
+/**
  * Model-family → rate map (nano-AIU per token). Keys are lowercase family stems
  * matched by substring against a normalized model id (longest key wins). Edit
  * freely; unknown models fall back to {@link FALLBACK_AIU_RATE}. Numbers are
