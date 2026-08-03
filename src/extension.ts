@@ -202,6 +202,11 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.reassignBranchesBulk', (workItemId?: string) =>
       reassignBranchesBulk(workItemId)
     ),
+    // Delete a work item created by mistake (zero-loss: attached branches/credits/
+    // effort move to "Unassigned"). Invoked from the work-item detail or palette.
+    vscode.commands.registerCommand('aiEffortTracker.deleteWorkItem', (workItemId?: string) =>
+      deleteWorkItemCmd(workItemId)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.setWorkItemEstimate', (workItemId?: string) =>
       setWorkItemEstimate(workItemId)
     ),
@@ -1344,6 +1349,47 @@ async function deleteLedgerEntry(id?: string) {
   if (db.deleteLedgerEntry(entry.id)) {
     vscode.window.showInformationMessage('Credit entry deleted.');
     refreshDashboard();
+  }
+}
+
+/**
+ * Delete a work item the user created by mistake (zero-loss). Confirms the detach
+ * impact first, then removes the entity — its branches, credit entries, manual
+ * effort and work-item-direct time entries move to "Unassigned" (nothing is
+ * destroyed) and can be re-homed afterwards. Invoked from the work-item detail
+ * (passes the id) or the command palette (prompts for one).
+ */
+async function deleteWorkItemCmd(workItemId?: string) {
+  const id = workItemId ?? await pickWorkItem('Delete which work item?');
+  if (!id) return;
+  const wi = db.getWorkItem(id);
+  if (!wi) {
+    vscode.window.showWarningMessage(`Work item #${id} not found.`);
+    return;
+  }
+  const imp = db.workItemDeletionImpact(id);
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  const parts: string[] = [];
+  if (imp.branches) parts.push(plural(imp.branches, 'branch', 'branches'));
+  if (imp.ledger) parts.push(plural(imp.ledger, 'credit entry', 'credit entries'));
+  if (imp.manualEffort) parts.push(plural(imp.manualEffort, 'manual-effort entry', 'manual-effort entries'));
+  if (imp.timeEntries) parts.push(plural(imp.timeEntries, 'time-log entry', 'time-log entries'));
+  const detail = parts.length
+    ? `\n\nIts ${parts.join(', ')} will move to "Unassigned" (nothing is deleted) \u2014 you can re-assign them afterwards.`
+    : '\n\nIt has no attached data.';
+  const label = wi.title ? `#${id} \u2014 ${wi.title}` : `#${id}`;
+  const ok = await vscode.window.showWarningMessage(
+    `Delete work item ${label}?${detail}`,
+    { modal: true },
+    'Delete'
+  );
+  if (ok !== 'Delete') return;
+  const res = db.deleteWorkItem(id);
+  if (res.removed) {
+    vscode.window.showInformationMessage(`Work item #${id} deleted.`);
+    refreshDashboard();
+  } else {
+    vscode.window.showWarningMessage(`Work item #${id} could not be deleted.`);
   }
 }
 
