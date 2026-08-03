@@ -156,7 +156,7 @@ export function activate(context: vscode.ExtensionContext) {
       );
       refreshDashboard();
     }),
-    vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
+    vscode.commands.registerCommand('aiEffortTracker.importRealCredits', async () => {
       // Import EXACT credits from Copilot Chat Debug export(s) (issue #70). Uses
       // the configured folder when set; otherwise prompts for file(s).
       let files: string[];
@@ -182,9 +182,10 @@ export function activate(context: vscode.ExtensionContext) {
         );
         return;
       }
-      const summary = creditImportTracker.importFiles(targets);
+      const branch = (await GitTracker.getCurrentBranch()) ?? timeTracker.getBranch();
+      const summary = creditImportTracker.importFiles(targets, branch);
       vscode.window.showInformationMessage(
-        `Imported ${summary.credits.toFixed(1)} exact credits — ${summary.turns} turn(s), ` +
+        `Imported ${summary.credits.toFixed(1)} exact credits to "${branch}" — ${summary.turns} turn(s), ` +
           `${summary.requests} request(s) from ${summary.files} file(s). ` +
           `${summary.inserted} new, ${summary.updated} updated` +
           (summary.purgedAuto > 0 ? `, ${summary.purgedAuto} estimate(s) replaced.` : '.')
