@@ -5,11 +5,23 @@ import { getFileExt } from '../util/fileTypes';
 
 export class CopilotTracker implements vscode.Disposable {
   private disposables: vscode.Disposable[] = [];
+  private documentLines = new Map<string, string[]>();
 
   constructor(private db: Database, private timeTracker: TimeTracker) {}
 
   start(_context: vscode.ExtensionContext) {
+    for (const doc of vscode.workspace.textDocuments) {
+      if (doc.uri.scheme === 'file' || doc.uri.scheme === 'untitled') {
+        this.documentLines.set(doc.uri.toString(), doc.getText().split(/\r?\n/));
+      }
+    }
     this.disposables.push(
+      vscode.workspace.onDidOpenTextDocument(doc => {
+        if (doc.uri.scheme === 'file' || doc.uri.scheme === 'untitled') {
+          this.documentLines.set(doc.uri.toString(), doc.getText().split(/\r?\n/));
+        }
+      }),
+      vscode.workspace.onDidCloseTextDocument(doc => this.documentLines.delete(doc.uri.toString())),
       vscode.workspace.onDidChangeTextDocument(event => this.onDocChange(event))
     );
   }
@@ -59,11 +71,19 @@ export class CopilotTracker implements vscode.Disposable {
     // even a small edit is attributed to AI, so AI-inserted lines stay AI.
     const source: 'human' | 'ai' =
       looksHandTyped && mode !== 'aiGenerating' ? 'human' : 'ai';
+    const key = event.document.uri.toString();
+    const before = this.documentLines.get(key);
+    const after = event.document.getText().split(/\r?\n/);
+    this.documentLines.set(key, after);
 
+    const relPath = vscode.workspace.asRelativePath(event.document.uri, false);
     if (insertedLines > 0 || deletedLines > 0) {
-      const relPath = vscode.workspace.asRelativePath(event.document.uri, false);
       this.db.recordLineChange(branch, ext, source, insertedLines, deletedLines, relPath);
     }
+    if (before) {
+      this.db.recordEffectiveLines(branch, relPath, source, meaningfulLineVersions(before, after));
+    }
+
     if (insertedChars > 0) {
       this.db.recordChars(branch, source, insertedChars);
     }
@@ -96,6 +116,7 @@ export class CopilotTracker implements vscode.Disposable {
         typed += change.text.length;
       }
     }
+
     if (typed > 0) {
       this.db.recordChatChars(this.timeTracker.getBranch(), typed);
       this.timeTracker.markEdit('human');
@@ -105,4 +126,19 @@ export class CopilotTracker implements vscode.Disposable {
   dispose() {
     this.disposables.forEach(d => d.dispose());
   }
+}
+
+/**
+ * Count meaningful line versions between two document states. Common prefix and
+ * suffix lines are ignored, so a whole-file rewrite that preserves 100 lines and
+ * adds one counts as one. A later delete or replacement counts as another version.
+ */
+export function meaningfulLineVersions(before: string[], after: string[]): number {
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start++;
+  let bi = before.length - 1, ai = after.length - 1;
+  while (bi >= start && ai >= start && before[bi] === after[ai]) { bi--; ai--; }
+  const removed = Math.max(0, bi - start + 1);
+  const added = Math.max(0, ai - start + 1);
+  return removed + added;
 }

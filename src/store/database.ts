@@ -54,6 +54,10 @@ export interface BranchSummary {
   linesHumanDeleted: number;
   linesAiAdded: number;
   linesAiDeleted: number;
+  /** Canonical meaningful line versions used by productivity and value math. */
+  effectiveLinesHuman: number;
+  effectiveLinesAi: number;
+  effectiveByCategory: Record<string, { human: number; ai: number }>;
   copilotAcceptances: number;
   estimatedCostUsd: number;
   chatCharsHuman: number;
@@ -399,6 +403,9 @@ export interface FileStat {
   aiDeleted: number;
   edits: number;
   lastTs: number;
+  /** Canonical meaningful line versions, excluding unchanged rewrite churn. */
+  effectiveHuman?: number;
+  effectiveAi?: number;
 }
 
 /** A completed uninterrupted focus/flow session. */
@@ -500,6 +507,10 @@ interface BranchData {
   daily?: Record<string, DailyBucket>;
   focusSessions?: FocusSession[];
   files?: Record<string, FileStat>;
+  /** Effective lines by category/source. Compact counters only; no file contents. */
+  effectiveLines?: Record<string, { human: number; ai: number }>;
+  /** Frozen pre-v11 added-line baseline retained when effective tracking starts. */
+  effectiveLegacyBaseline?: Record<string, { human: number; ai: number }>;
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
@@ -675,6 +686,10 @@ export interface WorkItemSummary {
   linesHumanDeleted: number;
   linesAiAdded: number;
   linesAiDeleted: number;
+  /** Canonical meaningful line versions used by productivity and value math. */
+  effectiveLinesHuman: number;
+  effectiveLinesAi: number;
+  effectiveByCategory: Record<string, { human: number; ai: number }>;
   copilotAcceptances: number;
   estimatedCostUsd: number;
   chatCharsHuman: number;
@@ -708,7 +723,7 @@ export interface WorkItemSummary {
   roi: RoiFigures;
   /**
    * The monetary VALUE OF GENERATED LINES for this work item (issue #48): its
-   * rolled-up added lines (human + AI) expressed as equivalent authoring hours at
+   * rolled-up effective lines expressed as equivalent authoring hours at
    * the global baseline speed, and what that time is worth at the project's
    * effective sell rate + currency. `generatedValue` is `null` when the sell rate
    * (or baseline) is unconfigured — never NaN — and `equivalentHours` doubles as
@@ -855,8 +870,12 @@ export interface ProjectRoi extends RoiFigures {
  * {@link sanitizeTimeEntries}, exactly as `manualEffort`/`reassignments` are
  * defaulted/sanitized, so a v9 → v10 load is a pure, idempotent, zero-loss
  * upgrade that never NaNs and never loses data.
+ *
+ * v11 adds compact per-branch effective-line counters. Existing branches fall
+ * back to their historical added-line totals until a new effective counter is
+ * recorded. No snapshots or source contents are persisted.
  */
-export const CURRENT_SCHEMA_VERSION = 10;
+export const CURRENT_SCHEMA_VERSION = 11;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -1386,6 +1405,8 @@ export function mergeManualRollup(target: BranchRollup, m: ManualRollup): void {
   target.linesHumanDeleted += m.linesHumanDeleted;
   target.linesAiAdded += m.linesAiAdded;
   target.linesAiDeleted += m.linesAiDeleted;
+  target.effectiveLinesHuman += m.linesHumanAdded + m.linesHumanDeleted;
+  target.effectiveLinesAi += m.linesAiAdded + m.linesAiDeleted;
   // Keep the AI-line cost estimate consistent with the folded-in AI lines.
   target.estimatedCostUsd += m.linesAiAdded * COST_PER_AI_LINE_USD;
   for (const cat of Object.keys(m.byCategory)) {
@@ -1397,6 +1418,9 @@ export function mergeManualRollup(target: BranchRollup, m: ManualRollup): void {
     dst.human.deleted += src.human.deleted;
     dst.ai.added += src.ai.added;
     dst.ai.deleted += src.ai.deleted;
+    const eff = (target.effectiveByCategory[cat] ??= { human: 0, ai: 0 });
+    eff.human += src.human.added + src.human.deleted;
+    eff.ai += src.ai.added + src.ai.deleted;
   }
 }
 
@@ -1498,6 +1522,7 @@ export function rollupBranchSummaries(summaries: BranchSummary[]): BranchRollup 
   const t: BranchRollup = {
     humanCodingMs: 0, aiGeneratingMs: 0, reviewingMs: 0, idleMs: 0,
     linesHumanAdded: 0, linesHumanDeleted: 0, linesAiAdded: 0, linesAiDeleted: 0,
+    effectiveLinesHuman: 0, effectiveLinesAi: 0, effectiveByCategory: {},
     copilotAcceptances: 0, estimatedCostUsd: 0, chatCharsHuman: 0, chatTurnsHuman: 0,
     humanChars: 0, aiChars: 0, humanKeystrokes: 0, aiInserts: 0,
     aiInlineLines: 0, aiChatLines: 0, aiInlineChars: 0, aiChatChars: 0,
@@ -1513,6 +1538,13 @@ export function rollupBranchSummaries(summaries: BranchSummary[]): BranchRollup 
     t.linesHumanDeleted += s.linesHumanDeleted;
     t.linesAiAdded += s.linesAiAdded;
     t.linesAiDeleted += s.linesAiDeleted;
+    t.effectiveLinesHuman += s.effectiveLinesHuman;
+    t.effectiveLinesAi += s.effectiveLinesAi;
+    for (const [cat, src] of Object.entries(s.effectiveByCategory)) {
+      const dst = (t.effectiveByCategory[cat] ??= { human: 0, ai: 0 });
+      dst.human += src.human;
+      dst.ai += src.ai;
+    }
     t.copilotAcceptances += s.copilotAcceptances;
     t.estimatedCostUsd += s.estimatedCostUsd;
     t.chatCharsHuman += s.chatCharsHuman;
@@ -1862,6 +1894,54 @@ export class Database {
       else { f.humanAdded += linesAdded; f.humanDeleted += linesDeleted; }
       f.edits += 1;
       f.lastTs = Date.now();
+    }
+    this.save();
+  }
+
+  /**
+   * Record meaningful line versions after the editor tracker has removed unchanged
+   * rewrite noise. These compact counters are the canonical productivity measure;
+   * raw added/deleted churn remains stored separately for diagnostics.
+   */
+  recordEffectiveLines(
+    branch: string,
+    filePath: string,
+    source: 'human' | 'ai',
+    count: number
+  ): void {
+    if (!Number.isFinite(count) || count <= 0) return;
+    const data = this.ensureBranch(branch);
+    const { categorize } = require('../util/fileTypes') as typeof import('../util/fileTypes');
+    const category = categorize(filePath);
+    if (!data.effectiveLegacyBaseline) {
+      data.effectiveLegacyBaseline = {};
+      const { categorizeExt, ALL_CATEGORIES } = require('../util/fileTypes') as typeof import('../util/fileTypes');
+      for (const cat of ALL_CATEGORIES) data.effectiveLegacyBaseline[cat] = { human: 0, ai: 0 };
+      for (const [ext, stats] of Object.entries(data.lineChanges)) {
+        const b = data.effectiveLegacyBaseline[categorizeExt(ext)];
+        b.human += stats.human.added;
+        b.ai += stats.ai.added;
+      }
+    }
+    if (!data.effectiveLines) data.effectiveLines = {};
+    const bucket = (data.effectiveLines[category] ??= { human: 0, ai: 0 });
+    bucket[source] += count;
+
+    if (!data.files) data.files = {};
+    const f = (data.files[filePath] ??= {
+      humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: 0
+    });
+    if (source === 'ai') f.effectiveAi = (f.effectiveAi ?? 0) + count;
+    else f.effectiveHuman = (f.effectiveHuman ?? 0) + count;
+    f.lastTs = Date.now();
+
+    // Keep per-file diagnostic state bounded. Category totals are retained.
+    const entries = Object.entries(data.files);
+    if (entries.length > 2000) {
+      entries
+        .sort((a, b) => (b[1].lastTs ?? 0) - (a[1].lastTs ?? 0))
+        .slice(2000)
+        .forEach(([p]) => delete data.files![p]);
     }
     this.save();
   }
@@ -2780,7 +2860,7 @@ export class Database {
     // equivalentHours doubles as the suggested billable-hours input. Shares the
     // same effective-rate source as `roi`; null (never NaN) when a rate is unset.
     const generated = computeGeneratedValue({
-      linesAdded: rollup.linesHumanAdded + rollup.linesAiAdded,
+      linesAdded: rollup.effectiveLinesHuman + rollup.effectiveLinesAi,
       baselineLocPerMinute: this.readBaselineLocPerMinute(),
       sellRate: roi.hourlySellRate
     });
@@ -2947,8 +3027,8 @@ export class Database {
     const total = workItemTotalEstimate(wi);
     const rows: EstimateActualRow[] = ALL_CATEGORIES.map(cat => {
       const est = breakdown && typeof breakdown[cat] === 'number' ? breakdown[cat]! : 0;
-      const bucket = summary.byCategory[cat];
-      const actual = bucket ? bucket.human.added + bucket.ai.added : 0;
+      const bucket = summary.effectiveByCategory[cat];
+      const actual = bucket ? bucket.human + bucket.ai : 0;
       return { category: cat, estimate: est, actual };
     });
     return {
@@ -3005,6 +3085,31 @@ export class Database {
     }
 
     const creditTotals = this.getCreditsForBranch(branch);
+    const effectiveByCategory: Record<string, { human: number; ai: number }> = {};
+    let effectiveLinesHuman = 0, effectiveLinesAi = 0;
+    for (const cat of ALL_CATEGORIES as string[]) {
+      const current = data.effectiveLines?.[cat] ?? { human: 0, ai: 0 };
+      const legacy = data.effectiveLegacyBaseline?.[cat] ?? { human: 0, ai: 0 };
+      effectiveByCategory[cat] = {
+        human: legacy.human + current.human,
+        ai: legacy.ai + current.ai
+      };
+      effectiveLinesHuman += legacy.human + current.human;
+      effectiveLinesAi += legacy.ai + current.ai;
+    }
+    // Pre-v11 data has no effective counters. Preserve historical behavior until
+    // new edits establish the canonical metric instead of making value disappear.
+    if (!data.effectiveLines) {
+      effectiveLinesHuman = linesHumanAdded;
+      effectiveLinesAi = linesAiAdded;
+      for (const cat of ALL_CATEGORIES as string[]) {
+        const src = byCategory[cat];
+        effectiveByCategory[cat] = {
+          human: src?.human.added ?? 0,
+          ai: src?.ai.added ?? 0
+        };
+      }
+    }
     const projectId = data.workItemId
       ? this.workItems[data.workItemId]?.projectId ?? null
       : null;
@@ -3039,6 +3144,9 @@ export class Database {
       linesHumanDeleted,
       linesAiAdded,
       linesAiDeleted,
+      effectiveLinesHuman,
+      effectiveLinesAi,
+      effectiveByCategory,
       copilotAcceptances: data.copilotAcceptances,
       estimatedCostUsd: linesAiAdded * COST_PER_AI_LINE_USD,
       chatCharsHuman: data.chatCharsHuman ?? 0,
