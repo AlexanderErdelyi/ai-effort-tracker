@@ -354,7 +354,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   let ghMetrics = null;
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments());
+  const initialNet = await GitTracker.getNetLineChange();
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'cmd' && m.value) {
@@ -375,6 +376,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       lastGhFetch = Date.now();
     }
 
+    const netChange = await GitTracker.getNetLineChange();
     dashboardPanel.webview.postMessage({
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
@@ -387,7 +389,8 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       workItemSummaries: db.getAllWorkItemSummaries(),
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
-      reassignments: db.getReassignments()
+      reassignments: db.getReassignments(),
+      netChange
     });
   }, 5000);
 
@@ -2190,7 +2193,7 @@ async function assignWorkItemToProject() {
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */
 function refreshDashboard() {
   if (!dashboardPanel) return;
-  GitTracker.getCurrentBranch().then(b => {
+  Promise.all([GitTracker.getCurrentBranch(), GitTracker.getNetLineChange()]).then(([b, netChange]) => {
     dashboardPanel?.webview.postMessage({
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
@@ -2202,7 +2205,8 @@ function refreshDashboard() {
       workItemSummaries: db.getAllWorkItemSummaries(),
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
-      reassignments: db.getReassignments()
+      reassignments: db.getReassignments(),
+      netChange
     });
   });
 }

@@ -1,6 +1,7 @@
 import type { BranchSummary, ProjectSummary, WorkItemSummary, LedgerEntry, ManualEffortEntry, ReassignmentRecord } from '../store/database';
 import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics, BillingUsage } from '../services/githubService';
+import type { NetLineChange } from '../trackers/gitTracker';
 
 export interface InsightsConfig {
   baselineLocPerMinute: number;
@@ -36,7 +37,8 @@ export function renderDashboardHtml(
   workItemSummaries: WorkItemSummary[] = [],
   ledger: LedgerEntry[] = [],
   manualEffort: ManualEffortEntry[] = [],
-  reassignments: ReassignmentRecord[] = []
+  reassignments: ReassignmentRecord[] = [],
+  netChange: NetLineChange | null = null
 ): string {
   const data = JSON.stringify(summaries);
   const current = JSON.stringify(currentBranch);
@@ -50,6 +52,7 @@ export function renderDashboardHtml(
   const ledData = JSON.stringify(ledger);
   const meData = JSON.stringify(manualEffort);
   const reData = JSON.stringify(reassignments);
+  const netData = JSON.stringify(netChange);
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -117,6 +120,7 @@ let WI=${wiData};
 let LEDGER=${ledData};
 let ME=${meData};
 let RE=${reData};
+let NET=${netData};
 const charts={};
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
@@ -800,7 +804,20 @@ function showDetail(branch){
     +'</div>'
     +'<table style="margin-top:14px"><thead><tr><th>Model</th><th>Credits</th><th>Cost</th></tr></thead><tbody>'+modelRows+'</tbody></table>'
     +'<p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">Net ROI = value produced \\u2212 total cost (labor + credits) from the project\\u2019s effective rates. Credit cost uses the ledger \\u201cCost\\u201d when set, else credits \\u00d7 the project credit rate. \\u201c\\u2014\\u201d means a required rate is unset \\u2014 use \\u201cSet Rates\\u201d on the project. Baseline loc/min tunes the productivity estimate only.</p></div>';
-  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div><div id="ds-lines" class="ds"><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="val" style="color:var(--human)">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="val" style="color:var(--ai)">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="val" style="color:var(--cost)">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr"><div class="card"><h3>By Category</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
+  // Real net change from git (issue: churn vs net). Only for the branch actually
+  // checked out (NET reflects the working tree), so we match SCM's Changes view.
+  var showNet=NET&&NET.branch===d.branch;
+  var netHtml='',netCatCard='';
+  if(showNet){
+    var na=NET.totalAdded||0,nr=NET.totalRemoved||0,nn=na-nr;
+    netHtml='<div class="card" style="margin-bottom:14px"><div style="display:flex;justify-content:space-between;align-items:center"><h3>\\uD83D\\uDCD0 Net change (git)</h3><span style="font-size:.78em;color:var(--vscode-descriptionForeground)">real diff vs branch base \\u00b7 '+(NET.fileCount||0)+' files</span></div>'
+      +'<div class="sg" style="margin-top:12px"><div class="st"><div class="lbl">Net +Added</div><div class="val" style="color:var(--added)">+'+na+'</div></div><div class="st"><div class="lbl">Net -Removed</div><div class="val" style="color:var(--deleted)">-'+nr+'</div></div><div class="st"><div class="lbl">Net Delta</div><div class="val">'+(nn>=0?'+':'')+nn+'</div></div></div>'
+      +'<p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">This matches what Source Control shows as the branch\\u2019s real change (committed + uncommitted + new files). The \\u201cwritten / rewritten\\u201d counts below are cumulative <em>churn</em> \\u2014 every AI regeneration and rewrite is summed, so they run higher than the net whenever code was revised repeatedly.</p></div>';
+    var nc=NET.byCategory||{};
+    var netCatRows=Object.keys(nc).sort(function(a,b){return(nc[b].added+nc[b].removed)-(nc[a].added+nc[a].removed);}).map(function(k){var s=nc[k];return'<tr><td>'+(CAT[k]||k)+'</td><td class="dc"><span style="color:var(--added)">+'+s.added+'</span></td><td class="dc"><span style="color:var(--deleted)">-'+s.removed+'</span></td><td class="dc">'+((s.added-s.removed)>=0?'+':'')+(s.added-s.removed)+'</td></tr>';}).join('')||'<tr><td colspan="4" style="color:var(--vscode-descriptionForeground)">No net change</td></tr>';
+    netCatCard='<div class="card"><h3>\\uD83D\\uDCD0 Net by Category (git)</h3><table><thead><tr><th>Category</th><th>+Added</th><th>-Removed</th><th>Net</th></tr></thead><tbody>'+netCatRows+'</tbody></table></div>';
+  }
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div><div id="ds-lines" class="ds">'+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="val" style="color:var(--human)">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="val" style="color:var(--ai)">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="val" style="color:var(--cost)">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
   // Honor the user's current sub-tab instead of the hard-coded Insights default, so a
@@ -859,6 +876,7 @@ window.addEventListener('message',function(e){
     if(msg.ledger!==undefined&&msg.ledger)LEDGER=msg.ledger;
     if(msg.manualEffort!==undefined&&msg.manualEffort)ME=msg.manualEffort;
     if(msg.reassignments!==undefined&&msg.reassignments)RE=msg.reassignments;
+    if(msg.netChange!==undefined)NET=msg.netChange;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();

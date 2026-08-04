@@ -133,6 +133,18 @@ export function getFileExt(filePath: string): string {
   return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : 'unknown';
 }
 
+/**
+ * True when a file NAME signals an acceptance/technical spec even though its
+ * extension is a documentation one (e.g. `tech-spec.md`, `functional_spec.md`,
+ * `spec.md`, `requirements.md`). Matches `spec`/`specification`/`requirement(s)`
+ * as a whole token so accidental substrings like `special` or `inspection`
+ * are NOT treated as specs.
+ */
+export function looksLikeSpecFilename(filePath: string): boolean {
+  const base = (filePath.replace(/\\/g, '/').split('/').pop() ?? filePath).toLowerCase();
+  return /(^|[^a-z])(spec(ification)?|requirements?)([^a-z]|$)/.test(base);
+}
+
 /** Categorize by extension only (built-in defaults + user extension rules). */
 export function categorizeExt(ext: string): FileCategory {
   const key = ext.toLowerCase();
@@ -155,7 +167,15 @@ export function categorize(filePath: string): FileCategory {
   }
 
   const ext = getFileExt(filePath);
-  if (extensions[ext]) return extensions[ext];
-  if (DEFAULT_EXT_RULES[ext]) return DEFAULT_EXT_RULES[ext];
-  return 'other';
+  let cat: FileCategory;
+  if (extensions[ext]) cat = extensions[ext];
+  else if (DEFAULT_EXT_RULES[ext]) cat = DEFAULT_EXT_RULES[ext];
+  else cat = 'other';
+
+  // A doc-extension file whose NAME reads like a spec (tech-spec.md, spec.md,
+  // requirements.md) is really a specification. Folder/user rules above still win.
+  if (cat === 'documentation' && looksLikeSpecFilename(filePath)) {
+    return 'specification';
+  }
+  return cat;
 }
