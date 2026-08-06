@@ -511,6 +511,8 @@ interface BranchData {
   effectiveLines?: Record<string, { human: number; ai: number }>;
   /** Frozen pre-v11 added-line baseline retained when effective tracking starts. */
   effectiveLegacyBaseline?: Record<string, { human: number; ai: number }>;
+  /** Metric algorithm version; v2 uses sequence-aware line matching. */
+  effectiveLinesVersion?: number;
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
 }
@@ -1911,6 +1913,11 @@ export class Database {
   ): void {
     if (!Number.isFinite(count) || count <= 0) return;
     const data = this.ensureBranch(branch);
+    if ((data.effectiveLinesVersion ?? 0) < 2) {
+      data.effectiveLines = {};
+      data.effectiveLegacyBaseline = {};
+      data.effectiveLinesVersion = 2;
+    }
     const { categorize } = require('../util/fileTypes') as typeof import('../util/fileTypes');
     const category = categorize(filePath);
     if (!data.effectiveLegacyBaseline) {
@@ -1943,6 +1950,29 @@ export class Database {
         .slice(2000)
         .forEach(([p]) => delete data.files![p]);
     }
+    this.save();
+  }
+
+  /**
+   * One-time repair/seed from the authoritative git diff after the v1 line matcher
+   * overcounted shifted blocks. Existing churn remains untouched.
+   */
+  seedEffectiveLinesFromGit(
+    branch: string,
+    byCategory: Record<string, { added: number; removed: number }>
+  ): void {
+    const data = this.ensureBranch(branch);
+    if (data.effectiveLinesVersion === 2) return;
+    data.effectiveLegacyBaseline = {};
+    data.effectiveLines = {};
+    for (const cat of ALL_CATEGORIES) {
+      const git = byCategory[cat] ?? { added: 0, removed: 0 };
+      data.effectiveLegacyBaseline[cat] = {
+        human: 0,
+        ai: Math.max(0, git.added) + Math.max(0, git.removed)
+      };
+    }
+    data.effectiveLinesVersion = 2;
     this.save();
   }
 

@@ -138,7 +138,32 @@ export function meaningfulLineVersions(before: string[], after: string[]): numbe
   while (start < before.length && start < after.length && before[start] === after[start]) start++;
   let bi = before.length - 1, ai = after.length - 1;
   while (bi >= start && ai >= start && before[bi] === after[ai]) { bi--; ai--; }
-  const removed = Math.max(0, bi - start + 1);
-  const added = Math.max(0, ai - start + 1);
-  return removed + added;
+  const a = before.slice(start, bi + 1);
+  const b = after.slice(start, ai + 1);
+  if (a.length === 0 || b.length === 0) return a.length + b.length;
+
+  // LCS recognizes unchanged lines that merely shifted after an insertion/deletion.
+  // Cap quadratic work; large replacement blocks fall back to unique-line matching.
+  if (a.length * b.length <= 1_000_000) {
+    let prev = new Uint32Array(b.length + 1);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = new Uint32Array(b.length + 1);
+      for (let j = 1; j <= b.length; j++) {
+        cur[j] = a[i - 1] === b[j - 1]
+          ? prev[j - 1] + 1
+          : Math.max(prev[j], cur[j - 1]);
+      }
+      prev = cur;
+    }
+    const retained = prev[b.length];
+    return (a.length - retained) + (b.length - retained);
+  }
+  const counts = new Map<string, number>();
+  for (const line of a) counts.set(line, (counts.get(line) ?? 0) + 1);
+  let retained = 0;
+  for (const line of b) {
+    const n = counts.get(line) ?? 0;
+    if (n > 0) { retained++; counts.set(line, n - 1); }
+  }
+  return (a.length - retained) + (b.length - retained);
 }

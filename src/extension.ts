@@ -355,6 +355,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   try { ghMetrics = await ghService.getCopilotMetrics(); } catch { /* ignore */ }
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
   const initialNet = await GitTracker.getNetLineChange();
+  if (initialNet) db.seedEffectiveLinesFromGit(initialNet.branch, initialNet.byCategory);
   dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
@@ -377,6 +378,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
     }
 
     const netChange = await GitTracker.getNetLineChange();
+    if (netChange) db.seedEffectiveLinesFromGit(netChange.branch, netChange.byCategory);
     dashboardPanel.webview.postMessage({
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
@@ -2194,6 +2196,7 @@ async function assignWorkItemToProject() {
 function refreshDashboard() {
   if (!dashboardPanel) return;
   Promise.all([GitTracker.getCurrentBranch(), GitTracker.getNetLineChange()]).then(([b, netChange]) => {
+    if (netChange) db.seedEffectiveLinesFromGit(netChange.branch, netChange.byCategory);
     dashboardPanel?.webview.postMessage({
       type: 'update',
       summaries: db.getAllBranchesSummaries(),
@@ -2332,5 +2335,4 @@ async function exportReport(db: Database, tracker: TimeTracker) {
     vscode.window.showInformationMessage(`Report saved to ${uri.fsPath}`);
   }
 }
-
 
