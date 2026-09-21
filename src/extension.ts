@@ -703,7 +703,7 @@ async function setWorkItemEstimate(preselectedId?: string) {
     db.setEstimateBreakdown(workItemId, null);
     db.upsertWorkItem(workItemId, { estimate: Number(raw), estimateUnit: unit });
   } else {
-    const categories: FileCategory[] = ['programming', 'specification', 'documentation', 'deployment'];
+    const categories: FileCategory[] = ['programming', 'specification', 'documentation', 'translation', 'deployment'];
     const existing = db.getWorkItem(workItemId)?.estimateBreakdown;
     const breakdown: EstimateBreakdown = {};
     for (const cat of categories) {
