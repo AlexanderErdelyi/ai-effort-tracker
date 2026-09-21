@@ -251,6 +251,47 @@ test('live capture freezes new-turn attribution and parks an ambiguous branch sw
   assert.equal(db.getCreditEntries().find(e => e.debugUsage.sessionId === 'session-one').branch, 'branch-a');
 });
 
+test('child-only log updates repair an existing parent row, preserving branch and deduplication', async t => {
+  const { dir, db } = temporary(t);
+  const ws = path.join(dir, 'workspace');
+  const root = path.join(ws, 'GitHub.copilot-chat', 'debug-logs', 'session-one');
+  fs.mkdirSync(root, { recursive: true });
+  const main = path.join(root, 'main.jsonl');
+  writeLog(main, 1000, 2.395285);
+  fs.appendFileSync(main, JSON.stringify({
+    sid: 'session-one', ts: 1001, type: 'tool_call', name: 'runSubagent', status: 'ok',
+    spanId: 'invoke', parentSpanId: 'root-one', attrs: {}
+  }) + '\n');
+  db.recordDebugUsage('original-branch', turn([request('call-one', 2.395285)]));
+  const id = db.getCreditEntries()[0].id;
+  const tracker = new DebugLogUsageTracker(db, { scheme: 'file', fsPath: path.join(ws, 'tracker') }, () => {});
+  t.after(() => tracker.dispose());
+  GitTracker.getCurrentBranch = async () => 'different-branch';
+  await tracker.poll();
+  const child = path.join(root, 'runSubagent-Explore-child.jsonl');
+  const writeChild = credits => fs.writeFileSync(child, [
+    { type: 'session_start', spanId: 'start', attrs: { parentSessionId: 'session-one' } },
+    { type: 'user_message', spanId: 'root-child', parentSpanId: 'invoke', attrs: {} },
+    { type: 'llm_request', spanId: 'call-one', parentSpanId: 'root-child',
+      attrs: { model: 'child-model', inputTokens: 10, outputTokens: 1, copilotUsageNanoAiu: credits * 1e9 } }
+  ].map(r => JSON.stringify({ ...r, sid: 'child', ts: 1002, status: 'ok' })).join('\n') + '\n');
+  writeChild(10);
+  await tracker.poll();
+  writeChild(20.224035);
+  await tracker.poll();
+  await tracker.poll();
+  assert.equal(db.getCreditEntries().length, 1);
+  const entry = db.getCreditEntries()[0];
+  assert.equal(entry.credits.toFixed(6), '22.619320');
+  assert.equal(entry.id, id);
+  assert.equal(entry.branch, 'original-branch');
+  assert.equal(entry.debugUsage.requests.length, 2);
+  const imported = await tracker.importSession((await tracker.sessions())[0], 'another-branch');
+  assert.equal(imported.credits.toFixed(6), '22.619320');
+  assert.equal(db.getCreditEntries().length, 1);
+  assert.equal(entry.branch, 'original-branch');
+});
+
 test('dashboard script parses and debug detail shows partial usage without fabricated tier pricing', t => {
   const { db } = temporary(t);
   const { entry } = db.recordDebugUsage('a', turn([request('a', 2), request('b', null)]));

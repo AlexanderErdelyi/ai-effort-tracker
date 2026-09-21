@@ -49,6 +49,12 @@ token/cache price to an already recorded charge. A missing charge is **unknown**
 the ledger labels the known subtotal as partial. GitHub billing is still the
 source for final billed spend, allowances and adjustments.
 
+Sibling subagent `.jsonl` logs are included in the invoking user turn through
+their declared parent session and parent tool span, including nested subagents.
+Child-only log updates refresh the same ledger entry. Unlinked child requests are
+reported as warnings rather than assigned by timing alone. Span reuse after an
+extension-host restart is isolated from previous requests.
+
 - `aiEffortTracker.captureDebugLogs` is enabled by default. It replaces both live
   estimators and automatic export-folder imports (reload after changing it).
   Disabling it restores the export-folder mode or one legacy estimator.
@@ -70,7 +76,8 @@ Only compact request identities, charges, token counts, file paths and edit coun
 are saved in the effort store. Prompts, source content, tool arguments and results
 are discarded after parsing; the system-prompt and tool-definition files are not
 read. The live scanner retains metadata for at most 200 recent sessions and 5,000
-turn bindings, reads at most 16 MiB per log, and skips oversized logs with a message
+turn bindings, reads at most 16 MiB per log and 64 MiB / 200 log files per session,
+and skips oversized sessions with a message
 in **AI Effort Tracker — Debug Usage**. It never deletes Copilot's own logs. Older
 sessions remain available for explicit import; compact ledger history is retained.
 
