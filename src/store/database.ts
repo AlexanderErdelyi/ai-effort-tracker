@@ -149,6 +149,31 @@ export interface LedgerEntry {
    * pre-#74 rows lack it and load as `undefined`, so no migration is needed.
    */
   analysis?: TurnAnalysis;
+  /** Stable model-response aliases shared by debug logs and chat exports. */
+  responseIds?: string[];
+  /** Compact request identities and charges only; never prompt/tool payloads. */
+  debugUsage?: {
+    sessionId: string;
+    turnId: string;
+    requests: DebugCreditRequest[];
+    unpricedRequests: number;
+    requestAliases?: string[];
+    /** More-complete export retained until the request-level log catches up. */
+    exportCredits?: number;
+    exportRequests?: number;
+    creditsOverridden?: boolean;
+    logWarnings?: number;
+  };
+}
+
+export interface DebugCreditRequest {
+  spanId: string;
+  responseId?: string;
+  model: string;
+  credits: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens?: number;
 }
 
 /**
@@ -2105,6 +2130,10 @@ export class Database {
       chatSessionId?: string | null;
     }
   ): void {
+    if (this.creditLedger.some(e => e.debugUsage && (
+      e.responseIds?.includes(opts.requestId) || e.debugUsage.requestAliases?.includes(opts.requestId) ||
+      e.note === `auto:jsonl:${opts.requestId}`
+    ))) return;
     const safeCredits = Number.isFinite(credits) && credits >= 0 ? credits : 0;
     const note = `auto:jsonl:${opts.requestId}`;
     const existing = this.creditLedger.find(e => e.source === 'auto' && e.note === note);
@@ -2135,16 +2164,15 @@ export class Database {
    * export (issue #70). Unlike {@link recordAutoChatUsage} (a token-rate estimate
    * tailed live from `chatSessions/*.jsonl`), this stores the authoritative
    * `copilot_usage.total_nano_aiu` summed across the turn's internal model
-   * requests, so credit totals match GitHub billing exactly.
+   * requests. Final invoice adjustments remain outside these recorded charges.
    *
    * Idempotency & upgrade: the row is upserted by its `import:debug:<promptId>`
    * note. Re-importing the same export (or a periodic "export all" that re-covers
    * the turn) updates the SAME row in place — never a second entry, never a double
    * count. A later, MORE COMPLETE export (more requests captured for a turn that
    * was mid-flight when first exported) simply raises the value. Rows are always
-   * marked `exact` and use `source:'import'`, a distinct namespace from the `auto`
-   * estimators, so the "exact-only" reconciliation ({@link purgeAutoLedger}) can
-   * drop estimates without touching imports or manual entries.
+   * marked `exact` and use `source:'import'`. Matching debug-log requests are
+   * reconciled by identity, not merely by using different source namespaces.
    *
    * Attribution (`branch`/`workItemId`/`projectId`) is resolved at import time via
    * {@link appendLedger} — identical to manual credit logging — so imported
@@ -2161,8 +2189,34 @@ export class Database {
       completionTokens?: number;
       requests?: number;
       analysis?: TurnAnalysis;
+      responseIds?: string[];
     }
   ): { inserted: boolean } {
+    const debugMatches = this.creditLedger.filter(e => e.debugUsage && (
+      opts.responseIds?.some(id => e.responseIds?.includes(id)) ||
+      e.debugUsage.requestAliases?.includes(opts.promptId)
+    ));
+    const debug = debugMatches[0];
+    if (debug && (debugMatches.length > 1 || (
+      !debug.debugUsage!.requestAliases?.includes(opts.promptId) &&
+      opts.responseIds?.some(id => !debug.responseIds?.includes(id))
+    ))) {
+      throw new Error('Export overlaps debug usage only partially. Review the existing ledger entries before importing this export.');
+    }
+    if (debug) {
+      // Keep a more complete export as an aggregate floor, not a second charge.
+      if (Number.isFinite(credits) && credits >= 0) {
+        if (!debug.debugUsage!.creditsOverridden) debug.credits = Math.max(debug.credits, credits);
+        debug.debugUsage!.exportCredits = Math.max(debug.debugUsage!.exportCredits ?? 0, credits);
+        debug.debugUsage!.exportRequests = Math.max(debug.debugUsage!.exportRequests ?? 0, opts.requests ?? 0);
+        debug.debugUsage!.unpricedRequests = debug.debugUsage!.requests.filter(r => r.credits === null).length +
+          Math.max(0, debug.debugUsage!.exportRequests - debug.debugUsage!.requests.length);
+        debug.exact = !debug.debugUsage!.creditsOverridden && !debug.debugUsage!.logWarnings &&
+          debug.debugUsage!.unpricedRequests === 0;
+        this.save();
+      }
+      return { inserted: false };
+    }
     const safeCredits = Number.isFinite(credits) && credits >= 0 ? credits : 0;
     const note = `import:debug:${opts.promptId}`;
     const existing = this.creditLedger.find(e => e.source === 'import' && e.note === note);
@@ -2173,6 +2227,7 @@ export class Database {
       if (opts.completionTokens !== undefined) existing.completionTokens = opts.completionTokens;
       if (opts.analysis !== undefined) existing.analysis = opts.analysis;
       existing.exact = true;
+      if (opts.responseIds) existing.responseIds = opts.responseIds;
       this.save();
       return { inserted: false };
     }
@@ -2182,8 +2237,109 @@ export class Database {
     if (opts.completionTokens !== undefined) entry.completionTokens = opts.completionTokens;
     if (opts.analysis !== undefined) entry.analysis = opts.analysis;
     entry.exact = true;
+    if (opts.responseIds) entry.responseIds = opts.responseIds;
     this.save();
     return { inserted: true };
+  }
+
+  hasDebugTurn(sessionId: string, turnId: string): boolean {
+    return this.creditLedger.some(e => e.debugUsage?.sessionId === sessionId &&
+      e.debugUsage.turnId === turnId);
+  }
+
+  /**
+   * One row per user turn, grown by physical model-call span ID (response IDs can
+   * be shared by several tool rounds). Attribution remains frozen on updates.
+   * Analysis is display-only: editor line counters must not receive these edits.
+   */
+  recordDebugUsage(
+    branch: string,
+    opts: {
+      sessionId: string;
+      turnId: string;
+      timestamp: number;
+      requests: DebugCreditRequest[];
+      analysis: TurnAnalysis;
+      requestAliases?: string[];
+      logWarnings?: number;
+    }
+  ): { inserted: boolean; entry: LedgerEntry } {
+    if (!opts.sessionId || !opts.turnId || !Number.isFinite(opts.timestamp) || opts.timestamp < 0) {
+      throw new Error('Invalid debug-log turn identity or timestamp');
+    }
+    for (const r of opts.requests) {
+      if (!r.spanId || !Number.isFinite(r.inputTokens) || r.inputTokens < 0 ||
+          !Number.isFinite(r.outputTokens) || r.outputTokens < 0 ||
+          (r.credits !== null && (!Number.isFinite(r.credits) || r.credits < 0)) ||
+          (r.cachedTokens !== undefined && (!Number.isFinite(r.cachedTokens) || r.cachedTokens < 0))) {
+        throw new Error('Invalid debug-log usage record');
+      }
+    }
+    const responseIds = [...new Set(opts.requests.flatMap(r => r.responseId ? [r.responseId] : []))];
+    const notes = new Set((opts.requestAliases ?? []).flatMap(id =>
+      [`auto:jsonl:${id}`, `import:debug:${id}`]));
+    const matches = this.creditLedger.filter(e => e.source !== 'manual' && (
+      (e.debugUsage?.sessionId === opts.sessionId && e.debugUsage.turnId === opts.turnId) ||
+      (!e.debugUsage && (responseIds.some(id => e.responseIds?.includes(id)) ||
+        notes.has(e.note ?? '')))
+    ));
+    if (matches.some(e => !e.debugUsage && e.source === 'import' &&
+        !notes.has(e.note ?? '') && e.responseIds?.some(id => !responseIds.includes(id)))) {
+      throw new Error('Debug usage overlaps an imported turn only partially. Review the existing ledger before importing this session.');
+    }
+    let entry = matches.find(e => e.debugUsage) ?? matches[0];
+    const inserted = !entry;
+    if (!entry) {
+      entry = this.appendLedger(branch, 'unknown', 0, 'auto',
+        `auto:debug-log:${opts.sessionId}:${opts.turnId}`, { chatSessionId: opts.sessionId });
+      entry.ts = opts.timestamp;
+    }
+    const priorRequests = entry.debugUsage?.requests ?? [];
+    const requests = new Map(priorRequests.map(r => [r.spanId, r]));
+    for (const r of opts.requests) {
+      const previous = requests.get(r.spanId);
+      // A truncated or partially written reread must not erase a known charge.
+      requests.set(r.spanId, {
+        ...r,
+        credits: r.credits ?? previous?.credits ?? null
+      });
+    }
+    const all = [...requests.values()];
+    const knownCredits = all.reduce((sum, r) => sum + (r.credits ?? 0), 0);
+    const missing = all.filter(r => r.credits === null).length;
+    // An older export may contain more calls than a partial debug log. Keep its
+    // amount until the live source catches up, rather than silently losing spend.
+    const priorExports = matches.filter(e => !e.debugUsage && e.source === 'import' && e.exact);
+    const exportAmounts = priorExports.map(e => e.credits);
+    if (entry.debugUsage?.exportCredits !== undefined) exportAmounts.push(entry.debugUsage.exportCredits);
+    const exportCredits = exportAmounts.length ? Math.max(...exportAmounts) : undefined;
+    const exportRequests = Math.max(entry.debugUsage?.exportRequests ?? 0,
+      ...priorExports.map(e => e.analysis?.requestsDetail.length ?? 0));
+    entry.model = [...new Set(all.map(r => r.model))].join(' + ') || 'unknown';
+    const creditsOverridden = entry.debugUsage?.creditsOverridden;
+    if (!creditsOverridden) entry.credits = Math.max(knownCredits, exportCredits ?? 0);
+    entry.exact = !creditsOverridden && !opts.logWarnings && missing === 0 && !(exportRequests && exportRequests > all.length);
+    entry.chatSessionId = opts.sessionId;
+    entry.responseIds = [...new Set([...(entry.responseIds ?? []), ...responseIds])];
+    entry.promptTokens = all.reduce((sum, r) => sum + r.inputTokens, 0);
+    entry.completionTokens = all.reduce((sum, r) => sum + r.outputTokens, 0);
+    const incomingIds = new Set(opts.requests.map(r => r.spanId));
+    if (priorRequests.every(r => incomingIds.has(r.spanId)) &&
+        (!entry.analysis || opts.analysis.toolCalls >= entry.analysis.toolCalls)) {
+      entry.analysis = opts.analysis;
+    }
+    entry.debugUsage = { sessionId: opts.sessionId, turnId: opts.turnId,
+      requests: all, unpricedRequests: missing + Math.max(0, (exportRequests ?? 0) - all.length),
+      requestAliases: [...new Set([...(entry.debugUsage?.requestAliases ?? []), ...(opts.requestAliases ?? [])])],
+      ...(creditsOverridden ? { creditsOverridden } : {}),
+      logWarnings: opts.logWarnings,
+      ...(exportCredits !== undefined ? { exportCredits, exportRequests } : {})
+    };
+    // Remove only provably overlapping automatic/imported rows. Manual entries
+    // and unrelated older estimates remain untouched.
+    this.creditLedger = this.creditLedger.filter(e => e === entry || !matches.includes(e));
+    this.save();
+    return { inserted, entry };
   }
 
   /**
@@ -2195,7 +2351,7 @@ export class Database {
    */
   purgeAutoLedger(): number {
     const before = this.creditLedger.length;
-    this.creditLedger = this.creditLedger.filter(e => e.source !== 'auto');
+    this.creditLedger = this.creditLedger.filter(e => e.source !== 'auto' || e.exact || e.debugUsage);
     const removed = before - this.creditLedger.length;
     if (removed > 0) this.save();
     return removed;
@@ -2216,7 +2372,13 @@ export class Database {
     const entry = this.creditLedger.find(e => e.id === id);
     if (!entry) return undefined;
     if (patch.model !== undefined) entry.model = patch.model;
-    if (patch.credits !== undefined) entry.credits = patch.credits;
+    if (patch.credits !== undefined) {
+      entry.credits = patch.credits;
+      if (entry.debugUsage) {
+        entry.debugUsage.creditsOverridden = true;
+        entry.exact = false;
+      }
+    }
     if (patch.note !== undefined) entry.note = patch.note;
     if (patch.ts !== undefined) entry.ts = patch.ts;
     if (patch.cost !== undefined) {

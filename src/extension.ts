@@ -6,6 +6,7 @@ import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
 import { CreditImportTracker } from './trackers/creditImportTracker';
+import { DebugLogUsageTracker } from './trackers/debugLogUsageTracker';
 import { Database } from './store/database';
 import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
@@ -26,6 +27,7 @@ let copilotTracker: CopilotTracker;
 let chatUsageTracker: ChatUsageTracker;
 let chatSessionUsageTracker: ChatSessionUsageTracker;
 let creditImportTracker: CreditImportTracker;
+let debugLogUsageTracker: DebugLogUsageTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
@@ -78,6 +80,7 @@ export function activate(context: vscode.ExtensionContext) {
   chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
   chatSessionUsageTracker = new ChatSessionUsageTracker(db, timeTracker, context.storageUri);
   creditImportTracker = new CreditImportTracker(db, timeTracker, () => refreshDashboard());
+  debugLogUsageTracker = new DebugLogUsageTracker(db, context.storageUri, () => refreshDashboard());
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
@@ -155,6 +158,36 @@ export function activate(context: vscode.ExtensionContext) {
         `Logged ${credits} credits (${model}) on ${branch}.`
       );
       refreshDashboard();
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.importDebugSession', async () => {
+      try {
+        const sessions = await debugLogUsageTracker.sessions();
+        if (!sessions.length) {
+          vscode.window.showInformationMessage('No Copilot debug logs found in this workspace.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(sessions.map(session => ({
+          label: session.sessionId,
+          description: new Date(session.modified).toLocaleString(),
+          session
+        })), { title: 'Import recorded credits and edit details', placeHolder: 'Choose a chat session in this workspace' });
+        if (!picked) return;
+        const current = await GitTracker.getCurrentBranch() ?? timeTracker.getBranch();
+        const branch = await vscode.window.showQuickPick([...new Set([current, ...db.getAllBranches()])], {
+          title: 'Attribute this chat history to a branch',
+          placeHolder: 'Historical logs do not identify the branch. Choose explicitly; existing attribution is preserved.'
+        });
+        if (!branch) return;
+        const result = await debugLogUsageTracker.importSession(picked.session, branch);
+        vscode.window.showInformationMessage(
+          `Debug session: ${result.credits.toFixed(6)} recorded credits across ${result.turns} turn(s). ` +
+          (result.unpriced ? `${result.unpriced} request(s) have unknown charges; the total is partial. ` : '') +
+          (result.warnings ? `${result.warnings} log warning(s): some records or edit counts could not be read; see Debug Usage output. ` : '') +
+          'Edit details are available in the credit ledger; editor effort is not added twice.'
+        );
+      } catch (error) {
+        vscode.window.showErrorMessage(`Could not import debug session: ${String(error)}`);
+      }
     }),
     vscode.commands.registerCommand('aiEffortTracker.importRealCredits', async () => {
       // Import EXACT credits from Copilot Chat Debug export(s) (issue #70). Uses
@@ -318,17 +351,20 @@ export function activate(context: vscode.ExtensionContext) {
   timeTracker.startTracking();
   gitTracker.start(context);
   copilotTracker.start(context);
-  // Exact-only reconciliation (issue #70): when a credit-import folder is
-  // configured, exact debug-export imports are the source of truth, so the live
-  // token-rate estimators are NOT started (their estimates would double-count and
-  // undercount agent turns ~5×). Otherwise the estimators run as before.
-  if (CreditImportTracker.isConfigured()) {
+  // Use exactly one automatic source. Recorded debug logs take precedence;
+  // disabling them opts into the export-folder mode or one legacy estimator.
+  if (DebugLogUsageTracker.enabled()) {
+    // A single live source: neither token estimates nor legacy request weights
+    // may charge for the same model calls. Historical exports remain manual.
+    debugLogUsageTracker.start();
+  } else if (CreditImportTracker.isConfigured()) {
     creditImportTracker.start(context);
+  } else if (vscode.workspace.getConfiguration('aiEffortTracker').get<boolean>('autoCaptureRealCredits') ?? true) {
+    chatSessionUsageTracker.start(context);
   } else {
     chatUsageTracker.start(context);
-    chatSessionUsageTracker.start(context);
   }
-  context.subscriptions.push(chatSessionUsageTracker, creditImportTracker);
+  context.subscriptions.push(debugLogUsageTracker, creditImportTracker);
 }
 
 export function deactivate() {
@@ -2335,4 +2371,3 @@ async function exportReport(db: Database, tracker: TimeTracker) {
     vscode.window.showInformationMessage(`Report saved to ${uri.fsPath}`);
   }
 }
-

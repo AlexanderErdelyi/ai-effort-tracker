@@ -2,11 +2,9 @@
  * Pure parser for Copilot Chat Debug exports (issue #70).
  *
  * The Chat Debug view can export the captured request logs as JSON. That export
- * is the ONLY place the EXACT per-request AIU cost
- * (`metadata.usage.copilot_usage.total_nano_aiu`) is available — VS Code strips
- * it from the on-disk `chatSessions/*.jsonl` within seconds, so tailing that file
- * only ever yields a token-rate estimate (which undercounts multi-request agent
- * turns ~5×). Importing this export lets credit totals match GitHub exactly.
+ * contains per-request AIU costs (`metadata.usage.copilot_usage.total_nano_aiu`).
+ * Persisted Copilot debug logs expose recorded charges through a separate parser.
+ * These charges describe recorded usage, not final invoice adjustments.
  *
  * Two shapes are accepted, both defensively:
  *   1. "all prompts" wrapper: `{ prompts: [ { prompt, promptId, logs:[…] }, … ] }`
@@ -22,6 +20,7 @@
  */
 
 import { exactCreditsFromCopilotUsage, tokenTiersFromCopilotUsage } from './aiuRates';
+import { toolEditImpact, toolResultFailed } from './editImpact';
 
 /** Line-count impact of the edits a turn made to one file (no code stored). */
 export interface FileEditStat {
@@ -89,6 +88,8 @@ export interface TurnAnalysis {
 export interface ImportedTurn {
   /** Stable per-turn id used for idempotent upsert dedup (`import:debug:<id>`). */
   promptId: string;
+  /** Model-response linkage shared with persisted debug logs; not request identities. */
+  responseIds?: string[];
   /** Dominant model of the turn (the request contributing the most credits). */
   model: string;
   /** EXACT AIU credits summed across the turn's internal model requests. */
@@ -164,109 +165,6 @@ function promptIdOf(turn: Record<string, unknown>): string {
   return '';
 }
 
-/** Extension of a path (lowercased, no dot), or `unknown`. */
-function extOf(filePath: string): string {
-  const base = filePath.replace(/\\/g, '/').split('/').pop() ?? filePath;
-  const i = base.lastIndexOf('.');
-  return i > 0 ? base.slice(i + 1).toLowerCase() : 'unknown';
-}
-
-/** Split into lines for diffing (handles CRLF/CR/LF). */
-function splitLines(s: string): string[] {
-  if (!s) return [];
-  return s.split(/\r\n|\r|\n/);
-}
-
-/**
- * Count lines added/removed between two strings via an LCS line-diff (the same
- * added = new-not-in-common, removed = old-not-in-common measure Git uses). Turns
- * carry small edits, but a guard falls back to a multiset diff for pathologically
- * large blobs so the DP can never blow up. Pure.
- */
-function lineDiff(oldStr: string, newStr: string): { added: number; removed: number } {
-  const a = splitLines(oldStr);
-  const b = splitLines(newStr);
-  if (a.length === 0) return { added: b.length, removed: 0 };
-  if (b.length === 0) return { added: 0, removed: a.length };
-  if (a.length > 4000 || b.length > 4000) {
-    // Fallback: multiset difference (order-insensitive but bounded + never throws).
-    const count = new Map<string, number>();
-    for (const l of a) count.set(l, (count.get(l) ?? 0) + 1);
-    let common = 0;
-    for (const l of b) {
-      const c = count.get(l) ?? 0;
-      if (c > 0) { common++; count.set(l, c - 1); }
-    }
-    return { added: b.length - common, removed: a.length - common };
-  }
-  const m = a.length;
-  const n = b.length;
-  let prev = new Int32Array(n + 1);
-  let curr = new Int32Array(n + 1);
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      curr[j] = a[i - 1] === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], curr[j - 1]);
-    }
-    [prev, curr] = [curr, prev];
-    curr.fill(0);
-  }
-  const lcs = prev[n];
-  return { added: n - lcs, removed: m - lcs };
-}
-
-/**
- * Coerce a tool-call `args` value to a plain object. The debug export sometimes
- * serializes args as a JSON string, and sometimes as a char-indexed object (the
- * result of spreading a string), so we reconstruct both. Returns `{}` on failure.
- */
-function coerceArgs(args: unknown): Record<string, unknown> {
-  if (isObj(args)) {
-    const keys = Object.keys(args);
-    if (keys.length > 0 && keys.every(k => /^\d+$/.test(k))) {
-      const joined = keys.sort((x, y) => Number(x) - Number(y)).map(k => (args as Record<string, unknown>)[k]).join('');
-      try { const o = JSON.parse(joined); return isObj(o) ? o : {}; } catch { return {}; }
-    }
-    return args;
-  }
-  if (typeof args === 'string') {
-    try { const o = JSON.parse(args); return isObj(o) ? o : {}; } catch { return {}; }
-  }
-  return {};
-}
-
-/** One file edit extracted from a tool call (path + old/new code strings). */
-interface RawEdit { filePath: string; oldString: string; newString: string; created: boolean }
-
-/** Extract file edits from a single tool call's args, across known edit tools. */
-function editsFromArgs(tool: string, args: Record<string, unknown>): RawEdit[] {
-  const t = tool.toLowerCase();
-  const out: RawEdit[] = [];
-  // multi-edit tools: an array of {filePath, oldString, newString}
-  const arr = Array.isArray(args.replacements) ? args.replacements
-    : Array.isArray(args.edits) ? args.edits
-    : undefined;
-  if (arr) {
-    for (const r of arr) {
-      if (!isObj(r)) continue;
-      const fp = str(r.filePath) || str(r.file) || str(r.path);
-      if (!fp) continue;
-      out.push({ filePath: fp, oldString: str(r.oldString), newString: str(r.newString), created: false });
-    }
-    return out;
-  }
-  const fp = str(args.filePath) || str(args.file) || str(args.path);
-  if (!fp) return out;
-  // create / insert tools: full content, no prior text.
-  if (/create|new_file|insert/.test(t)) {
-    const content = str(args.content) || str(args.code) || str(args.newString);
-    out.push({ filePath: fp, oldString: '', newString: content, created: /create|new_file/.test(t) });
-    return out;
-  }
-  // single replace edit.
-  out.push({ filePath: fp, oldString: str(args.oldString), newString: str(args.newString), created: false });
-  return out;
-}
-
 /**
  * Build the compact, code-free {@link TurnAnalysis} for one turn's `logs[]`.
  * Aggregates the tool histogram, per-file line-count impact, per-request token
@@ -285,16 +183,16 @@ function analyzeTurn(logs: Record<string, unknown>[]): TurnAnalysis {
     const tool = str(log.tool);
     const isToolCall = log.kind === 'toolCall' || (!!tool && !log.metadata);
     if (isToolCall && tool) {
+      if (log.status === 'error' || log.status === 'failed' || log.success === false || toolResultFailed(log.result)) continue;
       toolCalls += 1;
       toolCounts.set(tool, (toolCounts.get(tool) ?? 0) + 1);
-      const edits = editsFromArgs(tool, coerceArgs(log.args));
+      const edits = toolEditImpact(tool, log.args).files;
       for (const e of edits) {
-        const { added, removed } = lineDiff(e.oldString, e.newString);
-        const key = e.filePath;
-        const cur = fileMap.get(key) ?? { path: key, ext: extOf(key), added: 0, removed: 0, edits: 0 };
-        cur.added += added;
-        cur.removed += removed;
-        cur.edits += 1;
+        const key = e.path;
+        const cur = fileMap.get(key) ?? { path: key, ext: e.ext, added: 0, removed: 0, edits: 0 };
+        cur.added += e.added;
+        cur.removed += e.removed;
+        cur.edits += e.edits;
         if (e.created) cur.created = true;
         fileMap.set(key, cur);
       }
@@ -360,6 +258,7 @@ export function parseDebugExport(root: unknown): ImportedTurn[] {
     let promptTokens = 0;
     let completionTokens = 0;
     let requests = 0;
+    const responseIds = new Set<string>();
     let bestModel = '';
     let bestModelCredits = -1;
 
@@ -371,6 +270,12 @@ export function parseDebugExport(root: unknown): ImportedTurn[] {
       promptTokens += pt;
       completionTokens += ct;
       requests += 1;
+      const meta = isObj(log.metadata) ? log.metadata : undefined;
+      const usage = meta && isObj(meta.usage) ? meta.usage : undefined;
+      for (const candidate of [meta?.responseId, usage?.responseId]) {
+        const id = str(candidate);
+        if (id) responseIds.add(id);
+      }
       if (exact > bestModelCredits) {
         bestModelCredits = exact;
         bestModel = modelOf(log);
@@ -380,6 +285,7 @@ export function parseDebugExport(root: unknown): ImportedTurn[] {
     if (requests === 0 || !(credits > 0)) continue;
     out.push({
       promptId,
+      ...(responseIds.size ? { responseIds: [...responseIds] } : {}),
       model: bestModel || 'unknown',
       credits,
       promptTokens,

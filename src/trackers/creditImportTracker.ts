@@ -28,10 +28,8 @@ export interface ImportSummary {
  * upgrades the value). It is the authoritative alternative to the live
  * token-rate estimator, whose numbers undercount agent turns ~5×.
  *
- * EXACT-ONLY reconciliation: whenever an import runs it purges the estimated
- * `source:'auto'` rows ({@link Database.purgeAutoLedger}); the live estimators are
- * disabled while a folder is configured (see extension activation). So credit
- * totals come purely from exact imports + manual entries and always match GitHub.
+ * Reconciles only overlapping request identities; unrelated history is retained.
+ * Automatic folder capture runs only when debug-log capture is disabled.
  *
  * Everything is best-effort/defensive: a malformed export, a vanished file, or a
  * permission error is swallowed and never disturbs the extension host.
@@ -104,15 +102,14 @@ export class CreditImportTracker implements vscode.Disposable {
       if (files.length === 0) return;
       const summary = this.importFiles(files);
       if (summary.turns > 0 || summary.purgedAuto > 0) this.onImported?.(summary);
-    } catch {
-      /* best-effort: never disturb the extension host */
+    } catch (error) {
+      this.output.error(`Credit import failed: ${String(error)}`);
     }
   }
 
   /**
    * Import an explicit list of export files (used by the manual command too).
-   * Purges estimated `auto` rows afterwards (exact-only), and returns an
-   * aggregate summary suitable for a status toast.
+   * Returns an aggregate summary; unrelated ledger entries are never purged.
    */
   importFiles(files: string[], branchOverride?: string): ImportSummary {
     const branch = (branchOverride && branchOverride.trim()) || this.timeTracker.getBranch();
@@ -149,7 +146,8 @@ export class CreditImportTracker implements vscode.Disposable {
           promptTokens: t.promptTokens,
           completionTokens: t.completionTokens,
           requests: t.requests,
-          analysis: t.analysis
+          analysis: t.analysis,
+          responseIds: t.responseIds
         });
         summary.turns += 1;
         summary.requests += t.requests;
@@ -165,8 +163,8 @@ export class CreditImportTracker implements vscode.Disposable {
       );
     }
 
-    // Exact-only: drop estimated auto rows so they can never double-count.
-    summary.purgedAuto = this.db.purgeAutoLedger();
+    // Debug-log rows carry recorded charges, not competing estimates. Do not
+    // purge unrelated ledger history just because an export was selected.
     return summary;
   }
 
