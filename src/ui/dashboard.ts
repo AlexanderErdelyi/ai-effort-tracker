@@ -49,7 +49,7 @@ export function renderDashboardHtml(
   const blData = JSON.stringify(billing);
   const projData = JSON.stringify(projectSummaries);
   const wiData = JSON.stringify(workItemSummaries);
-  const ledData = JSON.stringify(ledger);
+  const ledData = JSON.stringify(ledger).replace(/</g, '\\u003c');
   const meData = JSON.stringify(manualEffort);
   const reData = JSON.stringify(reassignments);
   const netData = JSON.stringify(netChange);
@@ -664,7 +664,8 @@ function renderProjectsView(){
 // editing/deleting a row here corrects every derived total automatically.
 function renderLedger(){
   var el=document.getElementById('ledger');
-  var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button> <button class="dtab" data-action="cmd" data-value="importRealCredits" title="Import EXACT credits from a Copilot Chat Debug export (matches GitHub billing)">\\u2B07 Import Real Credits</button>';
+  var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button> <button class="dtab" data-action="cmd" data-value="importRealCredits" title="Import recorded credits from a Copilot Chat Debug export">\\u2B07 Import Real Credits</button>';
+  add+=' <button class="dtab" data-action="cmd" data-value="importDebugSession">Import Debug Session</button>';
   if(!LEDGER||!LEDGER.length){
     el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div><div class="card"><p style="color:var(--vscode-descriptionForeground)">No credit entries yet. Use \\u201cAdd Entry\\u201d to record one.</p></div>';
     return;
@@ -677,6 +678,8 @@ function renderLedger(){
     var note=e.note?esc(e.note):'';
     var sc=e.source==='manual'?'bh':(e.source==='auto'?'ba':'bp');
     var src='<span class="badge '+sc+'">'+esc(e.source)+'</span>';
+    if(e.debugUsage)src+='<span class="badge bp" title="'+Number(e.credits).toFixed(6)+' ledger credits">'+(e.debugUsage.creditsOverridden?'manually adjusted':e.debugUsage.unpricedRequests?'partial: '+e.debugUsage.unpricedRequests+' unpriced':'recorded')+'</span>';
+    if(e.debugUsage&&e.debugUsage.logWarnings)src+='<span class="badge bd">log warnings</span>';
     var dbtn=e.analysis?'<button class="dtab" data-action="ledDetail" data-id="'+esc(e.id)+'" title="Deep analysis \\u2014 lines, tools, token cost">\\uD83D\\uDD0D</button> ':'';
     return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td>'+Number(e.credits).toFixed(1)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
@@ -721,17 +724,40 @@ function toggleLedgerDetail(id){
     +ledTierRow('Cache write',tt.cacheWrite||0,tc.cacheWrite||0,credTotal,'storing context for reuse')
     +ledTierRow('Output',tt.output||0,tc.output||0,credTotal,'model-generated tokens')
     +'</tbody></table>';
+  if(e.debugUsage){
+    var reqs=e.debugUsage.requests||[];
+    var cachedKnown=reqs.every(function(r){return typeof r.cachedTokens==='number';});
+    var cached=reqs.reduce(function(n,r){return n+(r.cachedTokens||0);},0);
+    tip='Recorded charges include the model request\\u2019s billing rules. Per-tier credit prices are not reported here; no cache discount or price estimate is applied again.'
+      +(e.debugUsage.unpricedRequests?' <strong>Incomplete request detail: '+e.debugUsage.unpricedRequests+' model call(s) lack a per-call charge.</strong>':'')
+      +(e.debugUsage.exportCredits!==undefined?' A matched export supplies an aggregate charge; the ledger retains the larger recorded total.':'')
+      +(e.debugUsage.logWarnings?' <strong>Some log records or edit counts could not be read. Usage or code impact may be incomplete; see Debug Usage output.</strong>':'')
+      +(e.debugUsage.creditsOverridden?' <strong>The ledger amount is manually overridden; capture will preserve your correction.</strong>':'');
+    var recorded=reqs.reduce(function(n,r){return n+(r.credits||0);},0);
+    tiersTbl='<table><tbody><tr><td>Model calls</td><td>'+reqs.length+'</td></tr><tr><td>Input tokens</td><td>'+(e.promptTokens||0).toLocaleString()+'</td></tr><tr><td>Output tokens</td><td>'+(e.completionTokens||0).toLocaleString()+'</td></tr><tr><td>Cached input tokens (part of input)</td><td>'+(cachedKnown?cached.toLocaleString():'Not fully reported')+'</td></tr><tr><td>Known per-call credits</td><td>'+recorded.toFixed(6)+'</td></tr></tbody></table>';
+    var models=new Map();
+    reqs.forEach(function(r){
+      var m=models.get(r.model)||{calls:0,input:0,output:0,credits:0,unknown:0};
+      m.calls++;m.input+=r.inputTokens;m.output+=r.outputTokens;
+      if(r.credits===null)m.unknown++;else m.credits+=r.credits;
+      models.set(r.model,m);
+    });
+    tiersTbl+='<table><thead><tr><th>Model</th><th>Calls</th><th>Input / output</th><th>Known credits</th></tr></thead><tbody>'+Array.from(models).map(function(pair){
+      var m=pair[1];return'<tr><td>'+esc(pair[0])+'</td><td>'+m.calls+'</td><td>'+m.input.toLocaleString()+' / '+m.output.toLocaleString()+'</td><td>'+m.credits.toFixed(6)+(m.unknown?' (partial)':'')+'</td></tr>';
+    }).join('')+'</tbody></table>';
+  }
   var files=(an.files||[]).slice().sort(function(a,b){return(b.added+b.removed)-(a.added+a.removed);});
   var fileRows=files.map(function(f){
     var cat=f.category?'<span class="badge bp">'+esc(CAT[f.category]||f.category)+'</span>':'\\u2014';
     var cr=f.created?' <span class="badge ba">new</span>':'';
     return'<tr><td style="font-family:monospace;font-size:.85em" title="'+esc(f.path)+'">'+esc(ledBase(f.path))+cr+'</td><td>'+cat+'</td><td class="dc"><span style="color:var(--added)">+'+f.added+'</span></td><td class="dc"><span style="color:var(--deleted)">-'+f.removed+'</span></td><td class="dc">'+f.edits+'</td></tr>';
-  }).join('')||'<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No file edits in this turn (read/search-only)</td></tr>';
+  }).join('')||'<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No measurable file edits recorded. Terminal/external edits may not expose a diff.</td></tr>';
   var filesTbl='<table style="margin:4px 0"><thead><tr><th>File</th><th>Category</th><th class="dc">+Added</th><th class="dc">-Removed</th><th class="dc">Edits</th></tr></thead><tbody>'+fileRows+'</tbody></table>';
+  if(e.debugUsage)filesTbl+='<p style="font-size:.8em;color:var(--vscode-descriptionForeground)">Successful, measurable tool edits only; repeated edits accumulate. Not the final git diff. These counts are diagnostic and are not added again to editor-tracked effort.</p>';
   var tools=(an.tools||[]).slice().sort(function(a,b){return b.count-a.count;});
   var toolChips=tools.map(function(x){return'<span class="badge bp" style="margin:2px">'+esc(x.name)+' \\u00D7'+x.count+'</span>';}).join('')||'<span style="color:var(--vscode-descriptionForeground)">none</span>';
   // Efficiency ratios
-  var perNet=netLines>0?(e.credits/netLines):null;
+  var perNet=!e.debugUsage&&netLines>0?(e.credits/netLines):null;
   var effHtml='<div style="display:flex;gap:18px;flex-wrap:wrap;margin:8px 0;font-size:.88em">'
     +'<span>\\uD83E\\uDDFE <strong>'+Number(e.credits).toFixed(2)+'</strong> credits</span>'
     +'<span>\\u270F\\uFE0F net <strong style="color:var(--added)">'+(netLines>=0?'+':'')+netLines+'</strong> lines ('+(an.totalAdded||0)+' added / '+(an.totalRemoved||0)+' removed)</span>'
@@ -744,7 +770,7 @@ function toggleLedgerDetail(id){
     +effHtml
     +'<div style="background:var(--vscode-editorWidget-background,rgba(128,128,128,.08));border-left:3px solid var(--ai);padding:6px 10px;border-radius:4px;margin:6px 0;font-size:.88em">'+tip+'</div>'
     +'<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start">'
-    +'<div style="flex:1;min-width:320px"><div style="font-weight:600;font-size:.9em;margin:6px 0 2px">Token cost breakdown</div>'+tiersTbl+'</div>'
+    +'<div style="flex:1;min-width:320px"><div style="font-weight:600;font-size:.9em;margin:6px 0 2px">'+(e.debugUsage?'Recorded usage':'Token cost breakdown')+'</div>'+tiersTbl+'</div>'
     +'<div style="flex:1;min-width:320px"><div style="font-weight:600;font-size:.9em;margin:6px 0 2px">Files changed</div>'+filesTbl+'</div>'
     +'</div>'
     +'<div style="font-weight:600;font-size:.9em;margin:8px 0 4px">Tools used</div><div>'+toolChips+'</div>'

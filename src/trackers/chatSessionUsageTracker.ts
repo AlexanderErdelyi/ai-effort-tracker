@@ -8,11 +8,10 @@ import { estimateCreditsAiu, exactCreditsFromCopilotUsage } from '../util/aiuRat
 
 /**
  * Auto-captures REAL per-request chat usage (tokens → AIU credits) by tailing VS
- * Code's own chat session storage (issue #59). This complements — and does NOT
- * replace — {@link ChatUsageTracker} (issue #17), which tails the Copilot Chat
- * *extension log* and only sees `model + latency` (no tokens). The two use
- * distinct ledger note namespaces (`auto:jsonl:` here vs `auto:ccreq:` there) so
- * they never collide or double-count.
+ * Code's own chat session storage (issue #59). This is a legacy fallback when
+ * recorded debug-log capture and export-folder capture are disabled. It must
+ * not run alongside {@link ChatUsageTracker}: distinct note namespaces alone
+ * do not prevent two sources from charging the same calls.
  *
  * Storage (verified — see issue #59 + comments):
  * `%APPDATA%\Code\User\workspaceStorage\<wsHash>\chatSessions\<sessionId>.jsonl`

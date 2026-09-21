@@ -39,6 +39,51 @@
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
 
+## Recorded Copilot credits and code impact
+
+Live capture reads this VS Code window's workspace storage:
+`GitHub.copilot-chat/debug-logs/<session-id>/main.jsonl`. It uses the recorded
+`copilotUsageNanoAiu / 1,000,000,000` charge for each physical model call, including
+agent/tool rounds. It does not estimate a charge from generated lines or reapply a
+token/cache price to an already recorded charge. A missing charge is **unknown**;
+the ledger labels the known subtotal as partial. GitHub billing is still the
+source for final billed spend, allowances and adjustments.
+
+- `aiEffortTracker.captureDebugLogs` is enabled by default. It replaces both live
+  estimators and automatic export-folder imports (reload after changing it).
+  Disabling it restores the export-folder mode or one legacy estimator.
+- New user turns observed while the extension is running are tracked automatically.
+  The branch is captured when the turn is first observed and retained through later
+  rounds and restarts. A branch transition between polls is ambiguous; those turns
+  are parked under `unknown` rather than silently assigned to the wrong work item.
+- Existing, unsynced history is **not** assigned to the currently checked-out
+  branch automatically. Run **AI Effort Tracker: Import Copilot Debug Session**
+  (also in the Ledger) and explicitly select the chat and branch. Repeat imports
+  update the same entries; they do not rewrite existing attribution.
+- Ledger drill-down shows token counts and successful, measurable tool edits,
+  including `apply_patch`. Additions/removals are accumulated edit activity, not
+  the final git diff. These diagnostics **do not increment editor effort again**.
+  Terminal scripts, external changes, failed tools, or tools without before/after
+  data cannot be treated as measured changes.
+
+Only compact request identities, charges, token counts, file paths and edit counts
+are saved in the effort store. Prompts, source content, tool arguments and results
+are discarded after parsing; the system-prompt and tool-definition files are not
+read. The live scanner retains metadata for at most 200 recent sessions and 5,000
+turn bindings, reads at most 16 MiB per log, and skips oversized logs with a message
+in **AI Effort Tracker — Debug Usage**. It never deletes Copilot's own logs. Older
+sessions remain available for explicit import; compact ledger history is retained.
+
+Capture requires logs to exist locally in this window's workspace storage. Missing
+logs are not evidence of zero usage. In remote development the Copilot logs and this
+extension may be on different hosts; this feature does not scan other workspaces
+or silently fall back to guessed charges.
+
+Existing manual entries are preserved. Older automatic/imported entries are
+reconciled only when request identities establish an overlap; unrelated history is
+never globally deleted. Old entries without usable identities may need manual
+review before importing overlapping history.
+
 ## Development
 
 ```bash
