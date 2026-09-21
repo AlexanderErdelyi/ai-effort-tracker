@@ -4,13 +4,14 @@ import * as vscode from 'vscode';
  * Effort categories. The set was expanded (M3, issue #14) from the original
  * `code | spec | config | other` to reflect real work types. Older category
  * keys are still tolerated by the dashboard (it falls back to the raw key), and
- * stored line data is keyed by file extension — not by category — so no data
- * migration is required.
+ * Raw line data is keyed by extension. Effective counters also retain category
+ * attribution, which the store updates when known file paths are reclassified.
  */
 export type FileCategory =
   | 'programming'
   | 'specification'
   | 'documentation'
+  | 'translation'
   | 'deployment'
   | 'config'
   | 'other';
@@ -19,6 +20,7 @@ export const ALL_CATEGORIES: FileCategory[] = [
   'programming',
   'specification',
   'documentation',
+  'translation',
   'deployment',
   'config',
   'other'
@@ -28,10 +30,18 @@ export const CATEGORY_LABELS: Record<FileCategory, string> = {
   programming: '💻 Programming',
   specification: '📋 Specification',
   documentation: '📄 Documentation',
+  translation: 'Translations',
   deployment: '🚀 Deployment',
   config: '⚙️ Config',
   other: '📦 Other'
 };
+
+const TRANSLATION_EXTENSIONS = new Set(['xlf', 'xliff', 'po', 'pot', 'resx']);
+
+/** Translation volume is diagnostic, not a programming productivity proxy. */
+export function countsTowardProductivity(category: string): boolean {
+  return category !== 'translation';
+}
 
 /** Built-in extension → category defaults. User settings override these. */
 const DEFAULT_EXT_RULES: Record<string, FileCategory> = {
@@ -80,18 +90,18 @@ function isValidCategory(value: unknown): value is FileCategory {
 }
 
 /** Read user-configured rules from settings (best effort). */
-function readUserRules(): CategoryRules {
+function readUserRules(legacyDefaults = false): CategoryRules {
   const extensions: Record<string, FileCategory> = {};
   const folders: Record<string, FileCategory> = {};
   try {
     const cfg = vscode.workspace.getConfiguration('aiEffortTracker');
     const extRules = cfg.get<Record<string, string>>('categoryRules.extensions') ?? {};
     for (const [k, v] of Object.entries(extRules)) {
-      if (isValidCategory(v)) extensions[normalizeExtKey(k)] = v;
+      if (isValidCategory(v) && !(legacyDefaults && v === 'translation')) extensions[normalizeExtKey(k)] = v;
     }
     const folderRules = cfg.get<Record<string, string>>('categoryRules.folders') ?? {};
     for (const [k, v] of Object.entries(folderRules)) {
-      if (isValidCategory(v)) folders[k] = v;
+      if (isValidCategory(v) && !(legacyDefaults && v === 'translation')) folders[k] = v;
     }
   } catch { /* vscode config unavailable — fall back to defaults */ }
   return { extensions, folders };
@@ -150,6 +160,7 @@ export function categorizeExt(ext: string): FileCategory {
   const key = ext.toLowerCase();
   const { extensions } = readUserRules();
   if (extensions[key]) return extensions[key];
+  if (TRANSLATION_EXTENSIONS.has(key)) return 'translation';
   if (DEFAULT_EXT_RULES[key]) return DEFAULT_EXT_RULES[key];
   return 'other';
 }
@@ -157,10 +168,12 @@ export function categorizeExt(ext: string): FileCategory {
 /**
  * Path-aware categorization. Folder rules take precedence over extension rules,
  * and user rules take precedence over built-in defaults.
+ * legacyDefaults reproduces pre-translation classification for stored counters
+ * that predate per-file category attribution.
  */
-export function categorize(filePath: string): FileCategory {
+export function categorize(filePath: string, legacyDefaults = false): FileCategory {
   const normPath = filePath.replace(/\\/g, '/').toLowerCase();
-  const { extensions, folders } = readUserRules();
+  const { extensions, folders } = readUserRules(legacyDefaults);
 
   for (const [pattern, cat] of Object.entries(folders)) {
     if (folderMatches(pattern, normPath)) return cat;
@@ -169,6 +182,7 @@ export function categorize(filePath: string): FileCategory {
   const ext = getFileExt(filePath);
   let cat: FileCategory;
   if (extensions[ext]) cat = extensions[ext];
+  else if (!legacyDefaults && TRANSLATION_EXTENSIONS.has(ext)) cat = 'translation';
   else if (DEFAULT_EXT_RULES[ext]) cat = DEFAULT_EXT_RULES[ext];
   else cat = 'other';
 

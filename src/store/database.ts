@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
-import { ALL_CATEGORIES } from '../util/fileTypes';
+import { ALL_CATEGORIES, categorize, countsTowardProductivity } from '../util/fileTypes';
 import type { FileCategory } from '../util/fileTypes';
 import {
   resolveEffectiveRates,
@@ -431,6 +431,8 @@ export interface FileStat {
   /** Canonical meaningful line versions, excluding unchanged rewrite churn. */
   effectiveHuman?: number;
   effectiveAi?: number;
+  /** Category owning this file's persisted effective counters. */
+  effectiveCategory?: FileCategory;
 }
 
 /** A completed uninterrupted focus/flow session. */
@@ -1432,8 +1434,11 @@ export function mergeManualRollup(target: BranchRollup, m: ManualRollup): void {
   target.linesHumanDeleted += m.linesHumanDeleted;
   target.linesAiAdded += m.linesAiAdded;
   target.linesAiDeleted += m.linesAiDeleted;
-  target.effectiveLinesHuman += m.linesHumanAdded + m.linesHumanDeleted;
-  target.effectiveLinesAi += m.linesAiAdded + m.linesAiDeleted;
+  const translation = m.byCategory.translation;
+  target.effectiveLinesHuman += m.linesHumanAdded + m.linesHumanDeleted -
+    (translation ? translation.human.added + translation.human.deleted : 0);
+  target.effectiveLinesAi += m.linesAiAdded + m.linesAiDeleted -
+    (translation ? translation.ai.added + translation.ai.deleted : 0);
   // Keep the AI-line cost estimate consistent with the folded-in AI lines.
   target.estimatedCostUsd += m.linesAiAdded * COST_PER_AI_LINE_USD;
   for (const cat of Object.keys(m.byCategory)) {
@@ -1925,6 +1930,34 @@ export class Database {
     this.save();
   }
 
+  /** Move only retained, attributable counters; never guess at pruned history. */
+  private reclassifyEffectiveFiles(data: BranchData): void {
+    if (!data.effectiveLines || data.effectiveLinesVersion !== 2) return;
+    let changed = false;
+    for (const [filePath, file] of Object.entries(data.files ?? {})) {
+      if (file.effectiveHuman === undefined && file.effectiveAi === undefined) continue;
+      const previous = file.effectiveCategory ?? categorize(filePath, true);
+      const next = categorize(filePath);
+      if (previous !== next) {
+        const from = data.effectiveLines[previous];
+        if (from) {
+          const to = (data.effectiveLines[next] ??= { human: 0, ai: 0 });
+          const human = Math.min(Math.max(0, from.human), file.effectiveHuman ?? 0);
+          const ai = Math.min(Math.max(0, from.ai), file.effectiveAi ?? 0);
+          from.human -= human;
+          from.ai -= ai;
+          to.human += human;
+          to.ai += ai;
+        }
+      }
+      if (file.effectiveCategory !== next) {
+        file.effectiveCategory = next;
+        changed = true;
+      }
+    }
+    if (changed) this.save();
+  }
+
   /**
    * Record meaningful line versions after the editor tracker has removed unchanged
    * rewrite noise. These compact counters are the canonical productivity measure;
@@ -1938,6 +1971,7 @@ export class Database {
   ): void {
     if (!Number.isFinite(count) || count <= 0) return;
     const data = this.ensureBranch(branch);
+    this.reclassifyEffectiveFiles(data);
     if ((data.effectiveLinesVersion ?? 0) < 2) {
       data.effectiveLines = {};
       data.effectiveLegacyBaseline = {};
@@ -1965,6 +1999,7 @@ export class Database {
     });
     if (source === 'ai') f.effectiveAi = (f.effectiveAi ?? 0) + count;
     else f.effectiveHuman = (f.effectiveHuman ?? 0) + count;
+    f.effectiveCategory = category;
     f.lastTs = Date.now();
 
     // Keep per-file diagnostic state bounded. Category totals are retained.
@@ -3237,6 +3272,7 @@ export class Database {
 
   getSummaryForBranch(branch: string): BranchSummary {
     const data = this.ensureBranch(branch);
+    this.reclassifyEffectiveFiles(data);
     const { categorize, categorizeExt, ALL_CATEGORIES } = require('../util/fileTypes');
 
     let linesHumanAdded = 0, linesHumanDeleted = 0;
@@ -3286,8 +3322,10 @@ export class Database {
         human: legacy.human + current.human,
         ai: legacy.ai + current.ai
       };
-      effectiveLinesHuman += legacy.human + current.human;
-      effectiveLinesAi += legacy.ai + current.ai;
+      if (countsTowardProductivity(cat)) {
+        effectiveLinesHuman += legacy.human + current.human;
+        effectiveLinesAi += legacy.ai + current.ai;
+      }
     }
     // Pre-v11 data has no effective counters. Preserve historical behavior until
     // new edits establish the canonical metric instead of making value disappear.
@@ -3301,6 +3339,8 @@ export class Database {
           ai: src?.ai.added ?? 0
         };
       }
+      effectiveLinesHuman -= effectiveByCategory.translation?.human ?? 0;
+      effectiveLinesAi -= effectiveByCategory.translation?.ai ?? 0;
     }
     const projectId = data.workItemId
       ? this.workItems[data.workItemId]?.projectId ?? null

@@ -39,6 +39,25 @@
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
 
+## Translation line tracking
+
+XLF, XLIFF, PO, POT and RESX files default to the **Translations** category.
+For JSON or other localization files, use a folder rule such as
+`"aiEffortTracker.categoryRules.folders": { "Translations": "translation" }`.
+Explicit user category rules still take precedence.
+
+Translation effective lines are shown separately for branches, work items and
+projects, and in file-category breakdowns. They are excluded from headline
+productivity effective lines, velocity, manual-equivalent time and generated
+value. Actual time, credit costs and financial ROI are not removed or discounted.
+These are changed-line counts, not translated words or a monetary valuation of
+translation work.
+
+Existing effective counters are reclassified when retained per-file counts
+identify their category; totals and raw churn are preserved. Old aggregate-only
+baselines or pruned file history cannot be reliably separated retroactively and
+are not guessed. The reclassification is persisted and does not repeat on reload.
+
 ## Recorded Copilot credits and code impact
 
 Live capture reads this VS Code window's workspace storage:

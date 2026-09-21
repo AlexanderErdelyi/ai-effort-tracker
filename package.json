@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.20.1",
+  "version": "0.21.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.90.0"
@@ -353,13 +353,14 @@
         "aiEffortTracker.categoryRules.extensions": {
           "type": "object",
           "default": {},
-          "markdownDescription": "Categorize files by extension. Keys may be `al`, `.al`, or `*.al`; values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. These override the built-in defaults.",
+          "markdownDescription": "Categorize files by extension. Values: `programming`, `specification`, `documentation`, `translation`, `deployment`, `config`, `other`. Keys may be `al`, `.al`, or `*.al`. XLF, XLIFF, PO, POT and RESX default to translation; translation lines are tracked separately and excluded from productivity/generated-value estimates. These rules override built-in defaults.",
           "additionalProperties": {
             "type": "string",
             "enum": [
               "programming",
               "specification",
               "documentation",
+              "translation",
               "deployment",
               "config",
               "other"
@@ -369,13 +370,14 @@
         "aiEffortTracker.categoryRules.folders": {
           "type": "object",
           "default": {},
-          "markdownDescription": "Categorize files by folder/path. Keys are folder names or glob patterns (e.g. `docs`, `src/specs`, `**/deploy/**`); values are one of `programming`, `specification`, `documentation`, `deployment`, `config`, `other`. Folder rules take precedence over extension rules.",
+          "markdownDescription": "Categorize files by folder/path. Keys are folder names or glob patterns (e.g. `docs`, `src/specs`, `Translations`); values are one of `programming`, `specification`, `documentation`, `translation`, `deployment`, `config`, `other`. Use translation for JSON or other localization files in a dedicated folder. Folder rules take precedence over extension rules.",
           "additionalProperties": {
             "type": "string",
             "enum": [
               "programming",
               "specification",
               "documentation",
+              "translation",
               "deployment",
               "config",
               "other"

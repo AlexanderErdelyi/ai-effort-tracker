@@ -163,6 +163,14 @@ function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';retur
 function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function activeMsOf(x){return(x.humanCodingMs||0)+(x.aiGeneratingMs||0)+(x.reviewingMs||0);}
+function translationSummaryHtml(x){
+  var t=x&&x.effectiveByCategory&&x.effectiveByCategory.translation;
+  if(!t||!(t.human+t.ai))return'';
+  return'<div class="card" style="margin:12px 0"><h3>Translations (separate)</h3><div class="sg">'
+    +sc('Translation effective lines',String(t.human+t.ai))
+    +sc('Human',String(t.human),'var(--human)')+sc('AI',String(t.ai),'var(--ai)')
+    +'</div><p style="margin-top:8px;font-size:.85em;color:var(--vscode-descriptionForeground)">Excluded from productivity effective lines, velocity, manual-equivalent time and generated value. Tracked time and credit costs remain included. Translation line counts are not translated-word counts.</p></div>';
+}
 
 function billingHtml(){
   var imp='<button class="dtab" data-action="cmd" data-value="importCredits" style="margin-top:10px">\\u21bb Import / refresh usage</button>';
@@ -471,7 +479,7 @@ function roiOf(x){return (x&&x.roi)?x.roi:{currency:'USD',creditCost:null,netVal
 // Currency an attributed ledger row should render in: its project's effective
 // currency when resolvable, else USD (issue #45 — no hardcoded '$').
 function projCurrency(pid){var p=pid&&PROJ.find(function(x){return x.projectId===pid;});return (p&&p.roi&&p.roi.currency)||'USD';}
-function aiPctOf(x){var t=(x.linesHumanAdded||0)+(x.linesAiAdded||0);return t>0?Math.round((x.linesAiAdded/t)*100):0;}
+function aiPctOf(x){return Number(aiPct(x));}
 function projToolbar(){
   return'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">'
     +'<button class="dtab" data-action="cmd" data-value="createProject">\\uFF0B New Project</button>'
@@ -531,6 +539,7 @@ function renderProjectDetail(){
     +'<div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(act)+'</div></div>'
     +'<div class="st"><div class="lbl">Credits</div><div class="val" style="color:var(--cost)">'+credits.toFixed(1)+'</div></div>'
     +'<div class="st"><div class="lbl">ROI Net</div><div class="val">'+roi+'</div></div></div>'
+    +translationSummaryHtml(p)
     +'<p class="sub" style="margin:12px 0 6px">Repos: '+repos+'</p>'
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
     +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
@@ -649,6 +658,7 @@ function renderWorkItemDetail(){
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
     +manualSplitHtml(w)
+    +translationSummaryHtml(w)
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button>'+(genH==null?'':'<button class="dtab" data-action="bhUse" data-id="'+esc(w.workItemId)+'" data-hours="'+esc(genH)+'" title="Prefill billable hours with the generated-lines equivalent (\\u2248 '+genH+'h)">\\u26A1 Use as Billable Hours</button>')+'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button><button class="dtab" data-action="wiDel" data-id="'+esc(w.workItemId)+'" title="Delete this work item \\u2014 its branches, credits and effort move to Unassigned (nothing is deleted)">\\uD83D\\uDDD1 Delete Work Item</button></div>'
     +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
@@ -811,6 +821,7 @@ function showDetail(branch){
     +sc('Effective Lines',String(I.totalNet),'var(--vscode-foreground)')
     +sc('Active Time',fmtMin(I.activeMin),'var(--review)')
     +'</div>'
+    +translationSummaryHtml(d)
     +'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDE80 Productivity Story</h3>'
     +'<p style="line-height:1.7;margin-top:8px">In <strong>'+fmtMin(I.activeMin)+'</strong> of active work you produced <strong>'+I.totalNet+'</strong> effective changed lines '
     +'(<strong style="color:var(--ai)">'+I.aiShare.toFixed(0)+'%</strong> from AI) at <strong>'+I.velocity.toFixed(1)+' loc/min</strong>. '
@@ -844,6 +855,7 @@ function showDetail(branch){
     netCatCard='<div class="card"><h3>\\uD83D\\uDCD0 Net by Category (git)</h3><table><thead><tr><th>Category</th><th>+Added</th><th>-Removed</th><th>Net</th></tr></thead><tbody>'+netCatRows+'</tbody></table></div>';
   }
   var effectiveHtml='<div class="card" style="margin-bottom:14px"><h3>\\u2705 Effective changed lines</h3><div class="sg" style="margin-top:12px"><div class="st"><div class="lbl">Human</div><div class="val" style="color:var(--human)">'+(d.effectiveLinesHuman||0)+'</div></div><div class="st"><div class="lbl">AI</div><div class="val" style="color:var(--ai)">'+(d.effectiveLinesAi||0)+'</div></div><div class="st"><div class="lbl">Total</div><div class="val">'+((d.effectiveLinesHuman||0)+(d.effectiveLinesAi||0))+'</div></div></div><p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">Canonical meaningful line versions used for productivity, equivalent time, generated value and estimate actuals. Unchanged full-file rewrite noise is excluded; later corrections count as additional effective work.</p></div>';
+  effectiveHtml+=translationSummaryHtml(d);
   document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="val" style="color:var(--cost)">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="val" style="color:var(--added)">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="val" style="color:var(--ai)">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="val" style="color:var(--deleted)">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="val" style="color:var(--review)">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="val" style="color:var(--human)">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="val" style="color:var(--ai)">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="val" style="color:var(--cost)">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="card" style="margin-top:16px"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
