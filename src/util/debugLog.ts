@@ -36,6 +36,7 @@ export interface DebugLogResult {
 interface Row {
   line: number;
   sid: string;
+  scope: string;
   ts: number;
   dur: number;
   type: string;
@@ -69,50 +70,70 @@ function successful(row: Row): boolean {
  * Repeated snapshots of a span replace its usage, never add to it. A responseId
  * alone cannot identify physical calls, so spanless records are diagnosed.
  */
-export function parseDebugLog(text: string): DebugLogResult {
+export function parseDebugLog(mainText: string, relatedLogs: string[] = []): DebugLogResult {
   const diagnostics: string[] = [], rows: Row[] = [];
-  const raw = text.replace(/^\uFEFF/, '').split(/\r?\n/);
-  let session = '', ignoredPartialLine = false;
-  for (let i = 0; i < raw.length; i++) {
-    if (!raw[i].trim()) continue;
-    let value: unknown;
-    try { value = JSON.parse(raw[i]); } catch {
-      if (i === raw.length - 1 && !text.endsWith('\n')) ignoredPartialLine = true;
-      else diagnostics.push(`Line ${i + 1}: malformed JSON record ignored.`);
-      continue;
+  const parentSessions = new Map<string, string>();
+  let ignoredPartialLine = false;
+  for (const text of [mainText, ...relatedLogs]) {
+    const raw = text.replace(/^\uFEFF/, '').split(/\r?\n/);
+    let session = '';
+    const scopes = new Map<string, string>();
+    for (let i = 0; i < raw.length; i++) {
+      if (!raw[i].trim()) continue;
+      let value: unknown;
+      try { value = JSON.parse(raw[i]); } catch {
+        if (i === raw.length - 1 && !text.endsWith('\n')) ignoredPartialLine = true;
+        else diagnostics.push(`Line ${i + 1}: malformed JSON record ignored.`);
+        continue;
+      }
+      if (!object(value) || !str(value.type)) {
+        diagnostics.push(`Line ${i + 1}: invalid debug record ignored.`);
+        continue;
+      }
+      const sid = str(value.sid) || session;
+      if (value.type === 'session_start') session = sid;
+      if (!sid) {
+        diagnostics.push(`Line ${i + 1}: missing session identity; record ignored.`);
+        continue;
+      }
+      const ts = validNumber(value.ts) ? value.ts
+        : typeof value.ts === 'string' ? Date.parse(value.ts) : NaN;
+      if (value.type === 'session_start' && Number.isFinite(ts)) {
+        scopes.set(sid, key(sid, String(ts)));
+        if (object(value.attrs) && str(value.attrs.parentSessionId)) {
+          parentSessions.set(scopes.get(sid)!, str(value.attrs.parentSessionId));
+        }
+      }
+      rows.push({ line: i + 1, sid, scope: scopes.get(sid) ?? sid, ts, dur: num(value.dur), type: str(value.type),
+        name: str(value.name), spanId: str(value.spanId), parentSpanId: str(value.parentSpanId),
+        status: str(value.status).toLowerCase(), attrs: object(value.attrs) ? value.attrs : {} });
     }
-    if (!object(value) || !str(value.type)) {
-      diagnostics.push(`Line ${i + 1}: invalid debug record ignored.`);
-      continue;
-    }
-    const sid = str(value.sid) || session;
-    if (value.type === 'session_start') session = sid;
-    if (!sid) {
-      diagnostics.push(`Line ${i + 1}: missing session identity; record ignored.`);
-      continue;
-    }
-    const ts = validNumber(value.ts) ? value.ts
-      : typeof value.ts === 'string' ? Date.parse(value.ts) : NaN;
-    rows.push({ line: i + 1, sid, ts, dur: num(value.dur), type: str(value.type),
-      name: str(value.name), spanId: str(value.spanId), parentSpanId: str(value.parentSpanId),
-      status: str(value.status).toLowerCase(), attrs: object(value.attrs) ? value.attrs : {} });
   }
 
   const nodes = new Map<string, Row>();
   const roots = new Map<string, DebugLogTurn>();
+  const identities = new Map<string, string>();
+  function persistedId(row: Row): string {
+    if (parentSessions.has(row.scope)) return key(row.scope, row.spanId);
+    const id = key(row.sid, row.spanId);
+    const firstScope = identities.get(id);
+    if (!firstScope) identities.set(id, row.scope);
+    return !firstScope || firstScope === row.scope ? row.spanId : key(row.scope, row.spanId);
+  }
   for (const row of rows) {
     if (row.spanId) {
-      const id = key(row.sid, row.spanId), previous = nodes.get(id);
+      persistedId(row);
+      const id = key(row.scope, row.spanId), previous = nodes.get(id);
       const attrs = { ...previous?.attrs, ...row.attrs };
       if (!validNumber(attrs.copilotUsageNanoAiu) && validNumber(previous?.attrs.copilotUsageNanoAiu)) {
         attrs.copilotUsageNanoAiu = previous.attrs.copilotUsageNanoAiu;
       }
       nodes.set(id, previous ? { ...row, parentSpanId: row.parentSpanId || previous.parentSpanId, attrs } : row);
     }
-    if (row.type !== 'user_message' || !row.spanId) continue;
-    const id = key(row.sid, row.spanId);
+    if (row.type !== 'user_message' || !row.spanId || parentSessions.has(row.scope)) continue;
+    const id = key(row.scope, row.spanId);
     if (!roots.has(id) && Number.isFinite(row.ts)) roots.set(id, {
-      sessionId: row.sid, turnId: row.spanId, timestamp: row.ts, requests: [],
+      sessionId: row.sid, turnId: persistedId(row), timestamp: row.ts, requests: [],
       credits: 0, unknownRequestCount: 0, responseIds: [], requestAliases: [], analysis: analysis()
     });
   }
@@ -123,20 +144,34 @@ export function parseDebugLog(text: string): DebugLogResult {
   for (const row of rows) {
     if (row.type !== 'turn_start' && row.type !== 'turn_end') continue;
     const encoded = /^(?:turn_start|turn_end)-(.+)-[^-]+$/.exec(row.spanId)?.[1];
-    if (encoded && roots.has(key(row.sid, encoded))) {
-      markerRoots.set(key(row.sid, row.spanId), key(row.sid, encoded));
+    if (encoded && nodes.has(key(row.scope, encoded))) {
+      markerRoots.set(key(row.scope, row.spanId), key(row.scope, encoded));
     }
   }
+  const linkedInvocations = new Set<string>();
   function rootOf(row: Row): DebugLogTurn | undefined {
-    let id = key(row.sid, row.spanId);
+    let id = key(row.scope, row.spanId);
     const visited = new Set<string>();
     while (!visited.has(id)) {
       visited.add(id);
-      const root = roots.get(id) ?? roots.get(markerRoots.get(id) ?? '');
+      const root = roots.get(id);
       if (root) return root;
+      const marker = markerRoots.get(id);
+      if (marker) { id = marker; continue; }
       const node = nodes.get(id);
       if (!node?.parentSpanId) return undefined;
-      id = key(row.sid, node.parentSpanId);
+      const localParent = key(node.scope, node.parentSpanId);
+      if (nodes.has(localParent)) { id = localParent; continue; }
+      const parentSid = parentSessions.get(node.scope);
+      if (!parentSid) return undefined;
+      // Child roots point at a tool span in their declared parent session.
+      // The latest preceding span selects the correct extension-host lifetime.
+      const candidates = [...nodes.values()].filter(p => p.sid === parentSid &&
+        p.type === 'tool_call' && p.spanId === node.parentSpanId && p.ts <= node.ts)
+        .sort((a, b) => b.ts - a.ts);
+      if (!candidates.length) return undefined;
+      id = key(candidates[0].scope, candidates[0].spanId);
+      linkedInvocations.add(id);
     }
     return undefined;
   }
@@ -144,13 +179,13 @@ export function parseDebugLog(text: string): DebugLogResult {
   const requests = new Map<string, Row>(), tools = new Map<string, Row>();
   for (const original of rows) {
     if (original.type !== 'llm_request' && original.type !== 'tool_call') continue;
-    const row = original.spanId ? nodes.get(key(original.sid, original.spanId))! : original;
+    const row = original.spanId ? nodes.get(key(original.scope, original.spanId))! : original;
     const identity = row.spanId;
     if (!identity) {
       diagnostics.push(`Line ${row.line}: missing call identity; record ignored.`);
       continue;
     }
-    (row.type === 'llm_request' ? requests : tools).set(key(row.sid, identity), row);
+    (row.type === 'llm_request' ? requests : tools).set(key(row.scope, identity), row);
   }
 
   for (const row of requests.values()) {
@@ -162,7 +197,7 @@ export function parseDebugLog(text: string): DebugLogResult {
     }
     const a = row.attrs, responseId = str(a.responseId);
     const request: DebugLogRequest = {
-      spanId: row.spanId,
+      spanId: persistedId(row),
       ...(responseId ? { responseId } : {}),
       model: str(a.model) || row.name.replace(/^chat:/, '') || 'unknown',
       inputTokens: num(a.inputTokens), outputTokens: num(a.outputTokens),
@@ -212,6 +247,12 @@ export function parseDebugLog(text: string): DebugLogResult {
       } else turn.analysis.files.push(file);
       turn.analysis.totalAdded += file.added;
       turn.analysis.totalRemoved += file.removed;
+    }
+  }
+  for (const row of tools.values()) {
+    if (row.name === 'runSubagent' && successful(row) && !toolResultFailed(row.attrs.result) &&
+        !linkedInvocations.has(key(row.scope, row.spanId))) {
+      diagnostics.push(`Line ${row.line}: subagent usage is not linked yet; turn total may be incomplete.`);
     }
   }
   return { turns: [...roots.values()].sort((a, b) => a.timestamp - b.timestamp), diagnostics, ignoredPartialLine };

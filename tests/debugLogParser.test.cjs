@@ -12,6 +12,7 @@ const request = (spanId = 'request', attrs = {}, extra = {}) =>
   row('llm_request', spanId, { model: 'model', inputTokens: 100, outputTokens: 10,
     copilotUsageNanoAiu: 1e9, ...attrs }, { parentSpanId: 'root', ...extra });
 const parse = rows => parseDebugLog(rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+const jsonl = rows => rows.map(r => JSON.stringify(r)).join('\n') + '\n';
 const patch = '*** Begin Patch\n*** Update File: C:\\code.ts\n@@\n-old secret\n+new secret\n+other secret\n*** End Patch';
 const tool = (id = 'tool', extra = {}) => row('tool_call', id, {
   args: JSON.stringify({ input: patch, explanation: 'PRIVATE EXPLANATION' }),
@@ -67,6 +68,57 @@ test('same response ID on distinct physical spans is not a duplicate charge', ()
   assert.equal(turns[0].requests.length, 2);
   assert.equal(turns[0].credits, 2);
   assert.deepEqual(turns[0].responseIds, ['shared']);
+});
+
+test('separate subagent logs roll up to the invoking main turn, including nested agents', () => {
+  const main = [root(), request('main', { copilotUsageNanoAiu: 2395285000 }),
+    row('tool_call', 'invoke', {}, { name: 'runSubagent', parentSpanId: 'root' })];
+  const child = [
+    row('session_start', 'start', { parentSessionId: 'session' }, { sid: 'child' }),
+    row('user_message', 'child-root', {}, { sid: 'child', parentSpanId: 'invoke' }),
+    request('main', { copilotUsageNanoAiu: 20224035000 }, { sid: 'child', parentSpanId: 'child-root' }),
+    row('tool_call', 'invoke-nested', {}, { sid: 'child', name: 'runSubagent', parentSpanId: 'child-root' })
+  ];
+  const nested = [
+    row('session_start', 'start', { parentSessionId: 'child' }, { sid: 'nested' }),
+    row('user_message', 'nested-root', {}, { sid: 'nested', parentSpanId: 'invoke-nested' }),
+    request('main', { copilotUsageNanoAiu: 0 }, { sid: 'nested', parentSpanId: 'nested-root' }),
+    tool('edit', { sid: 'nested', parentSpanId: 'nested-root' })
+  ];
+  const result = parseDebugLog(jsonl(main), [jsonl(nested), jsonl(child)]);
+  assert.equal(result.turns.length, 1);
+  assert.equal(result.turns[0].credits.toFixed(6), '22.619320');
+  assert.equal(result.turns[0].requests.length, 3);
+  assert.equal(new Set(result.turns[0].requests.map(r => r.spanId)).size, 3);
+  assert.equal(result.turns[0].analysis.totalAdded, 2);
+  assert.deepEqual(result.diagnostics, []);
+  const mainOnly = parse(main);
+  assert.equal(mainOnly.turns[0].credits.toFixed(6), '2.395285');
+  assert.ok(mainOnly.diagnostics.some(d => d.includes('subagent usage is not linked')));
+  const duplicated = parseDebugLog(jsonl(main), [jsonl(child), jsonl(nested), jsonl(child)]);
+  assert.equal(duplicated.turns[0].credits.toFixed(6), '22.619320');
+  assert.equal(duplicated.turns[0].requests.length, 3);
+  const orphan = parseDebugLog(jsonl(main), [jsonl(nested)]);
+  assert.equal(orphan.turns[0].requests.length, 1);
+  assert.ok(orphan.diagnostics.length);
+});
+
+test('extension-host restarts reusing spans do not merge distinct turns or overwrite model calls', () => {
+  const first = [
+    row('session_start', 'session-start', {}, { ts: 100 }),
+    root(), request('call', { copilotUsageNanoAiu: 1e9 })
+  ];
+  const second = [
+    row('session_start', 'session-start', {}, { ts: 2000 }),
+    { ...root(), ts: 2001 },
+    request('call', { copilotUsageNanoAiu: 2e9 }, { ts: 2002 })
+  ];
+  const initial = parse(first);
+  const result = parse([...first, ...second]);
+  assert.equal(result.turns.length, 2);
+  assert.equal(result.turns[0].turnId, initial.turns[0].turnId);
+  assert.notEqual(result.turns[0].turnId, result.turns[1].turnId);
+  assert.deepEqual(result.turns.map(t => t.credits), [1, 2]);
 });
 
 test('spanless records are diagnosed, not conflated with physical requests by response ID', () => {

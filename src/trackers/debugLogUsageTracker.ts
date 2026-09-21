@@ -9,6 +9,8 @@ import { parseChatAliases } from '../util/chatAliases';
 
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_SESSIONS = 200;
+const MAX_SESSION_BYTES = 64 * 1024 * 1024;
+const MAX_SESSION_FILES = 200;
 
 export interface DebugSessionFile {
   sessionId: string;
@@ -88,12 +90,12 @@ export class DebugLogUsageTracker implements vscode.Disposable {
     this.timer = setInterval(() => void this.poll(), seconds * 1000);
   }
 
-  private async read(file: string): Promise<string> {
+  private async read(file: string, limit = MAX_FILE_BYTES): Promise<string> {
     const handle = await fs.promises.open(file, 'r');
     try {
       const size = (await handle.stat()).size;
-      if (size > MAX_FILE_BYTES) {
-        throw new Error('Debug log exceeds the 16 MiB read limit; use a Chat Debug export instead.');
+      if (size > limit) {
+        throw new Error('Debug log exceeds the bounded read limit; use a Chat Debug export instead.');
       }
 
       // A bounded snapshot: concurrent appends wait until the next poll.
@@ -108,6 +110,37 @@ export class DebugLogUsageTracker implements vscode.Disposable {
     } finally {
       await handle.close();
     }
+  }
+
+  private async sessionFiles(session: DebugSessionFile): Promise<{ files: string[]; stamp: string }> {
+    const dir = path.dirname(session.file);
+    const entries = (await fs.promises.readdir(dir, { withFileTypes: true }))
+      .filter(e => e.isFile() && e.name.endsWith('.jsonl') && e.name !== 'main.jsonl')
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const files = [session.file, ...entries.map(e => path.join(dir, e.name))];
+    if (files.length > MAX_SESSION_FILES) throw new Error('Too many debug-log files in this session; capture is incomplete.');
+    let total = 0;
+    const stamps: string[] = [];
+    for (const file of files) {
+      const stat = await fs.promises.stat(file);
+      total += stat.size;
+      if (stat.size > MAX_FILE_BYTES || total > MAX_SESSION_BYTES) {
+        throw new Error('Debug session exceeds the read limit; capture is incomplete. Use a Chat Debug export.');
+      }
+      stamps.push(`${path.basename(file)}:${stat.mtimeMs}:${stat.size}`);
+    }
+    return { files, stamp: stamps.join('|') };
+  }
+
+  private async parseSession(files: string[]): Promise<ReturnType<typeof parseDebugLog>> {
+    const logs: string[] = [];
+    let remaining = MAX_SESSION_BYTES;
+    for (const file of files) {
+      const text = await this.read(file, Math.min(MAX_FILE_BYTES, remaining));
+      remaining -= Buffer.byteLength(text, 'utf8');
+      logs.push(text);
+    }
+    return parseDebugLog(logs[0], logs.slice(1));
   }
 
   private async aliases(sessionId: string): Promise<Map<string, string[]>> {
@@ -139,10 +172,9 @@ export class DebugLogUsageTracker implements vscode.Disposable {
       let changed = false;
       for (const session of files) {
         try {
-          const stat = await fs.promises.stat(session.file);
-          const stamp = `${stat.mtimeMs}:${stat.size}`;
+          const { files: logFiles, stamp } = await this.sessionFiles(session);
           if (this.seen.get(session.file) === stamp) continue;
-          const parsed = parseDebugLog(await this.read(session.file));
+          const parsed = await this.parseSession(logFiles);
           const aliases = await this.aliases(session.sessionId);
           for (const message of parsed.diagnostics) this.output.warn(`${session.sessionId}: ${message}`);
           if (this.disposed) return;
@@ -189,7 +221,8 @@ export class DebugLogUsageTracker implements vscode.Disposable {
 
   /** Explicit user-selected branch; existing row attribution is never rewritten. */
   async importSession(session: DebugSessionFile, branch: string): Promise<DebugImportResult> {
-    const parsed = parseDebugLog(await this.read(session.file));
+    const { files } = await this.sessionFiles(session);
+    const parsed = await this.parseSession(files);
     for (const diagnostic of parsed.diagnostics) this.output.warn(diagnostic);
     const aliases = await this.aliases(session.sessionId);
     if (parsed.turns.some(turn => turn.sessionId !== session.sessionId)) throw new Error('Debug-log session ID mismatch');
