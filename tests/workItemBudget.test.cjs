@@ -216,7 +216,7 @@ test('budget fields sanitise on load, persist, and notified thresholds merge acr
   assert.equal('costBudget' in wi, false);
   assert.deepEqual(wi.budgetAlerts, [80, 100]);
   db.flushSync();
-  assert.equal(read().schemaVersion, 12);
+  assert.equal(read().schemaVersion, 13);
 
   // Two stale windows: one records 80 and 100 were notified, the other re-arms 100.
   const a = open(), b = open();
@@ -248,4 +248,29 @@ test('MCP list_work_items attaches budget status from the extension snapshot', t
   fs.writeFileSync(snapFile, '{"generatedAt":');
   assert.equal(loadBudgetSnapshot(snapFile), null);
   assert.equal(typeof mergeStores, 'function');
+});
+
+test('health repairs: auto-mapped branches take their unassigned credits along, duplicates are removed', t => {
+  const { open, file } = fixture(t);
+  const db = open();
+  db.recordCredits('feature/x', 'gpt', 5);
+  assert.ok(!db.getCreditEntries()[0].workItemId);
+  db.setWorkItemForBranch('feature/x', '500');
+  assert.equal(db.getCreditEntries()[0].workItemId, '500');
+  db.flushSync();
+
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const turn = { sessionId: 's', turnId: 't', requests: [{ spanId: 'a', model: 'gpt', credits: 2, inputTokens: 1, outputTokens: 1 }], unpricedRequests: 0 };
+  raw.creditLedger.push(
+    { id: 'd1', ts: 1, model: 'gpt', credits: 2, source: 'import', branch: 'feature/y', workItemId: null, debugUsage: turn },
+    { id: 'd2', ts: 2, model: 'gpt', credits: 1, source: 'import', branch: 'feature/y', workItemId: null, debugUsage: { ...turn, requests: [] } });
+  raw.branches['feature/y'] = { ...raw.branches['feature/x'], workItemId: '500' };
+  fs.writeFileSync(file, JSON.stringify(raw));
+  const db2 = open();
+  assert.equal(db2.removeDuplicateLedgerEntries(), 1);
+  assert.equal(db2.reattributeUnassignedCredits(), 1);
+  db2.flushSync();
+  const after = open().getCreditEntries();
+  assert.deepEqual(after.map(e => e.id).filter(id => id.startsWith('d')), ['d1']);
+  assert.equal(after.find(e => e.id === 'd1').workItemId, '500');
 });

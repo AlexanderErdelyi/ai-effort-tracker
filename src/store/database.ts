@@ -20,6 +20,8 @@ import { atomicWrite, readStore, retainPrevious, StoreBusyError, syncDirectory, 
 import { isLegacyOverwrite, mergeStores, STORE_WRITER } from './mergeStore';
 import { MAX_TOOLSETS, type ModelPrice, type ToolsetInfo } from '../util/modelCatalog';
 import { computeBudget, normalizeThresholds, type BudgetDay, type BudgetStatus } from '../analysis/budget';
+import { duplicateLedgerIndexes } from '../analysis/dataHealth';
+import type { TimesheetSourceRow } from '../analysis/timesheet';
 
 export interface LineStats {
   added: number;
@@ -616,7 +618,17 @@ export interface WorkItem {
    * once. Set-like array: concurrent windows merge it as a union.
    */
   budgetAlerts?: number[];
+  /**
+   * Lifecycle status (issue #97). `done` marks the item finished for estimation
+   * statistics; `active` explicitly reopens it (a dormant item without a status
+   * also counts as finished after a while). Absent = open.
+   */
+  status?: WorkItemStatus;
+  /** When the item was marked done (epoch ms). */
+  doneAt?: number;
 }
+
+export type WorkItemStatus = 'active' | 'done';
 
 /** Categories an estimate can be broken down by — reuses {@link FileCategory}. */
 export type EstimateCategory = FileCategory;
@@ -747,6 +759,9 @@ export interface WorkItemSummary {
   estimateUnit?: EstimateUnit;
   externalRef: string | null;
   createdAt: number;
+  /** Lifecycle status (issue #97); absent = open. */
+  status?: WorkItemStatus;
+  doneAt?: number;
   /** Branch names that currently roll up into this work item. */
   branches: string[];
   humanCodingMs: number;
@@ -811,6 +826,8 @@ export interface WorkItemSummary {
   timeEntries?: TimeEntry[];
   /** Budget status across all branches (issue #94). Display-only / derived. */
   budget?: BudgetStatus;
+  /** First/last local day with tracked time or credits (issue #97). */
+  activity?: { firstDay: string | null; lastDay: string | null; activeDays: number };
   /** Explicit budgets as entered (issue #94), for editing. */
   creditBudget?: number | null;
   costBudget?: number | null;
@@ -821,7 +838,7 @@ export type BranchRollup = Omit<
   WorkItemSummary,
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
   | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual' | 'roi'
-  | 'generated' | 'timeEntries' | 'budget' | 'creditBudget' | 'costBudget'
+  | 'generated' | 'timeEntries' | 'budget' | 'creditBudget' | 'costBudget' | 'status' | 'doneAt' | 'activity'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -955,8 +972,11 @@ export interface ProjectRoi extends RoiFigures {
  * `WorkItem.costBudget`) and the notified-threshold list `budgetAlerts`. No
  * rewrite: absent fields mean "no explicit budget / nothing notified yet", and
  * {@link normalizeWorkItemBillableHours} only strips invalid values.
+ *
+ * v13 (issue #97) adds the optional work-item lifecycle `status` ('active' |
+ * 'done') and `doneAt`. No rewrite; invalid values are stripped on load.
  */
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -1287,6 +1307,9 @@ export function normalizeWorkItemBillableHours(workItems: Record<string, WorkIte
         : [];
       if (list.length) wi.budgetAlerts = list; else delete wi.budgetAlerts;
     }
+    // v13 (issue #97): optional lifecycle status.
+    if (wi.status !== undefined && wi.status !== 'active' && wi.status !== 'done') delete wi.status;
+    if (wi.doneAt !== undefined && (typeof wi.doneAt !== 'number' || !Number.isFinite(wi.doneAt) || wi.status !== 'done')) delete wi.doneAt;
   }
 }
 
@@ -1705,6 +1728,12 @@ function dayKey(ts: number = Date.now()): string {
   return `${y}-${m}-${day}`;
 }
 
+/** First/last day with any tracked time or credits (issue #97). */
+function activityOf(daily: BudgetDay[]): { firstDay: string | null; lastDay: string | null; activeDays: number } {
+  const days = daily.filter(d => d.hours > 0 || d.credits > 0).map(d => d.date).sort();
+  return { firstDay: days[0] ?? null, lastDay: days[days.length - 1] ?? null, activeDays: days.length };
+}
+
 function emptyBucket(): DailyBucket {
   return {
     humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0,
@@ -1736,6 +1765,8 @@ export class Database {
   private refreshTimer: NodeJS.Timeout | undefined;
   private dirty = false;
   private saveErrorReported = false;
+  /** Last failed save (issue #104 health check); cleared by the next successful commit. */
+  private lastSaveError: { ts: number; message: string } | null = null;
   private pendingFlush: Promise<void> | undefined;
 
   constructor(storagePath: string) {
@@ -1902,6 +1933,7 @@ export class Database {
 
   private reportSaveError(error: unknown): void {
     console.error('AI Effort Tracker save failed; unsaved changes retained for retry', error);
+    this.lastSaveError = { ts: Date.now(), message: String(error) };
     if (!this.saveErrorReported) {
       this.saveErrorReported = true;
       void vscode.window.showWarningMessage(
@@ -1940,6 +1972,7 @@ export class Database {
       this.modelPrices = merged.modelPrices;
       this.dirty = false;
       this.saveErrorReported = false;
+      this.lastSaveError = null;
       syncDirectory(path.dirname(this.filePath));
     });
   }
@@ -2443,6 +2476,46 @@ export class Database {
   }
 
   /** Read-only snapshot for usage analysis. */
+  /** Raw inputs for the data health check (issue #104). Read-only views. */
+  getHealthData() {
+    return {
+      data: {
+        branches: this.store, workItems: this.workItems, creditLedger: this.creditLedger, projects: this.projects,
+        timeEntries: this.timeEntries, manualEffort: this.manualEffort, modelPrices: this.modelPrices
+      },
+      schemaVersion: this.schemaVersion,
+      filePath: this.filePath,
+      lastSaveError: this.lastSaveError
+    };
+  }
+
+  /** Health repair: drop duplicate credit rows / chat turns, keeping the most complete copy. */
+  removeDuplicateLedgerEntries(): number {
+    const drop = new Set(duplicateLedgerIndexes(this.creditLedger));
+    if (!drop.size) return 0;
+    this.creditLedger = this.creditLedger.filter((_, i) => !drop.has(i));
+    this.save();
+    return drop.size;
+  }
+
+  /**
+   * Health repair: credit rows captured before their branch was linked to a
+   * work item follow the branch's current work item (and its project).
+   */
+  reattributeUnassignedCredits(): number {
+    let n = 0;
+    for (const e of this.creditLedger) {
+      if (e.workItemId && e.workItemId !== UNASSIGNED_WORK_ITEM_ID) continue;
+      const wi = e.branch ? this.store[e.branch]?.workItemId : null;
+      if (!wi || wi === UNASSIGNED_WORK_ITEM_ID || !this.workItems[wi]) continue;
+      e.workItemId = wi;
+      e.projectId = this.workItems[wi].projectId ?? null;
+      n++;
+    }
+    if (n) this.save();
+    return n;
+  }
+
   getUsageData(): UsageData {
     return { creditLedger: this.creditLedger, toolsets: this.toolsets, modelPrices: this.modelPrices,
       branches: this.store, workItems: this.workItems, projects: this.projects };
@@ -2893,10 +2966,21 @@ export class Database {
     const data = this.ensureBranch(branch);
     // Never clobber a manual override with auto-detection.
     if (data.workItemIdManual) return;
+    const previous = data.workItemId;
     data.workItemId = workItemId;
     // A branch may be auto-detected before the work item entity exists; make sure
     // the persisted work item is present so aggregation can find it.
     this.ensureWorkItem(workItemId);
+    // Credits captured while the branch was still unmapped follow it (#104).
+    if (previous !== workItemId && (!previous || previous === UNASSIGNED_WORK_ITEM_ID) && workItemId !== UNASSIGNED_WORK_ITEM_ID) {
+      const projectId = this.workItems[workItemId]?.projectId ?? null;
+      for (const e of this.creditLedger) {
+        if (e.branch === branch && (!e.workItemId || e.workItemId === UNASSIGNED_WORK_ITEM_ID)) {
+          e.workItemId = workItemId;
+          e.projectId = projectId;
+        }
+      }
+    }
     this.save();
   }
 
@@ -3229,6 +3313,7 @@ export class Database {
     const wi = this.ensureWorkItem(workItemId);
     const branches = this.getBranchesForWorkItem(workItemId);
     const branchSummaries = branches.map(b => this.getSummaryForBranch(b));
+    const daily = this.workItemDaily(workItemId, branches);
     const rollup = rollupBranchSummaries(branchSummaries);
     // #21: fold hand-entered corrections into the tracked totals (additive) and
     // expose them separately as `manual` so the UI can show the auto/manual split.
@@ -3272,13 +3357,16 @@ export class Database {
       estimateUnit: wi.estimateUnit ?? 'hours',
       externalRef: wi.externalRef ?? null,
       createdAt: wi.createdAt,
+      ...(wi.status ? { status: wi.status } : {}),
+      ...(wi.doneAt ? { doneAt: wi.doneAt } : {}),
       branches,
       ...rollup,
       manual,
       roi,
       generated,
       timeEntries: this.timeEntriesForWorkItem(workItemId),
-      budget: this.budgetFor(wi, actualHours, credits.credits, roi, rollup.effectiveByCategory, branchSummaries),
+      budget: this.budgetFor(wi, actualHours, credits.credits, roi, rollup.effectiveByCategory, branchSummaries, daily),
+      activity: activityOf(daily),
       creditBudget: wi.creditBudget ?? null,
       costBudget: wi.costBudget ?? null
     };
@@ -3326,9 +3414,53 @@ export class Database {
     return [...days.values()];
   }
 
+  /**
+   * #101: active hours per day for every work item (same source as the budget,
+   * so the timesheet matches work item totals) plus one row for branches that
+   * are not mapped to a work item.
+   */
+  getTimesheetSource(): TimesheetSourceRow[] {
+    const rows: TimesheetSourceRow[] = [];
+    for (const wi of Object.values(this.workItems)) {
+      if (wi.id === UNASSIGNED_WORK_ITEM_ID) continue;
+      rows.push({
+        workItemId: wi.id,
+        title: wi.title ?? null,
+        externalRef: wi.externalRef ?? null,
+        projectId: wi.projectId ?? null,
+        daily: this.workItemDaily(wi.id, this.getBranchesForWorkItem(wi.id))
+      });
+    }
+    const unmapped = new Set(Object.keys(this.store).filter(b => {
+      const id = this.store[b].workItemId;
+      return !id || id === UNASSIGNED_WORK_ITEM_ID || !this.workItems[id];
+    }));
+    const days = new Map<string, number>();
+    const add = (date: string, h: number) => days.set(date, (days.get(date) ?? 0) + h);
+    for (const b of unmapped) {
+      for (const [date, bucket] of Object.entries(this.store[b]?.daily ?? {})) {
+        const ms = (bucket.humanCoding ?? 0) + (bucket.aiGenerating ?? 0) + (bucket.reviewing ?? 0);
+        if (ms > 0) add(date, ms / MS_PER_HOUR);
+      }
+    }
+    for (const e of this.timeEntries) {
+      const loose = e.branch ? unmapped.has(e.branch) : (!e.workItemId || e.workItemId === UNASSIGNED_WORK_ITEM_ID || !this.workItems[e.workItemId]);
+      if (loose && e.source === 'manual' && e.mode !== 'idle' && e.durationMs > 0) add(dayKey(timeEntryTs(e)), e.durationMs / MS_PER_HOUR);
+    }
+    rows.push({
+      workItemId: UNASSIGNED_WORK_ITEM_ID,
+      title: 'Unassigned branches',
+      externalRef: null,
+      projectId: null,
+      daily: [...days].map(([date, hours]) => ({ date, hours }))
+    });
+    return rows;
+  }
+
   private budgetFor(
     wi: WorkItem, usedHours: number, usedCredits: number, roi: RoiFigures,
-    byCategory: Record<string, { human: number; ai: number }>, branchSummaries: BranchSummary[]
+    byCategory: Record<string, { human: number; ai: number }>, branchSummaries: BranchSummary[],
+    daily: BudgetDay[] = this.workItemDaily(wi.id, branchSummaries.map(s => s.branch))
   ): BudgetStatus {
     const settings = this.readBudgetSettings();
     const projectCph = wi.projectId ? this.projects[wi.projectId]?.settings?.creditsPerEstimatedHour : undefined;
@@ -3351,7 +3483,7 @@ export class Database {
       usedHours,
       usedCredits,
       usedCost: roi.totalCost,
-      daily: this.workItemDaily(wi.id, branchSummaries.map(s => s.branch)),
+      daily,
       categoryLines,
       branches: branchSummaries.map(s => ({
         branch: s.branch,
@@ -3387,6 +3519,23 @@ export class Database {
     if (next.length === cur.length && next.every((t, i) => t === cur[i])) return;
     if (next.length) wi.budgetAlerts = next; else delete wi.budgetAlerts;
     this.save();
+  }
+
+  /**
+   * Mark a work item done, explicitly reopen it ('active'), or clear the status
+   * (null) so dormancy decides again (issue #97).
+   */
+  setWorkItemStatus(workItemId: string, status: WorkItemStatus | null): WorkItem {
+    const wi = this.ensureWorkItem(workItemId);
+    if (status === 'done') {
+      if (wi.status !== 'done') wi.doneAt = Date.now();
+      wi.status = 'done';
+    } else {
+      delete wi.doneAt;
+      if (status === 'active') wi.status = 'active'; else delete wi.status;
+    }
+    this.save();
+    return wi;
   }
 
   getAllWorkItemSummaries(): WorkItemSummary[] {

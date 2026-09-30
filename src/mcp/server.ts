@@ -7,6 +7,10 @@ import {
 } from '../analysis/usageInsights';
 import { promptExcerpts, SessionTitleResolver, storageRoots } from '../util/sessionTitles';
 import { BUDGET_SNAPSHOT_FILE } from '../analysis/budget';
+import { HEALTH_SNAPSHOT_FILE } from '../analysis/dataHealth';
+import { CATEGORY_RULES_SNAPSHOT_FILE, defaultClassifier, modelEfficiency, toolProfile } from '../analysis/efficiency';
+import { sanitizeRules } from '../util/categoryRules';
+import { ESTIMATION_SNAPSHOT_FILE, estimateAccuracy, suggestEstimate, type EstimationItem } from '../analysis/estimation';
 import * as path from 'path';
 
 export { promptExcerpts };
@@ -82,6 +86,49 @@ export const TOOLS = [
       required: ['sessionId'],
       additionalProperties: false
     }
+  },
+  {
+    name: 'model_efficiency',
+    title: 'Model efficiency per task type',
+    description: 'Per model × task type (file category with the most changed lines in the turn, or "qa" for Q&A / read-only turns): turns, credits, credits per turn, credits per 100 added lines, cache hit and output tokens; plus the cheapest model with enough samples per task type and estimated savings. Use to decide which model to pick for which kind of work.',
+    inputSchema: { type: 'object', properties: filterProps, additionalProperties: false }
+  },
+  {
+    name: 'tool_profile',
+    title: 'Tool-set profile',
+    description: 'For a project, work item or period: every MCP server / built-in tool group offered to Copilot vs actually called (calls, turns, tools used, last used, definition size), with a recommended minimal set (keep / disable / review), tokens saved per request and estimated credits saved.',
+    inputSchema: { type: 'object', properties: filterProps, additionalProperties: false }
+  },
+  {
+    name: 'suggest_estimate',
+    title: 'Suggest an estimate from history',
+    description: 'Suggests hours and credits for new work from finished work items (marked done, or untouched for 14 days) with similar titles, the same project or the same main category. Returns the P25/median/P75 range, the comparables used and the historical bias (actual ÷ estimate). Pass workItemId to estimate an existing item, or title/projectId for new work.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workItemId: { type: 'string', description: 'Existing work item to estimate (its title and project are used).' },
+        title: { type: 'string', description: 'Title or short description of the new work.' },
+        projectId: { type: 'string', description: 'Project of the new work.' },
+        categories: { type: 'array', items: { type: 'string' }, description: 'Expected main categories, e.g. ["programming"].' }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'estimate_accuracy',
+    title: 'Estimation accuracy',
+    description: 'How accurate hour estimates of finished work items were: median actual ÷ estimate, share within ±20 %, over/under shares, mean absolute error, grouped by project, size and month, per-category factors and the biggest misses. A factor of 1.4 means work took 40 % longer than estimated.',
+    inputSchema: {
+      type: 'object',
+      properties: { projectId: { type: 'string', description: 'Only this project.' } },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'data_health',
+    title: 'Data health check',
+    description: 'Whether the tracked data is complete and consistent: save errors, backups, schema, invalid numbers, duplicate credit rows, references to deleted items, time and credits without a work item, work items without project or estimate, projects without rates, unpriced model calls, missing token prices, future timestamps and days with more than 16 h. Each problem has a severity, count, examples and the extension command that fixes it. Check this before trusting totals or ROI.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false }
   }
 ].map(t => ({ ...t, annotations: { readOnlyHint: true, openWorldHint: false } }));
 
@@ -150,6 +197,44 @@ export function loadBudgetSnapshot(file = process.env.AET_STORE_PATH ? path.join
   return value;
 }
 
+const snapshotCache = new Map<string, { stamp: string; value: Json | null }>();
+
+/** A JSON snapshot the extension writes next to the store; null when absent or unreadable. */
+export function loadSnapshotFile(name: string, file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), name) : ''): Json | null {
+  if (!file) return null;
+  let stamp: string;
+  try { const st = fs.statSync(file); stamp = `${st.mtimeMs}|${st.size}`; } catch { return null; }
+  const hit = snapshotCache.get(file);
+  if (hit?.stamp === stamp) return hit.value;
+  let value: Json | null = null;
+  try { value = record(JSON.parse(fs.readFileSync(file, 'utf8'))); } catch { /* partial or corrupt: absent */ }
+  snapshotCache.set(file, { stamp, value });
+  return value;
+}
+
+function localDay(ts = Date.now()): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+const NO_ESTIMATION = 'No estimation snapshot yet (it is written by the extension about once a minute while VS Code runs).';
+
+export function estimationTool(name: 'suggest_estimate' | 'estimate_accuracy', args: Json, snapshot = loadSnapshotFile(ESTIMATION_SNAPSHOT_FILE), today = localDay()): unknown {
+  if (!snapshot) return { note: NO_ESTIMATION };
+  const items = (Array.isArray(snapshot.items) ? snapshot.items : []) as EstimationItem[];
+  const str = (v: unknown) => typeof v === 'string' && v ? v : undefined;
+  if (name === 'estimate_accuracy') {
+    const acc = estimateAccuracy(items, today, { projectId: str(args.projectId) });
+    return { ...acc, rows: acc.rows.slice(0, 50), asOf: snapshot.generatedAt ?? null,
+      ...(acc.overall ? {} : { note: 'No finished work items with an hour estimate yet. Mark work items done to measure accuracy.' }) };
+  }
+  const wi = str(args.workItemId) ? items.find(i => i.id === args.workItemId) : undefined;
+  if (str(args.workItemId) && !wi) throw new Error(`Unknown work item "${args.workItemId}".`);
+  const categories = Array.isArray(args.categories) ? args.categories.filter((c): c is string => typeof c === 'string') : undefined;
+  return { ...suggestEstimate(items, { title: str(args.title) ?? wi?.title, projectId: str(args.projectId) ?? wi?.projectId, categories, excludeId: wi?.id }, today),
+    asOf: snapshot.generatedAt ?? null };
+}
+
 export function listWorkItems(data: UsageData, filter: InsightFilter, snapshot = loadBudgetSnapshot()) {
   const rows: Json[] = workItemUsage(data, filter).slice(0, 100);
   if (!snapshot) return { workItems: rows, budgetNote: 'No budget snapshot yet (it is written by the extension about once a minute while VS Code runs).' };
@@ -199,6 +284,17 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       if (!file) return { ...detail, promptsNote: 'Copilot\'s debug log for this session no longer exists; prompts are unavailable.' };
       const prompts = promptExcerpts(file, chars);
       return { ...detail, turns: detail.turns.map(t => ({ ...t, prompt: prompts.get(t.turnId) ?? null })) };
+    }
+    case 'model_efficiency': {
+      const rules = loadSnapshotFile(CATEGORY_RULES_SNAPSHOT_FILE);
+      return modelEfficiency(data, parseFilter(args), defaultClassifier(sanitizeRules(record(rules?.rules) as never)));
+    }
+    case 'tool_profile': return toolProfile(data, parseFilter(args));
+    case 'suggest_estimate':
+    case 'estimate_accuracy': return estimationTool(name, args);
+    case 'data_health': {
+      const snap = loadSnapshotFile(HEALTH_SNAPSHOT_FILE);
+      return snap?.report ?? { note: 'No health snapshot yet. Open VS Code with the AI Effort Tracker extension (it refreshes the check every minute) and try again.' };
     }
     default: throw new Error(`Unknown tool "${name}".`);
   }

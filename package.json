@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.23.0",
+  "version": "0.24.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -112,12 +112,40 @@
         "title": "AI Effort Tracker: Set Work Item Budget (Credits / Money)"
       },
       {
+        "command": "aiEffortTracker.markWorkItemDone",
+        "title": "AI Effort Tracker: Mark Work Item Done"
+      },
+      {
+        "command": "aiEffortTracker.reopenWorkItem",
+        "title": "AI Effort Tracker: Reopen Work Item"
+      },
+      {
         "command": "aiEffortTracker.openWorkItem",
         "title": "AI Effort Tracker: Open Work Item in Dashboard"
       },
       {
         "command": "aiEffortTracker.openDashboardTab",
         "title": "AI Effort Tracker: Open Optimize Tab"
+      },
+      {
+        "command": "aiEffortTracker.checkDataHealth",
+        "title": "AI Effort Tracker: Check Data Health"
+      },
+      {
+        "command": "aiEffortTracker.newChatWithHandoff",
+        "title": "AI Effort Tracker: New Chat with Handoff"
+      },
+      {
+        "command": "aiEffortTracker.openTimesheet",
+        "title": "AI Effort Tracker: Open Timesheet"
+      },
+      {
+        "command": "aiEffortTracker.timesheetAddEntry",
+        "title": "AI Effort Tracker: Add Time for a Day (Timesheet)"
+      },
+      {
+        "command": "aiEffortTracker.exportTimesheetCsv",
+        "title": "AI Effort Tracker: Export Timesheet Week as CSV"
       },
       {
         "command": "aiEffortTracker.resetNudgeMutes",
@@ -202,6 +230,43 @@
           "type": "boolean",
           "default": true,
           "description": "Show chat titles (the name VS Code shows for a chat, or its first prompt) and prompt excerpts in the dashboard's Sessions tab. They are read from VS Code's local files on demand and never stored by the tracker. Turn off when sharing your screen."
+        },
+        "aiEffortTracker.handoff.includePrompts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include the first and last prompt of the chat (read from the local Copilot debug log, never stored) in the New Chat with Handoff prompt."
+        },
+        "aiEffortTracker.timesheet.rounding": {
+          "type": "string",
+          "enum": [
+            "none",
+            "0.25",
+            "0.5"
+          ],
+          "enumDescriptions": [
+            "Exact hours (2 decimals)",
+            "Round each day to the nearest quarter hour",
+            "Round each day to the nearest half hour"
+          ],
+          "default": "none",
+          "description": "Default rounding of the Timesheet tab and its CSV export (can be switched in the tab)."
+        },
+        "aiEffortTracker.away.prompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "When you come back after being away from VS Code (idle, other app, meeting, sleep), ask whether to count the time as meeting, review/thinking or other work, and log it as a time entry. Time another VS Code window was active is not asked about."
+        },
+        "aiEffortTracker.away.minMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "description": "Only ask about away periods of at least this many minutes."
+        },
+        "aiEffortTracker.away.maxMinutes": {
+          "type": "number",
+          "default": 240,
+          "minimum": 1,
+          "description": "Do not ask about away periods longer than this (overnight, weekends)."
         },
         "aiEffortTracker.budget.alerts": {
           "type": "boolean",

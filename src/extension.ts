@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
 import { CopilotTracker } from './trackers/copilotTracker';
@@ -8,7 +10,7 @@ import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
 import { CreditImportTracker } from './trackers/creditImportTracker';
 import { DebugLogUsageTracker } from './trackers/debugLogUsageTracker';
 import { Database } from './store/database';
-import { UNASSIGNED_WORK_ITEM_ID } from './store/database';
+import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
 import type { TimeEntry, TimeEntryInput, TimeEntryPatch } from './store/database';
@@ -23,6 +25,13 @@ import { GitHubService, BillingUsage } from './services/githubService';
 import { registerUsageInsightsMcp } from './mcp/provider';
 import { handleSessionsMessage } from './ui/sessionsPanel';
 import { BudgetMonitor } from './ui/budgetMonitor';
+import { AwayController } from './ui/awayPrompt';
+import { newChatWithHandoff } from './ui/handoff';
+import { buildTimesheet, normalizeRounding, timesheetCsv, weekStartOf } from './analysis/timesheet';
+import { defaultClassifier, modelEfficiency, toolProfile } from './analysis/efficiency';
+import { checkDataHealth, HEALTH_SNAPSHOT_FILE, type HealthReport } from './analysis/dataHealth';
+import { readUserRules } from './util/fileTypes';
+import { suggestEstimate, adjustForBias, toEstimationItem, estimateAccuracy, isFinished } from './analysis/estimation';
 import { NudgeController } from './ui/nudgeController';
 import { listSessions, optimizationFindings, usageOverview, type InsightFilter } from './analysis/usageInsights';
 
@@ -299,6 +308,12 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setBillableHours', (workItemId?: string) =>
       setBillableHours(workItemId)
     ),
+    vscode.commands.registerCommand('aiEffortTracker.markWorkItemDone', (workItemId?: string) =>
+      setWorkItemDone(workItemId, true)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.reopenWorkItem', (workItemId?: string) =>
+      setWorkItemDone(workItemId, false)
+    ),
     vscode.commands.registerCommand('aiEffortTracker.setWorkItemBudget', (workItemId?: string) =>
       setWorkItemBudget(workItemId)
     ),
@@ -322,6 +337,23 @@ export function activate(context: vscode.ExtensionContext) {
         await openDashboard(db, timeTracker, context);
       }
     }),
+    // #104: data health check + one-click repairs.
+    vscode.commands.registerCommand('aiEffortTracker.checkDataHealth', async () => {
+      const r = healthReport();
+      await vscode.commands.executeCommand('aiEffortTracker.openDashboardTab', 'health');
+      const msg = r.status === 'ok'
+        ? 'AI Effort Tracker: data health OK \u2013 no problems found.'
+        : `AI Effort Tracker: data health ${r.score}/100 \u2013 ${r.counts.error} errors, ${r.counts.warning} warnings, ${r.counts.info} hints.`;
+      if (r.counts.error) void vscode.window.showWarningMessage(msg); else void vscode.window.showInformationMessage(msg);
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.fixDataHealth', (checkId?: string) => fixDataHealth(checkId)),
+    // #100: continue a large chat in a new one with a summary.
+    vscode.commands.registerCommand('aiEffortTracker.newChatWithHandoff', (sessionId?: string) => newChatWithHandoff(db, context, sessionId)),
+    // #101: timesheet week grid.
+    vscode.commands.registerCommand('aiEffortTracker.openTimesheet', () =>
+      vscode.commands.executeCommand('aiEffortTracker.openDashboardTab', 'timesheet')),
+    vscode.commands.registerCommand('aiEffortTracker.timesheetAddEntry', (arg?: string) => timesheetAddEntry(arg)),
+    vscode.commands.registerCommand('aiEffortTracker.exportTimesheetCsv', (arg?: string) => exportTimesheetCsv(arg)),
     vscode.commands.registerCommand('aiEffortTracker.resetNudgeMutes', async () => {
       await nudgeController?.resetMutes();
       vscode.window.showInformationMessage('AI Effort Tracker: all live nudges are unmuted.');
@@ -347,7 +379,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
     vscode.commands.registerCommand('aiEffortTracker.createWorkItem', () => createWorkItem()),
     vscode.commands.registerCommand('aiEffortTracker.editWorkItem', () => editWorkItem()),
-    vscode.commands.registerCommand('aiEffortTracker.assignWorkItemToProject', () => assignWorkItemToProject()),
+    vscode.commands.registerCommand('aiEffortTracker.assignWorkItemToProject', (workItemId?: string) => assignWorkItemToProject(workItemId)),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
     vscode.commands.registerCommand('aiEffortTracker.importCredits', async () => {
@@ -406,8 +438,9 @@ export function activate(context: vscode.ExtensionContext) {
     chatUsageTracker.start(context);
   }
   context.subscriptions.push(debugLogUsageTracker, creditImportTracker);
-  budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath);
+  budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath, () => ({ [HEALTH_SNAPSHOT_FILE]: { report: healthReport() } }));
   context.subscriptions.push(budgetMonitor);
+  context.subscriptions.push(new AwayController(db, timeTracker, context.globalStorageUri.fsPath));
   try { registerUsageInsightsMcp(context); } catch (error) {
     console.error('AI Effort Tracker: MCP server registration failed', error);
   }
@@ -443,7 +476,19 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
     if (m?.type === 'optimize') {
-      dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId) });
+      dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId) });
+      return;
+    }
+    if (m?.type === 'health') {
+      dashboardPanel?.webview.postMessage({ type: 'healthData', report: healthReport() });
+      return;
+    }
+    if (m?.type === 'timesheet') {
+      dashboardPanel?.webview.postMessage({ type: 'timesheetData', ...timesheetPayload(m.weekStart, m.rounding) });
+      return;
+    }
+    if (m?.type === 'estimates') {
+      dashboardPanel?.webview.postMessage({ type: 'estimatesData', ...estimatesPayload(m.projectId) });
       return;
     }
     if (m && typeof m === 'object' && await handleSessionsMessage(m, db, context, msg => dashboardPanel?.webview.postMessage(msg))) return;
@@ -728,14 +773,28 @@ async function setWorkItemEstimate(preselectedId?: string) {
   if (!unitPick) return;
   const unit = unitPick.unit;
 
-  type ModePick = vscode.QuickPickItem & { mode: 'total' | 'breakdown' };
-  const modePick = await vscode.window.showQuickPick<ModePick>(
-    [
-      { label: 'Single total', mode: 'total', detail: 'Enter one overall estimate' },
-      { label: 'Per-category breakdown', mode: 'breakdown', detail: 'Programming / specification / documentation / deployment' }
-    ],
-    { placeHolder: 'How do you want to estimate?' }
+  // #97: suggest from finished comparable work items (hours only).
+  const target = db.getWorkItem(workItemId);
+  const suggestion = unit === 'hours'
+    ? suggestEstimate(estimationItems(), { title: target?.title, projectId: target?.projectId, excludeId: workItemId }, localDay())
+    : null;
+
+  type ModePick = vscode.QuickPickItem & { mode: 'total' | 'breakdown' | 'suggested' };
+  const modeItems: ModePick[] = [];
+  if (suggestion?.hours && suggestion.hours.median > 0) {
+    modeItems.push({
+      label: `$(lightbulb) Use suggestion: ${suggestion.hours.median} h`,
+      mode: 'suggested',
+      description: `range ${suggestion.hours.low}–${suggestion.hours.high} h`,
+      detail: suggestion.note + (suggestion.comparables.length
+        ? ' Based on ' + suggestion.comparables.slice(0, 3).map(c => `#${c.id} (${c.actualHours} h)`).join(', ') : '')
+    });
+  }
+  modeItems.push(
+    { label: 'Single total', mode: 'total', detail: 'Enter one overall estimate' },
+    { label: 'Per-category breakdown', mode: 'breakdown', detail: 'Programming / specification / documentation / deployment' }
   );
+  const modePick = await vscode.window.showQuickPick<ModePick>(modeItems, { placeHolder: 'How do you want to estimate?' });
   if (!modePick) return;
 
   const parseNum = (v: string): string | null => {
@@ -744,9 +803,13 @@ async function setWorkItemEstimate(preselectedId?: string) {
     return Number.isFinite(n) && n >= 0 ? null : 'Enter a non-negative number';
   };
 
-  if (modePick.mode === 'total') {
+  if (modePick.mode === 'suggested' && suggestion?.hours) {
+    db.setEstimateBreakdown(workItemId, null);
+    db.upsertWorkItem(workItemId, { estimate: suggestion.hours.median, estimateUnit: unit });
+  } else if (modePick.mode === 'total') {
+    const hint = suggestion?.hours ? ` — similar work took ${suggestion.hours.low}–${suggestion.hours.high} h` : '';
     const raw = await vscode.window.showInputBox({
-      prompt: `Total estimate for #${workItemId} (${unit})`,
+      prompt: `Total estimate for #${workItemId} (${unit})${hint}`,
       value: db.getWorkItemSummary(workItemId).estimate?.toString() ?? '',
       validateInput: v => (v.trim() ? parseNum(v) : 'Enter a number')
     });
@@ -775,10 +838,54 @@ async function setWorkItemEstimate(preselectedId?: string) {
   }
 
   const total = db.getWorkItemSummary(workItemId).estimate;
+  refreshDashboard();
+  // #98: surface the historical bias so the user can correct optimistic estimates.
+  const adjusted = unit === 'hours' && total !== null ? adjustForBias(total, suggestion?.biasFactor ?? null) : null;
+  if (adjusted !== null && suggestion?.biasFactor !== null && Math.abs((suggestion?.biasFactor ?? 1) - 1) > 0.2 && adjusted !== total) {
+    const use = `Use ${adjusted} h`;
+    const choice = await vscode.window.showInformationMessage(
+      `Estimate for #${workItemId} set to ${total} h. Historically your actuals run ${suggestion!.biasFactor}× your estimates ` +
+      `(${suggestion!.biasSamples} finished items) — a bias-adjusted estimate is ${adjusted} h.`,
+      use, 'Keep'
+    );
+    if (choice === use) {
+      db.setEstimateBreakdown(workItemId, null);
+      db.upsertWorkItem(workItemId, { estimate: adjusted, estimateUnit: 'hours' });
+      refreshDashboard();
+    }
+    return;
+  }
   vscode.window.showInformationMessage(
     `Estimate for #${workItemId} set to ${total} ${unit}.`
   );
+}
+
+/** All work items projected for the estimation engine (issues #97/#98). */
+function estimationItems() {
+  return db.getAllWorkItemSummaries()
+    .filter(s => s.workItemId !== UNASSIGNED_WORK_ITEM_ID && s.workItemId !== 'unknown')
+    .map(toEstimationItem);
+}
+
+/** Today's local date as YYYY-MM-DD. */
+function localDay(ts = Date.now()): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Mark a work item done or reopen it (issue #97). `arg` is the id or "id\u0000reopen". */
+async function setWorkItemDone(arg: string | undefined, done: boolean) {
+  const id = arg || await pickWorkItem(done ? 'Mark which work item as done?' : 'Reopen which work item?');
+  if (!id) return;
+  db.setWorkItemStatus(id, done ? 'done' : 'active');
   refreshDashboard();
+  if (!done) { vscode.window.showInformationMessage(`#${id} reopened.`); return; }
+  const s = db.getWorkItemSummary(id);
+  const actual = Math.round((s.humanCodingMs + s.aiGeneratingMs + s.reviewingMs) / 36_000) / 100;
+  const est = s.estimate !== null && (s.estimateUnit ?? 'hours') === 'hours' ? s.estimate : null;
+  vscode.window.showInformationMessage(est
+    ? `#${id} done: ${actual} h actual vs ${est} h estimated (${Math.round(actual / est * 100)} %).`
+    : `#${id} marked done (${actual} h actual). It now counts toward estimate suggestions.`);
 }
 
 /**
@@ -2341,8 +2448,8 @@ async function editWorkItem() {
 }
 
 /** Assign (or unassign) a work item to a project (issue #27). */
-async function assignWorkItemToProject() {
-  const wi = await pickWorkItem('Assign which work item to a project?');
+async function assignWorkItemToProject(workItemId?: string) {
+  const wi = workItemId || await pickWorkItem('Assign which work item to a project?');
   if (!wi) return;
   const current = db.getWorkItem(wi)?.projectId ?? null;
   const sel = await pickProjectOrNone(`Assign #${wi} to which project?`, current);
@@ -2353,21 +2460,150 @@ async function assignWorkItemToProject() {
   refreshDashboard();
 }
 
+/** Data health (issue #104): store contents + file facts through the pure checker. */
+function healthReport(): HealthReport {
+  const h = db.getHealthData();
+  const size = (p: string) => { try { return fs.statSync(p); } catch { return undefined; } };
+  const main = size(h.filePath);
+  let history: { size: number; mtime: number }[] = [];
+  try {
+    const dir = h.filePath + '.history';
+    history = fs.readdirSync(dir).filter(n => n.endsWith('.json'))
+      .map(n => size(path.join(dir, n))).filter((s): s is fs.Stats => !!s).map(s => ({ size: s.size, mtime: s.mtimeMs }));
+  } catch { /* no history yet */ }
+  const oldest = history.sort((a, b) => a.mtime - b.mtime)[0];
+  const rates: Record<string, { cost: number | null; sell: number | null }> = {};
+  for (const p of db.getAllProjects()) {
+    const r = db.getEffectiveRates(p.id);
+    rates[p.id] = { cost: r.hourlyCostRate, sell: r.hourlySellRate };
+  }
+  return checkDataHealth(h.data, {
+    schemaVersion: h.schemaVersion,
+    expectedSchemaVersion: CURRENT_SCHEMA_VERSION,
+    file: main ? {
+      sizeBytes: main.size,
+      hasBackup: !!size(h.filePath + '.bak'),
+      historyCount: history.length,
+      oldestHistoryBytes: oldest?.size ?? null,
+      oldestHistoryAgeMs: oldest ? Date.now() - oldest.mtime : null
+    } : undefined,
+    lastSaveError: h.lastSaveError,
+    rates
+  });
+}
+
+async function fixDataHealth(checkId?: string) {
+  if (checkId === 'duplicate-ledger') {
+    const ok = await vscode.window.showWarningMessage('Remove duplicate credit rows? The most complete copy of each chat turn is kept; a backup of the data file is written before saving.', { modal: true }, 'Remove duplicates');
+    if (ok !== 'Remove duplicates') return;
+    const n = db.removeDuplicateLedgerEntries();
+    vscode.window.showInformationMessage(`AI Effort Tracker: removed ${n} duplicate credit row(s).`);
+  } else if (checkId === 'stale-credit-attribution') {
+    const n = db.reattributeUnassignedCredits();
+    vscode.window.showInformationMessage(`AI Effort Tracker: ${n} credit row(s) now count for their branch's work item.`);
+  } else {
+    void vscode.commands.executeCommand('aiEffortTracker.checkDataHealth');
+    return;
+  }
+  refreshDashboard();
+}
+
 /** Usage-optimization data for the dashboard's Optimize tab (same engine as the MCP server). */
-function optimizePayload(days: unknown, workItemId: unknown) {
+function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown) {
   try {
     const filter: InsightFilter = {
       days: typeof days === 'number' && days > 0 ? Math.min(days, 365) : 30,
-      ...(typeof workItemId === 'string' && workItemId ? { workItemId } : {})
+      ...(typeof workItemId === 'string' && workItemId ? { workItemId } : {}),
+      ...(typeof projectId === 'string' && projectId ? { projectId } : {})
     };
     const data = db.getUsageData();
     return {
       overview: usageOverview(data, filter),
       findings: optimizationFindings(data, filter),
-      sessions: listSessions(data, filter, 15)
+      sessions: listSessions(data, filter, 15),
+      efficiency: modelEfficiency(data, filter, defaultClassifier(readUserRules())),
+      toolProfile: toolProfile(data, filter)
     };
   } catch (error) {
     return { error: `Cannot analyse usage: ${String(error)}` };
+  }
+}
+
+/** Timesheet tab (issue #101): one week of hours per work item and day. */
+function timesheetPayload(weekStart: unknown, rounding: unknown) {
+  try {
+    const r = rounding === undefined || rounding === null || rounding === ''
+      ? normalizeRounding(vscode.workspace.getConfiguration('aiEffortTracker').get<string>('timesheet.rounding'))
+      : normalizeRounding(rounding);
+    const ws = typeof weekStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(weekStart) ? weekStart : weekStartOf(Date.now());
+    return { sheet: buildTimesheet(db.getTimesheetSource(), ws, r), currentWeek: weekStartOf(Date.now()), today: localDay() };
+  } catch (error) {
+    return { error: `Cannot build timesheet: ${String(error)}` };
+  }
+}
+
+/** Add a time entry for a work item on a given day from a timesheet cell ("workItemId\u0000YYYY-MM-DD"). */
+async function timesheetAddEntry(arg?: string) {
+  const [rawWi, rawDay] = (arg ?? '').split('\u0000');
+  let workItemId = rawWi && rawWi !== UNASSIGNED_WORK_ITEM_ID ? rawWi : undefined;
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(rawDay ?? '') ? rawDay : localDay();
+  if (!workItemId) {
+    const wi = await pickWorkItemOptional(`Log time on ${day} to which work item?`);
+    if (wi === CANCELLED || !wi) return;
+    workItemId = wi;
+  }
+  const dur = await promptDurationMs(`Hours for #${workItemId} on ${day}? (minutes, e.g. 90, or h:mm, e.g. 1:30)`);
+  if (dur === CANCELLED || dur === undefined || dur <= 0) return;
+  const cat = await pickTimeEntryCategory('Category? (optional)');
+  if (cat === CANCELLED) return;
+  const note = await vscode.window.showInputBox({ prompt: 'Note (optional)', placeHolder: 'e.g. meeting, offline work' });
+  if (note === undefined) return;
+  const [y, mo, d] = day.split('-').map(Number);
+  const startTs = new Date(y, mo - 1, d, 9, 0, 0).getTime();
+  const input: TimeEntryInput = { source: 'manual', workItemId, startTs, endTs: startTs + dur, durationMs: dur };
+  if (cat) input.category = cat;
+  if (note.trim()) input.note = note.trim();
+  const entry = db.addTimeEntry(input);
+  vscode.window.showInformationMessage(`Logged ${fmtDuration(entry.durationMs)} to #${workItemId} on ${day}.`);
+  refreshDashboard();
+}
+
+/** Export one timesheet week as CSV ("weekStart\u0000rounding"). */
+async function exportTimesheetCsv(arg?: string) {
+  const [ws, rounding] = (arg ?? '').split('\u0000');
+  const p = timesheetPayload(ws, rounding);
+  if (!('sheet' in p) || !p.sheet) { vscode.window.showErrorMessage(p.error ?? 'Cannot build timesheet.'); return; }
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(`timesheet-${p.sheet.weekStart}.csv`),
+    filters: { CSV: ['csv'] }
+  });
+  if (!uri) return;
+  await vscode.workspace.fs.writeFile(uri, Buffer.from('\uFEFF' + timesheetCsv(p.sheet), 'utf8'));
+  vscode.window.showInformationMessage(`Timesheet exported to ${uri.fsPath}`);
+}
+
+/** Estimates tab (issues #97/#98): accuracy of finished items + suggestions for open ones. */
+function estimatesPayload(projectId: unknown) {
+  try {
+    const pid = typeof projectId === 'string' && projectId ? projectId : undefined;
+    const today = localDay();
+    const items = estimationItems();
+    const accuracy = estimateAccuracy(items, today, { projectId: pid });
+    const open = items
+      .filter(i => (!pid || i.projectId === pid) && !isFinished(i, today))
+      .map(i => {
+        const s = suggestEstimate(items, { title: i.title, projectId: i.projectId, excludeId: i.id }, today);
+        return {
+          id: i.id, title: i.title, projectId: i.projectId, status: i.status ?? null,
+          estimateHours: i.estimateHours, estimatePoints: i.estimatePoints, actualHours: i.actualHours, credits: i.credits,
+          lastDay: i.lastDay, suggestion: s.hours, suggestionCredits: s.credits, basis: s.basis,
+          adjusted: i.estimateHours !== null ? adjustForBias(i.estimateHours, s.biasFactor) : null, biasFactor: s.biasFactor
+        };
+      })
+      .sort((a, b) => (b.lastDay ?? '').localeCompare(a.lastDay ?? ''));
+    return { accuracy, open, projectId: pid ?? '' };
+  } catch (error) {
+    return { error: `Cannot analyse estimates: ${String(error)}` };
   }
 }
 
