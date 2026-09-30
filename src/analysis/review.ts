@@ -42,6 +42,7 @@ export interface OpenIssue {
   lines: number;
   note: string;
   at: number;
+  markId?: string;
 }
 
 export interface BranchCoverage {
@@ -57,6 +58,8 @@ export interface BranchCoverage {
 export interface RepoReview {
   files: Record<string, ReviewMark[]>;
   coverage: Record<string, BranchCoverage>;
+  /** Local folders of this repository seen on this machine, most recent first (for MCP). */
+  roots?: string[];
 }
 
 export interface ReviewStoreData {
@@ -72,6 +75,7 @@ const MAX_KEYS_PER_FILE = 40_000;
 const MAX_COVERAGE_FILES = 2000;
 const MAX_COVERAGE_ISSUES = 200;
 const MAX_BRANCHES_PER_REPO = 300;
+const MAX_ROOTS = 5;
 
 export const normalizeLine = (line: string) => line.replace(/\s+/g, ' ').trim();
 const hash = (s: string) => createHash('sha1').update(s).digest('hex').slice(0, HASH_LEN);
@@ -288,7 +292,8 @@ function decodeCoverage(v: unknown): BranchCoverage | undefined {
     path: String(f.path ?? ''), total: num(f.total), reviewed: num(f.reviewed), issueLines: num(f.issueLines)
   })).filter(f => f.path) : [];
   const issues = Array.isArray(v.issues) ? v.issues.filter(isObj).map(i => ({
-    path: String(i.path ?? ''), line: num(i.line), lines: num(i.lines), note: typeof i.note === 'string' ? i.note : '', at: num(i.at)
+    path: String(i.path ?? ''), line: num(i.line), lines: num(i.lines), note: typeof i.note === 'string' ? i.note : '', at: num(i.at),
+    ...(typeof i.markId === 'string' && i.markId ? { markId: i.markId } : {})
   })).filter(i => i.path) : [];
   return { at: num(v.at), base: typeof v.base === 'string' ? v.base : '', total: num(v.total), reviewed: num(v.reviewed), issueLines: num(v.issueLines), files, issues };
 }
@@ -314,6 +319,10 @@ export function decodeReviewStore(raw: string): ReviewStoreData {
         if (cov) rr.coverage[branch] = cov;
       }
     }
+    if (Array.isArray(r.roots)) {
+      const roots = r.roots.filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length < 1000).slice(0, MAX_ROOTS);
+      if (roots.length) rr.roots = roots;
+    }
     out.repos[repo] = rr;
   }
   return out;
@@ -332,6 +341,166 @@ export function withCoverage(repo: RepoReview, branch: string, cov: BranchCovera
 }
 
 export interface ReviewStatusArgs { workItemId?: string; branch?: string }
+
+const sameRoot = (a: string, b: string) => {
+  const n = (s: string) => { const x = s.replace(/[\\/]+$/, ''); return process.platform === 'win32' ? x.replace(/\//g, '\\').toLowerCase() : x; };
+  return n(a) === n(b);
+};
+
+/** Remember the local folder of a repository (most recent first) so MCP can read its files. */
+export function withRoot(repo: RepoReview, root: string): RepoReview {
+  if (repo.roots?.length && sameRoot(repo.roots[0], root)) return repo;
+  return { ...repo, roots: [root, ...(repo.roots ?? []).filter(r => !sameRoot(r, root))].slice(0, MAX_ROOTS) };
+}
+
+export interface ReviewIssuesArgs { workItemId?: string; branch?: string; path?: string; contextLines?: number }
+
+/** File access for {@link reviewIssues}; injected so the logic stays testable. */
+export interface ReviewIssuesIo {
+  exists(dir: string): boolean;
+  /** File text, or null when missing, too large or binary. */
+  readFile(abs: string): string | null;
+  currentBranch(root: string): string | null;
+}
+
+const MAX_LIVE_ISSUES = 100;
+const MAX_EXCERPT_LINES = 80;
+const joinPath = (root: string, rel: string) => root.replace(/[\\/]+$/, '') + (root.includes('\\') ? '\\' + rel.replace(/\//g, '\\') : '/' + rel);
+
+/**
+ * Numbered code around flagged lines (0-based `flagged`), flagged lines marked
+ * with ">", e.g. ` 12>| total := x;`. At most {@link MAX_EXCERPT_LINES} lines.
+ */
+export function issueExcerpt(lines: readonly string[], flagged: readonly number[], contextLines = 3, maxLines = MAX_EXCERPT_LINES): string {
+  if (!flagged.length || !lines.length) return '';
+  const set = new Set(flagged);
+  const start = Math.min(...flagged), end = Math.max(...flagged);
+  const from = Math.max(0, start - contextLines);
+  const to = Math.min(lines.length - 1, end + contextLines, from + maxLines - 1);
+  const width = String(to + 1).length;
+  const out: string[] = [];
+  for (let n = from; n <= to; n++) {
+    const t = lines[n].length > 400 ? lines[n].slice(0, 400) + ' …' : lines[n];
+    out.push(`${String(n + 1).padStart(width)}${set.has(n) ? '>' : ' '}| ${t}`);
+  }
+  return out.join('\n');
+}
+
+/** Chat prompt asking Copilot to fix flagged review issues (VS Code "Fix with Copilot"). */
+export function fixIssuesPrompt(branch: string | null, issues: readonly { path: string; line: number; lines: number; note: string; code?: string }[], total = issues.length): string {
+  const one = total === 1;
+  const out = [
+    `Fix the code review ${one ? 'issue' : `issues (${total})`} I flagged${branch ? ` on branch \`${branch}\`` : ''}.`,
+    `The AI Effort Tracker MCP tool \`review_issues\` returns ${one ? 'it' : 'them'} with exact locations and code; use it if it is available, otherwise use the list below.`,
+    ''
+  ];
+  issues.forEach((i, n) => {
+    out.push(`${n + 1}. \`${i.path}:${i.line}\`${i.lines > 1 ? ` (${i.lines} lines)` : ''}: ${i.note || '(no note)'}`);
+    if (i.code) out.push('   ```', ...i.code.split('\n').map(l => '   ' + l), '   ```');
+  });
+  if (total > issues.length) out.push(`… and ${total - issues.length} more (see \`review_issues\`).`);
+  out.push('', 'For each issue make the smallest fix that addresses the note and do not change unrelated code. '
+    + 'When you are done, list each issue with what you changed, or why you left it unchanged.');
+  return out.join('\n');
+}
+
+/**
+ * MCP `review_issues`: open review issues read live from the files on disk, with
+ * current line numbers and a numbered code excerpt, so an AI can fix them.
+ * Issues only known from the saved coverage of another branch (not in the
+ * checked-out files) are listed separately.
+ */
+export function reviewIssues(
+  store: ReviewStoreData,
+  branches: Record<string, { workItemId?: string | null }>,
+  workItems: Record<string, { title?: string | null; status?: string }>,
+  args: ReviewIssuesArgs,
+  io: ReviewIssuesIo
+): unknown {
+  const ctxLines = Math.max(0, Math.min(10, Math.round(Number.isFinite(args.contextLines) ? args.contextLines! : 3)));
+  const wanted = args.workItemId ? Object.keys(branches).filter(b => branches[b]?.workItemId === args.workItemId)
+    : args.branch ? [args.branch] : null;
+  const pathFilter = args.path?.trim().replace(/\\/g, '/').toLowerCase();
+  const pathOk = (rel: string) => !pathFilter || rel.toLowerCase().includes(pathFilter);
+  const live: Record<string, unknown>[] = [];
+  const elsewhere: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  const sig = (rel: string, at: number, note: string) => `${rel}\u0000${at}\u0000${note}`;
+  let checkedOut: { repo: string; root: string; branch: string | null }[] = [];
+
+  for (const [repoId, repo] of Object.entries(store.repos)) {
+    const roots = (repo.roots ?? []).filter(r => io.exists(r)).map(root => ({ root, current: io.currentBranch(root) }));
+    for (const { root, current } of roots) checkedOut.push({ repo: repoId, root, branch: current });
+    let fromBranches: Set<string> | null = null;
+    if (wanted) {
+      fromBranches = new Set();
+      for (const b of wanted) {
+        const cov = repo.coverage[b];
+        if (!cov) continue;
+        for (const f of cov.files) fromBranches.add(f.path);
+        for (const i of cov.issues) fromBranches.add(i.path);
+      }
+    }
+    for (const { root, current } of roots) {
+      // A checked-out branch of the requested scope: every flagged file in it counts.
+      const relevant = wanted && !(current && wanted.includes(current)) ? fromBranches : null;
+      for (const [rel, marks] of Object.entries(repo.files)) {
+        if (!marks.some(m => m.status === 'issue') || !pathOk(rel) || (relevant && !relevant.has(rel))) continue;
+        const text = io.readFile(joinPath(root, rel));
+        if (text === null) continue;
+        const lines = splitLines(text);
+        if (lines.length > 60_000) continue;
+        for (const i of evaluateFile(lines, new Set(), marks).issues) {
+          const idx = [...i.indices].sort((a, b) => a - b);
+          const start = idx[0], end = idx[idx.length - 1];
+          const code = issueExcerpt(lines, idx, ctxLines);
+          if (seen.has(i.markId)) continue;
+          seen.add(i.markId);
+          seen.add(sig(rel, i.at, i.note));
+          live.push({
+            repo: repoId, root, file: rel, absolutePath: joinPath(root, rel), startLine: start + 1, endLine: end + 1,
+            flaggedLines: idx.length, note: i.note || '(no note)', flaggedAt: new Date(i.at).toISOString(), branch: current, code
+          });
+        }
+      }
+    }
+    const current = roots[0]?.current ?? null;
+    const root = roots[0]?.root ?? null;
+    const snapBranches = (wanted ?? Object.keys(repo.coverage)).filter(b => repo.coverage[b] && !roots.some(x => x.current === b));
+    for (const b of snapBranches) {
+      const cov = repo.coverage[b];
+      for (const i of cov.issues) {
+        if (!pathOk(i.path) || seen.has(i.markId ?? '') || seen.has(sig(i.path, i.at, i.note))) continue;
+        const stillFlagged = (repo.files[i.path] ?? []).some(m => m.status === 'issue' && (i.markId ? m.id === i.markId : m.at === i.at));
+        if (!stillFlagged) continue;
+        seen.add(i.markId ?? sig(i.path, i.at, i.note));
+        elsewhere.push({
+          repo: repoId, branch: b, file: i.path, line: i.line, flaggedLines: i.lines, note: i.note || '(no note)',
+          flaggedAt: new Date(i.at).toISOString(), asOf: new Date(cov.at).toISOString(),
+          hint: root ? `Not in the files checked out now (${current ?? 'detached HEAD'}). Check out ${b} to fix it; line numbers are from ${new Date(cov.at).toISOString()}.`
+            : 'The folder of this repository is not known on this machine yet; open it in VS Code with the extension once.'
+        });
+      }
+    }
+  }
+  live.sort((a, b) => String(a.file).localeCompare(String(b.file)) || Number(a.startLine) - Number(b.startLine));
+  if (wanted) checkedOut = checkedOut.filter(c => live.some(l => l.root === c.root) || (c.branch && wanted.includes(c.branch)));
+  const scope = args.workItemId ? { workItemId: args.workItemId, title: workItems[args.workItemId]?.title ?? null, branches: wanted }
+    : args.branch ? { branch: args.branch } : 'all repositories';
+  return {
+    scope, ...(pathFilter ? { path: args.path } : {}), checkedOut,
+    openIssues: live.length, issues: live.slice(0, MAX_LIVE_ISSUES),
+    ...(live.length > MAX_LIVE_ISSUES ? { truncated: live.length - MAX_LIVE_ISSUES } : {}),
+    onOtherBranches: elsewhere.slice(0, 50),
+    instructions: 'The developer flagged these lines while reviewing code in VS Code; "note" says what is wrong. Fix each issue in "file" around startLine–endLine '
+      + '(lines marked ">" in "code" are the flagged ones; line numbers are for the file on disk now). Keep changes minimal and do not touch unrelated code. '
+      + 'Editing a flagged line clears its flag automatically and the new code shows up as "to review" for the developer. '
+      + 'If the right fix does not change a flagged line, say so, so the developer can resolve it in VS Code ("Resolved — mark reviewed").',
+    ...(live.length || elsewhere.length ? {} : { note: store.repos && Object.keys(store.repos).length
+      ? 'No open review issues. Flag issues in VS Code with the CodeLens "⚑ Flag issue" or the editor context menu.'
+      : 'No review marks saved yet. Flag issues in VS Code with the CodeLens "⚑ Flag issue" or the editor context menu.' })
+  };
+}
 
 /**
  * MCP `review_status` (#109): coverage of one work item or branch in detail,

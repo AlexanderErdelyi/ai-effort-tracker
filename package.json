@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -272,6 +272,12 @@
         "command": "aiEffortTracker.review.openFile",
         "title": "Review: Open File",
         "category": "AI Effort Tracker"
+      },
+      {
+        "command": "aiEffortTracker.review.fixWithCopilot",
+        "title": "Review: Fix Review Issues with Copilot",
+        "category": "AI Effort Tracker",
+        "icon": "$(sparkle)"
       }
     ],
     "mcpServerDefinitionProviders": [
@@ -751,6 +757,18 @@
         {
           "command": "aiEffortTracker.review.openFile",
           "when": "false"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "aiEffortTracker.review.fixWithCopilot",
+          "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewIssues",
+          "group": "inline"
+        },
+        {
+          "command": "aiEffortTracker.review.fixWithCopilot",
+          "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewIssue",
+          "group": "inline"
         }
       ]
     }

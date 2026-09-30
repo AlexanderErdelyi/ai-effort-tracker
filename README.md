@@ -225,6 +225,7 @@ or *"Analyse my usage for work item 1987"*. Tools:
 | `estimate_accuracy` | Estimated vs. actual hours of finished work items, bias by category and over time |
 | `data_health` | The data health report (see below) |
 | `review_status` | Code review coverage per work item and branch, files left and open review issues |
+| `review_issues` | Open review issues read live from disk: file, current lines, your note and the flagged code, so Copilot can fix them |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -365,6 +366,19 @@ edits.
   once. The health check warns when a work item marked done is not fully reviewed,
   and Copilot can read coverage through the MCP tool `review_status`.
 
+### Let Copilot fix flagged issues
+
+Flag what is wrong with **⚑ Flag issue** and write what needs to change in the note.
+Then either ask Copilot in agent mode ("fix my review issues") or click **✨ Fix with
+Copilot** (CodeLens on an issue, the issue's actions, the Issues group in the Review
+view, or the command **Review: Fix Review Issues with Copilot**). That opens a new chat
+with a prompt listing the issues with their code; pick Agent mode and send it.
+Copilot reads the issues through the MCP tool `review_issues`: file, current line
+numbers (read live from disk, so they are right even after edits), your note and a
+numbered code excerpt, optionally filtered by `workItemId`, `branch` or `path`.
+Issues that only exist on another branch are listed separately with a hint to check
+that branch out. When Copilot changes a flagged line the flag clears by itself and the
+new code shows up as "to review", so you check the fix like any other change.
 Marks are anchored to the line's content and its neighbours, not to line numbers,
 so they survive edits elsewhere, rebases and branch switches, and a moved block
 keeps its marks. Editing a reviewed line makes it (and its direct neighbours)

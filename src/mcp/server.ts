@@ -11,10 +11,36 @@ import { HEALTH_SNAPSHOT_FILE } from '../analysis/dataHealth';
 import { CATEGORY_RULES_SNAPSHOT_FILE, defaultClassifier, modelEfficiency, toolProfile } from '../analysis/efficiency';
 import { sanitizeRules } from '../util/categoryRules';
 import { ESTIMATION_SNAPSHOT_FILE, estimateAccuracy, suggestEstimate, type EstimationItem } from '../analysis/estimation';
-import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewStatus } from '../analysis/review';
+import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewIssues, reviewStatus, type ReviewIssuesIo } from '../analysis/review';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 
 export { promptExcerpts };
+
+function loadReviewStore() {
+  const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), REVIEW_FILE) : '';
+  if (!file || !fs.existsSync(file)) return emptyReviewStore();
+  return readStore(file, decodeReviewStore, emptyReviewStore).value;
+}
+
+/** Read-only access to the working tree for `review_issues`. */
+const reviewFileIo: ReviewIssuesIo = {
+  exists: dir => { try { return fs.statSync(dir).isDirectory(); } catch { return false; } },
+  readFile: abs => {
+    try {
+      const st = fs.statSync(abs);
+      if (!st.isFile() || st.size > 1_500_000) return null;
+      const buf = fs.readFileSync(abs);
+      return buf.includes(0) ? null : buf.toString('utf8');
+    } catch { return null; }
+  },
+  currentBranch: root => {
+    try {
+      const b = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 3000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      return b && b !== 'HEAD' ? b : null;
+    } catch { return null; }
+  }
+};
 
 /**
  * Read-only MCP server (stdio, newline-delimited JSON-RPC 2.0) exposing usage
@@ -140,6 +166,21 @@ export const TOOLS = [
       properties: {
         workItemId: { type: 'string', description: 'Detail for this work item (all its branches).' },
         branch: { type: 'string', description: 'Detail for this git branch.' }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'review_issues',
+    title: 'Open code review issues to fix',
+    description: 'Code the developer flagged as a review issue in VS Code ("⚑ Flag issue"), read live from the files on disk: file, absolute path, current start/end line, the developer\'s note and a numbered code excerpt (flagged lines marked ">"). Call this when asked to fix review issues or review findings, then fix each one at its location. Issues only present on another branch are listed under onOtherBranches.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workItemId: { type: 'string', description: 'Only issues in files changed on the branches of this work item.' },
+        branch: { type: 'string', description: 'Only issues in files changed on this git branch.' },
+        path: { type: 'string', description: 'Only files whose repository-relative path contains this text.' },
+        contextLines: { type: 'number', description: 'Unflagged lines of code shown before and after each issue (0–10, default 3).' }
       },
       additionalProperties: false
     }
@@ -311,11 +352,16 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       return snap?.report ?? { note: 'No health snapshot yet. Open VS Code with the AI Effort Tracker extension (it refreshes the check every minute) and try again.' };
     }
     case 'review_status': {
-      const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), REVIEW_FILE) : '';
-      const store = file ? readStore(file, decodeReviewStore, emptyReviewStore).value : emptyReviewStore();
+      const store = loadReviewStore();
       const str = (v: unknown) => typeof v === 'string' && v ? v : undefined;
       return reviewStatus(store, data.branches as Record<string, { workItemId?: string | null }>, data.workItems as Record<string, { title?: string | null; status?: string }>,
         { workItemId: str(args.workItemId), branch: str(args.branch) });
+    }
+    case 'review_issues': {
+      const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+      return reviewIssues(loadReviewStore(), data.branches as Record<string, { workItemId?: string | null }>, data.workItems as Record<string, { title?: string | null; status?: string }>,
+        { workItemId: str(args.workItemId), branch: str(args.branch), path: str(args.path), contextLines: typeof args.contextLines === 'number' ? args.contextLines : undefined },
+        reviewFileIo);
     }
     default: throw new Error(`Unknown tool "${name}".`);
   }
