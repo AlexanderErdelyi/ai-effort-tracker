@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -210,6 +210,68 @@
       {
         "command": "aiEffortTracker.importCredits",
         "title": "AI Effort Tracker: Import Copilot Premium-Request Usage"
+      },
+      {
+        "command": "aiEffortTracker.review.markReviewed",
+        "title": "Review: Mark Selection Reviewed",
+        "category": "AI Effort Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "aiEffortTracker.review.flagIssue",
+        "title": "Review: Flag Issue…",
+        "category": "AI Effort Tracker",
+        "icon": "$(warning)"
+      },
+      {
+        "command": "aiEffortTracker.review.clearMark",
+        "title": "Review: Clear Review Mark",
+        "category": "AI Effort Tracker"
+      },
+      {
+        "command": "aiEffortTracker.review.markFileReviewed",
+        "title": "Review: Mark File Reviewed",
+        "category": "AI Effort Tracker",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "aiEffortTracker.review.nextUnreviewed",
+        "title": "Review: Next Unreviewed Change",
+        "category": "AI Effort Tracker",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "aiEffortTracker.review.showProgress",
+        "title": "Review: Show Review Progress",
+        "category": "AI Effort Tracker"
+      },
+      {
+        "command": "aiEffortTracker.review.toggleHighlights",
+        "title": "Review: Toggle Review Highlights",
+        "category": "AI Effort Tracker",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "aiEffortTracker.review.setBaseline",
+        "title": "Review: Set Review Baseline…",
+        "category": "AI Effort Tracker",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "aiEffortTracker.review.refresh",
+        "title": "Review: Refresh",
+        "category": "AI Effort Tracker",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aiEffortTracker.review.issueActions",
+        "title": "Review: Issue Actions",
+        "category": "AI Effort Tracker"
+      },
+      {
+        "command": "aiEffortTracker.review.openFile",
+        "title": "Review: Open File",
+        "category": "AI Effort Tracker"
       }
     ],
     "mcpServerDefinitionProviders": [
@@ -574,8 +636,123 @@
               "other"
             ]
           }
+        },
+        "aiEffortTracker.review.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Track which changed lines you have reviewed (gutter marks, CodeLens, Review view, status bar)."
+        },
+        "aiEffortTracker.review.showDecorations": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show review marks in the gutter and overview ruler: reviewed (green), issue (red), changed but not reviewed yet (amber)."
+        },
+        "aiEffortTracker.review.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show \"Mark reviewed\" / \"Flag issue\" CodeLens above unreviewed changes and a progress line at the top of changed files."
+        },
+        "aiEffortTracker.review.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the review progress of the current branch in the status bar."
+        },
+        "aiEffortTracker.review.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/package-lock.json",
+            "**/yarn.lock",
+            "**/pnpm-lock.yaml",
+            "**/*.min.js",
+            "**/*.map",
+            "**/node_modules/**",
+            "**/out/**",
+            "**/dist/**",
+            "**/*.g.xlf"
+          ],
+          "description": "Glob patterns (relative to the repository root) of changed files that never need review, e.g. lock files and generated output."
+        },
+        "aiEffortTracker.review.baseRef": {
+          "type": "string",
+          "default": "",
+          "description": "Branch, tag or commit to review against. Empty = the merge-base with the default branch (origin/HEAD, main or master). The command \"Review: Set Review Baseline…\" overrides this per branch."
         }
       }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "aiEffortTracker.reviewView",
+          "name": "AI Effort: Review",
+          "icon": "$(checklist)",
+          "when": "aiEffortTracker.reviewEnabled"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "aiEffortTracker.reviewView",
+        "contents": "No changed lines to review on this branch.\nChanges since the merge-base with the default branch appear here, including AI edits you already committed.\n[Set Review Baseline](command:aiEffortTracker.review.setBaseline)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "aiEffortTracker.review.markReviewed",
+          "when": "resourceScheme == file && aiEffortTracker.reviewEnabled",
+          "group": "9_aiEffortReview@1"
+        },
+        {
+          "command": "aiEffortTracker.review.flagIssue",
+          "when": "resourceScheme == file && aiEffortTracker.reviewEnabled",
+          "group": "9_aiEffortReview@2"
+        },
+        {
+          "command": "aiEffortTracker.review.clearMark",
+          "when": "resourceScheme == file && aiEffortTracker.reviewEnabled",
+          "group": "9_aiEffortReview@3"
+        },
+        {
+          "command": "aiEffortTracker.review.markFileReviewed",
+          "when": "resourceScheme == file && aiEffortTracker.reviewEnabled",
+          "group": "9_aiEffortReview@4"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "aiEffortTracker.review.nextUnreviewed",
+          "when": "view == aiEffortTracker.reviewView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "aiEffortTracker.review.setBaseline",
+          "when": "view == aiEffortTracker.reviewView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "aiEffortTracker.review.toggleHighlights",
+          "when": "view == aiEffortTracker.reviewView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "aiEffortTracker.review.refresh",
+          "when": "view == aiEffortTracker.reviewView",
+          "group": "navigation@4"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "aiEffortTracker.review.issueActions",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.openFile",
+          "when": "false"
+        }
+      ]
     }
   },
   "scripts": {

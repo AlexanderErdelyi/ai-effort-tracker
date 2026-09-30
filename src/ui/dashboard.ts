@@ -167,6 +167,20 @@ function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';retur
 function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function activeMsOf(x){return(x.humanCodingMs||0)+(x.aiGeneratingMs||0)+(x.reviewingMs||0);}
+function reviewCardHtml(w){
+  var r=w&&w.review;if(!r)return'';
+  var col=r.complete?'var(--added)':r.openIssues?'var(--deleted)':'var(--cost)';
+  var files=(r.filesLeft||[]).map(function(f){return'<tr><td>'+esc(f.path)+'</td><td>'+(f.total-f.unreviewed)+'/'+f.total+'</td><td>'+f.unreviewed+' left</td></tr>';}).join('');
+  var issues=(r.issues||[]).map(function(i){return'<tr><td style="color:var(--deleted)">\\u2691 '+esc(i.note||'Issue')+'</td><td>'+esc(i.path)+':'+i.line+'</td><td>'+esc(i.branch)+'</td></tr>';}).join('');
+  var branches=(r.branches||[]).length>1?'<p style="margin-top:6px;font-size:.8em;color:var(--vscode-descriptionForeground)">'+r.branches.map(function(b){return esc(b.branch)+': '+b.reviewed+'/'+b.total;}).join(' \\u00b7 ')+'</p>':'';
+  return'<div class="card" style="margin-top:12px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><h3>\\uD83D\\uDD0D Code review</h3><button class="dtab" data-action="cmd" data-value="review.showProgress">Open Review view</button></div>'
+    +'<div class="sg" style="margin-top:6px">'+sc('Reviewed',r.pct+'%',col)+sc('Lines reviewed',r.reviewed+' / '+r.total)+sc('Left to review',String(r.unreviewed),r.unreviewed?'var(--cost)':'var(--added)')+sc('Open issues',String(r.openIssues),r.openIssues?'var(--deleted)':'inherit')+'</div>'
+    +(r.complete?'<p style="margin-top:8px;color:var(--added)">\\u2713 Every changed line on the branches of this work item is reviewed and no issues are open.</p>':'')
+    +(issues?'<table style="margin-top:8px"><thead><tr><th>Open issue</th><th>Where</th><th>Branch</th></tr></thead><tbody>'+issues+'</tbody></table>':'')
+    +(files?'<table style="margin-top:8px"><thead><tr><th>File</th><th>Reviewed</th><th></th></tr></thead><tbody>'+files+'</tbody></table>':'')
+    +branches
+    +'<p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Changed lines since the merge-base, as last evaluated '+(r.asOf?esc(new Date(r.asOf).toLocaleString()):'')+' when each branch was checked out. Mark lines with the CodeLens or editor context menu (\\u201cMark Selection Reviewed\\u201d / \\u201cFlag Issue\\u201d).</p></div>';
+}
 function translationSummaryHtml(x){
   var t=x&&x.effectiveByCategory&&x.effectiveByCategory.translation;
   if(!t||!(t.human+t.ai))return'';
@@ -714,6 +728,7 @@ function renderWorkItemDetail(){
     +'</div>'
     +manualSplitHtml(w)
     +budgetCardHtml(w,I.currency)
+    +reviewCardHtml(w)
     +translationSummaryHtml(w)
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCCF Set Estimate</button>'+(w.status==='done'?'<button class="dtab" data-action="wiReopen" data-id="'+esc(w.workItemId)+'" title="Reopen: count this work item as in progress again">\\u21BA Reopen</button>':'<button class="dtab" data-action="wiDone" data-id="'+esc(w.workItemId)+'" title="Mark done: it then counts toward estimate accuracy and suggestions">\\u2713 Mark Done</button>')+'<button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button>'+(genH==null?'':'<button class="dtab" data-action="bhUse" data-id="'+esc(w.workItemId)+'" data-hours="'+esc(genH)+'" title="Prefill billable hours with the generated-lines equivalent (\\u2248 '+genH+'h)">\\u26A1 Use as Billable Hours</button>')+'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button><button class="dtab" data-action="wiDel" data-id="'+esc(w.workItemId)+'" title="Delete this work item \\u2014 its branches, credits and effort move to Unassigned (nothing is deleted)">\\uD83D\\uDDD1 Delete Work Item</button></div>'
     +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'

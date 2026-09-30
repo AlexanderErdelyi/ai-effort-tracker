@@ -11,6 +11,7 @@ import { HEALTH_SNAPSHOT_FILE } from '../analysis/dataHealth';
 import { CATEGORY_RULES_SNAPSHOT_FILE, defaultClassifier, modelEfficiency, toolProfile } from '../analysis/efficiency';
 import { sanitizeRules } from '../util/categoryRules';
 import { ESTIMATION_SNAPSHOT_FILE, estimateAccuracy, suggestEstimate, type EstimationItem } from '../analysis/estimation';
+import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewStatus } from '../analysis/review';
 import * as path from 'path';
 
 export { promptExcerpts };
@@ -129,6 +130,19 @@ export const TOOLS = [
     title: 'Data health check',
     description: 'Whether the tracked data is complete and consistent: save errors, backups, schema, invalid numbers, duplicate credit rows, references to deleted items, time and credits without a work item, work items without project or estimate, projects without rates, unpriced model calls, missing token prices, future timestamps and days with more than 16 h. Each problem has a severity, count, examples and the extension command that fixes it. Check this before trusting totals or ROI.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+  },
+  {
+    name: 'review_status',
+    title: 'Code review coverage',
+    description: 'How much of the changed code (since the merge-base with the default branch) the developer has marked as reviewed in VS Code, per work item and branch: reviewed vs changed lines, files left to review and open review issues with their notes. Without arguments: overview of all work items, plus finished work items that are not fully reviewed. Use it to check whether AI-generated code was reviewed before a work item is closed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workItemId: { type: 'string', description: 'Detail for this work item (all its branches).' },
+        branch: { type: 'string', description: 'Detail for this git branch.' }
+      },
+      additionalProperties: false
+    }
   }
 ].map(t => ({ ...t, annotations: { readOnlyHint: true, openWorldHint: false } }));
 
@@ -295,6 +309,13 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
     case 'data_health': {
       const snap = loadSnapshotFile(HEALTH_SNAPSHOT_FILE);
       return snap?.report ?? { note: 'No health snapshot yet. Open VS Code with the AI Effort Tracker extension (it refreshes the check every minute) and try again.' };
+    }
+    case 'review_status': {
+      const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), REVIEW_FILE) : '';
+      const store = file ? readStore(file, decodeReviewStore, emptyReviewStore).value : emptyReviewStore();
+      const str = (v: unknown) => typeof v === 'string' && v ? v : undefined;
+      return reviewStatus(store, data.branches as Record<string, { workItemId?: string | null }>, data.workItems as Record<string, { title?: string | null; status?: string }>,
+        { workItemId: str(args.workItemId), branch: str(args.branch) });
     }
     default: throw new Error(`Unknown tool "${name}".`);
   }

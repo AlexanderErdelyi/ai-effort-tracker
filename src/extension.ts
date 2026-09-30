@@ -33,6 +33,7 @@ import { checkDataHealth, HEALTH_SNAPSHOT_FILE, type HealthReport } from './anal
 import { readUserRules } from './util/fileTypes';
 import { suggestEstimate, adjustForBias, toEstimationItem, estimateAccuracy, isFinished } from './analysis/estimation';
 import { NudgeController } from './ui/nudgeController';
+import { ReviewController } from './ui/reviewController';
 import { listSessions, optimizationFindings, usageOverview, type InsightFilter } from './analysis/usageInsights';
 
 let timeTracker: TimeTracker;
@@ -49,6 +50,7 @@ let pendingOpenWorkItem: string | undefined;
 let pendingOpenTab: string | undefined;
 let budgetMonitor: BudgetMonitor | undefined;
 let nudgeController: NudgeController | undefined;
+let reviewController: ReviewController | undefined;
 let lastBilling: BillingUsage | null = null;
 const ghService = new GitHubService();
 
@@ -441,6 +443,12 @@ export function activate(context: vscode.ExtensionContext) {
   budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath, () => ({ [HEALTH_SNAPSHOT_FILE]: { report: healthReport() } }));
   context.subscriptions.push(budgetMonitor);
   context.subscriptions.push(new AwayController(db, timeTracker, context.globalStorageUri.fsPath));
+  try {
+    reviewController = new ReviewController(context, context.globalStorageUri.fsPath);
+    context.subscriptions.push(reviewController);
+  } catch (error) {
+    console.error('AI Effort Tracker: review tracking failed to start', error);
+  }
   try { registerUsageInsightsMcp(context); } catch (error) {
     console.error('AI Effort Tracker: MCP server registration failed', error);
   }
@@ -471,7 +479,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
   const initialNet = await GitTracker.getNetLineChange();
   if (initialNet) db.seedEffectiveLinesFromGit(initialNet.branch, initialNet.byCategory);
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withReview(db.getAllWorkItemSummaries()), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
@@ -521,7 +529,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       analytics: getAnalytics(),
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
-      workItemSummaries: db.getAllWorkItemSummaries(),
+      workItemSummaries: withReview(db.getAllWorkItemSummaries()),
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
       reassignments: db.getReassignments(),
@@ -2488,8 +2496,25 @@ function healthReport(): HealthReport {
       oldestHistoryAgeMs: oldest ? Date.now() - oldest.mtime : null
     } : undefined,
     lastSaveError: h.lastSaveError,
-    rates
+    rates,
+    review: reviewCoverageByWorkItem(h.data.branches)
   });
+}
+
+/** Saved review coverage per work item across all its branches (#109); undefined when review tracking is off. */
+function reviewCoverageByWorkItem(branches: Record<string, { workItemId: string | null }>): Record<string, { total: number; reviewed: number; openIssues: number }> | undefined {
+  if (!reviewController || !(vscode.workspace.getConfiguration('aiEffortTracker.review').get<boolean>('enabled') ?? true)) return undefined;
+  const byWi = new Map<string, string[]>();
+  for (const [name, b] of Object.entries(branches ?? {})) {
+    if (!b?.workItemId || b.workItemId === UNASSIGNED_WORK_ITEM_ID) continue;
+    byWi.set(b.workItemId, [...(byWi.get(b.workItemId) ?? []), name]);
+  }
+  const out: Record<string, { total: number; reviewed: number; openIssues: number }> = {};
+  for (const [wi, names] of byWi) {
+    const r = reviewController.rollup(names);
+    if (r) out[wi] = { total: r.total, reviewed: r.reviewed, openIssues: r.openIssues };
+  }
+  return out;
 }
 
 async function fixDataHealth(checkId?: string) {
@@ -2607,6 +2632,14 @@ function estimatesPayload(projectId: unknown) {
   }
 }
 
+/** Attach the saved review coverage of each work item's branches (#109) for the dashboard. */
+function withReview<T extends { branches: string[] }>(list: T[]): (T & { review?: unknown })[] {
+  if (!reviewController || !(vscode.workspace.getConfiguration('aiEffortTracker.review').get<boolean>('enabled') ?? true)) return list;
+  return list.map(w => {
+    const r = w.branches.length ? reviewController!.rollup(w.branches) : null;
+    return r ? { ...w, review: { ...r, filesLeft: r.filesLeft.slice(0, 8), issues: r.issues.slice(0, 8) } } : w;
+  });
+}
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */
 function refreshDashboard() {
   if (!dashboardPanel) return;
@@ -2620,7 +2653,7 @@ function refreshDashboard() {
       analytics: getAnalytics(),
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
-      workItemSummaries: db.getAllWorkItemSummaries(),
+      workItemSummaries: withReview(db.getAllWorkItemSummaries()),
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
       reassignments: db.getReassignments(),
