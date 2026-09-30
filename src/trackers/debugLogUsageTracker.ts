@@ -44,6 +44,8 @@ export class DebugLogUsageTracker implements vscode.Disposable {
   private readonly startedAt = Date.now();
   private timer?: NodeJS.Timeout;
   private running = false;
+  /** Sessions that received live (non-import) turns in the latest poll, for live nudges (#93). */
+  lastChangedSessions: string[] = [];
   private disposed = false;
   private previousBranch?: string;
   private lastPoll = this.startedAt;
@@ -243,6 +245,7 @@ export class DebugLogUsageTracker implements vscode.Disposable {
       const active = new Set(files.map(f => f.file));
       for (const file of this.seen.keys()) if (!active.has(file)) this.seen.delete(file);
       let changed = false;
+      const touched = new Set<string>();
       let switches: BranchSwitch[] | undefined;
       for (const session of files) {
         let stamp: string | undefined;
@@ -297,6 +300,7 @@ export class DebugLogUsageTracker implements vscode.Disposable {
                 ...turn.responseIds.flatMap(id => aliases.get(id) ?? [])])]
             });
             changed = true;
+            touched.add(turn.sessionId);
           }
           this.seen.set(session.file, stamp);
         } catch (error) {
@@ -313,6 +317,7 @@ export class DebugLogUsageTracker implements vscode.Disposable {
       while (this.bindings.size > 5000) this.bindings.delete(this.bindings.keys().next().value!);
       this.previousBranch = branch;
       this.lastPoll = pollAt;
+      this.lastChangedSessions = [...touched];
       if (changed) this.changed();
     } catch (error) {
       this.output.error(`Debug-log capture failed: ${String(error)}`);
@@ -344,6 +349,7 @@ export class DebugLogUsageTracker implements vscode.Disposable {
       summary.credits += entry.credits;
       summary.unpriced += entry.debugUsage?.unpricedRequests ?? 0;
     }
+    this.lastChangedSessions = [];
     this.changed();
     return summary;
   }

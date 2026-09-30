@@ -21,6 +21,9 @@ import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
 import { GitHubService, BillingUsage } from './services/githubService';
 import { registerUsageInsightsMcp } from './mcp/provider';
+import { handleSessionsMessage } from './ui/sessionsPanel';
+import { BudgetMonitor } from './ui/budgetMonitor';
+import { NudgeController } from './ui/nudgeController';
 import { listSessions, optimizationFindings, usageOverview, type InsightFilter } from './analysis/usageInsights';
 
 let timeTracker: TimeTracker;
@@ -33,6 +36,10 @@ let debugLogUsageTracker: DebugLogUsageTracker;
 let db: Database;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
+let pendingOpenWorkItem: string | undefined;
+let pendingOpenTab: string | undefined;
+let budgetMonitor: BudgetMonitor | undefined;
+let nudgeController: NudgeController | undefined;
 let lastBilling: BillingUsage | null = null;
 const ghService = new GitHubService();
 
@@ -82,7 +89,12 @@ export function activate(context: vscode.ExtensionContext) {
   chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
   chatSessionUsageTracker = new ChatSessionUsageTracker(db, timeTracker, context.storageUri);
   creditImportTracker = new CreditImportTracker(db, timeTracker, () => refreshDashboard());
-  debugLogUsageTracker = new DebugLogUsageTracker(db, context.storageUri, () => refreshDashboard());
+  nudgeController = new NudgeController(db, context);
+  context.subscriptions.push(nudgeController);
+  debugLogUsageTracker = new DebugLogUsageTracker(db, context.storageUri, () => {
+    refreshDashboard();
+    nudgeController?.onUsage(debugLogUsageTracker?.lastChangedSessions ?? []);
+  });
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showSummary', () =>
@@ -287,6 +299,33 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setBillableHours', (workItemId?: string) =>
       setBillableHours(workItemId)
     ),
+    vscode.commands.registerCommand('aiEffortTracker.setWorkItemBudget', (workItemId?: string) =>
+      setWorkItemBudget(workItemId)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.openWorkItem', async (workItemId?: string) => {
+      const id = workItemId || await pickWorkItem('Open which work item?');
+      if (!id) return;
+      pendingOpenWorkItem = id;
+      if (dashboardPanel) {
+        dashboardPanel.reveal(vscode.ViewColumn.One);
+        flushPendingOpenWorkItem();
+      } else {
+        await openDashboard(db, timeTracker, context);
+      }
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.openDashboardTab', async (tab?: string) => {
+      pendingOpenTab = typeof tab === 'string' && tab ? tab : 'optimize';
+      if (dashboardPanel) {
+        dashboardPanel.reveal(vscode.ViewColumn.One);
+        flushPendingOpenWorkItem();
+      } else {
+        await openDashboard(db, timeTracker, context);
+      }
+    }),
+    vscode.commands.registerCommand('aiEffortTracker.resetNudgeMutes', async () => {
+      await nudgeController?.resetMutes();
+      vscode.window.showInformationMessage('AI Effort Tracker: all live nudges are unmuted.');
+    }),
     // #47: adjust/correct the AUTO-tracked time for a branch's mode (delta stored
     // under the hood; raw kept intact). `arg` encodes "branch\u0000mode" from the
     // dashboard ✎ affordance; falls back to QuickPicks from the palette.
@@ -367,6 +406,8 @@ export function activate(context: vscode.ExtensionContext) {
     chatUsageTracker.start(context);
   }
   context.subscriptions.push(debugLogUsageTracker, creditImportTracker);
+  budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath);
+  context.subscriptions.push(budgetMonitor);
   try { registerUsageInsightsMcp(context); } catch (error) {
     console.error('AI Effort Tracker: MCP server registration failed', error);
   }
@@ -400,10 +441,12 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
+    if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
     if (m?.type === 'optimize') {
       dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId) });
       return;
     }
+    if (m && typeof m === 'object' && await handleSessionsMessage(m, db, context, msg => dashboardPanel?.webview.postMessage(msg))) return;
     if (m?.type === 'cmd' && m.value) {
       await vscode.commands.executeCommand('aiEffortTracker.' + m.value, m.arg);
       refreshDashboard();
@@ -822,6 +865,73 @@ async function setBillableHours(arg?: string) {
   refreshDashboard();
 }
 
+/** Ask the dashboard (once its script is ready) to show a work item's detail or a tab. */
+function flushPendingOpenWorkItem() {
+  if (!dashboardPanel) return;
+  if (pendingOpenTab) {
+    const tab = pendingOpenTab;
+    pendingOpenTab = undefined;
+    void dashboardPanel.webview.postMessage({ type: 'openTab', tab });
+  }
+  if (!pendingOpenWorkItem) return;
+  const id = pendingOpenWorkItem;
+  pendingOpenWorkItem = undefined;
+  void dashboardPanel.webview.postMessage({ type: 'openWorkItem', id });
+}
+
+/**
+ * Set or clear a work item's explicit credit and money budgets (issue #94).
+ * Blank input clears the override so the budget is derived from the estimate.
+ */
+async function setWorkItemBudget(arg?: string) {
+  const id = arg || await pickWorkItem('Set a budget for which work item?');
+  if (!id) return;
+  const wi = db.getWorkItem(id);
+  const summary = db.getWorkItemSummary(id);
+  const b = summary.budget;
+  const currency = summary.roi?.currency ?? '';
+  const ask = async (prompt: string, current: number | undefined, derived: string) => {
+    const raw = await vscode.window.showInputBox({
+      prompt,
+      value: typeof current === 'number' ? String(current) : '',
+      placeHolder: derived,
+      validateInput: v => {
+        if (!v.trim()) return null;
+        const n = Number(v);
+        return Number.isFinite(n) && n >= 0 ? null : 'Enter a non-negative number (or leave blank to derive it)';
+      }
+    });
+    if (raw === undefined) return { ok: false as const };
+    const n = raw.trim() ? Number(raw) : 0;
+    return { ok: true as const, value: n > 0 ? n : null };
+  };
+  const derivedOf = (dim: 'credits' | 'cost', unit: string) => {
+    const d = b?.dims[dim];
+    return d && d.source !== 'explicit' ? `blank = derived ${d.budget} ${unit}` : 'blank = derive from the estimate (if possible)';
+  };
+
+  const credits = await ask(
+    `Credit budget for #${id} \u2014 blank to derive it from estimate \u00d7 credits per estimated hour`,
+    wi?.creditBudget, derivedOf('credits', 'credits')
+  );
+  if (!credits.ok) return;
+  const cost = await ask(
+    `Money budget${currency ? ` (${currency})` : ''} for #${id} \u2014 blank to derive it from estimate \u00d7 hourly cost + credit budget`,
+    wi?.costBudget, derivedOf('cost', currency)
+  );
+  if (!cost.ok) return;
+
+  db.setWorkItemBudget(id, { creditBudget: credits.value, costBudget: cost.value });
+  const after = db.getWorkItemSummary(id).budget;
+  vscode.window.showInformationMessage(
+    after && after.state !== 'unestimated'
+      ? `Budget for #${id} saved \u2014 ${after.pct}% used (${after.worst}).`
+      : `Budget for #${id} saved. Set an hour estimate or a budget to track consumption.`
+  );
+  refreshDashboard();
+  void budgetMonitor?.refresh();
+}
+
 /**
  * Adjust/CORRECT a branch's automatically-tracked time for one mode (issue #47).
  * Stores a per-mode adjustment DELTA under the hood via
@@ -1141,6 +1251,11 @@ async function setProjectRates(preselectedId?: string) {
     existing.creditCostPerUnit
   );
   if (!creditCost.ok) return;
+  const creditsPerHour = await numInput(
+    `Credit budget per estimated hour for "${projectLabel}" work items (issue #94) \u2014 blank to inherit the global setting`,
+    existing.creditsPerEstimatedHour
+  );
+  if (!creditsPerHour.ok) return;
 
   // Merge onto existing settings; assigning undefined clears an override.
   const settings = { ...existing };
@@ -1148,6 +1263,7 @@ async function setProjectRates(preselectedId?: string) {
   settings.hourlySellRate = sell.value;
   settings.currency = currencyRaw.trim() ? currencyRaw.trim() : undefined;
   settings.creditCostPerUnit = creditCost.value;
+  settings.creditsPerEstimatedHour = creditsPerHour.value && creditsPerHour.value > 0 ? creditsPerHour.value : undefined;
   db.upsertProject({ id: projectId, settings });
 
   const eff = db.getEffectiveRates(projectId);

@@ -19,6 +19,7 @@ import type { TurnAnalysis } from '../util/debugExport';
 import { atomicWrite, readStore, retainPrevious, StoreBusyError, syncDirectory, withStoreLock } from './persistence';
 import { isLegacyOverwrite, mergeStores, STORE_WRITER } from './mergeStore';
 import { MAX_TOOLSETS, type ModelPrice, type ToolsetInfo } from '../util/modelCatalog';
+import { computeBudget, normalizeThresholds, type BudgetDay, type BudgetStatus } from '../analysis/budget';
 
 export interface LineStats {
   added: number;
@@ -605,6 +606,16 @@ export interface WorkItem {
    * {@link Database.setBillableHours} / `effectiveBillableHours`.
    */
   billableHours?: number;
+  /** Explicit credit budget (issue #94); overrides the project's credits-per-hour default. */
+  creditBudget?: number;
+  /** Explicit money budget in the project currency (issue #94); overrides the rate-derived budget. */
+  costBudget?: number;
+  /**
+   * Budget alert thresholds (percent) already notified (issue #94). A threshold
+   * is removed again when consumption falls below it, so each crossing alerts
+   * once. Set-like array: concurrent windows merge it as a union.
+   */
+  budgetAlerts?: number[];
 }
 
 /** Categories an estimate can be broken down by — reuses {@link FileCategory}. */
@@ -663,6 +674,8 @@ export interface ProjectSettings {
   currency?: string;
   /** Money cost per 1 credit / premium-request, for folding AI spend into cost. */
   creditCostPerUnit?: number;
+  /** Default credit budget per estimated hour for this project's work items (issue #94). */
+  creditsPerEstimatedHour?: number;
   [key: string]: unknown;
 }
 
@@ -796,6 +809,11 @@ export interface WorkItemSummary {
    * the totals above; the array drives the per-entry Time Log card. Display-only.
    */
   timeEntries?: TimeEntry[];
+  /** Budget status across all branches (issue #94). Display-only / derived. */
+  budget?: BudgetStatus;
+  /** Explicit budgets as entered (issue #94), for editing. */
+  creditBudget?: number | null;
+  costBudget?: number | null;
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
@@ -803,7 +821,7 @@ export type BranchRollup = Omit<
   WorkItemSummary,
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
   | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual' | 'roi'
-  | 'generated' | 'timeEntries'
+  | 'generated' | 'timeEntries' | 'budget' | 'creditBudget' | 'costBudget'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -932,8 +950,13 @@ export interface ProjectRoi extends RoiFigures {
  * v11 adds compact per-branch effective-line counters. Existing branches fall
  * back to their historical added-line totals until a new effective counter is
  * recorded. No snapshots or source contents are persisted.
+ *
+ * v12 (issue #94) adds optional work-item budgets (`WorkItem.creditBudget`,
+ * `WorkItem.costBudget`) and the notified-threshold list `budgetAlerts`. No
+ * rewrite: absent fields mean "no explicit budget / nothing notified yet", and
+ * {@link normalizeWorkItemBillableHours} only strips invalid values.
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Well-known holding work item (issue #12) for branches that carry effort but
@@ -1250,9 +1273,19 @@ export function normalizeWorkItemBillableHours(workItems: Record<string, WorkIte
   for (const wi of Object.values(workItems)) {
     if (!wi || typeof wi !== 'object') continue;
     const bh = (wi as WorkItem).billableHours;
-    if (bh === undefined) continue;
-    if (typeof bh !== 'number' || !Number.isFinite(bh) || bh < 0) {
+    if (bh !== undefined && (typeof bh !== 'number' || !Number.isFinite(bh) || bh < 0)) {
       delete (wi as WorkItem).billableHours;
+    }
+    // v12 (issue #94): optional budgets must be positive numbers; alerts a list of thresholds.
+    for (const key of ['creditBudget', 'costBudget'] as const) {
+      const v = wi[key];
+      if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v <= 0)) delete wi[key];
+    }
+    if (wi.budgetAlerts !== undefined) {
+      const list = Array.isArray(wi.budgetAlerts)
+        ? [...new Set(wi.budgetAlerts.filter(v => typeof v === 'number' && Number.isFinite(v) && v > 0))].sort((a, b) => a - b)
+        : [];
+      if (list.length) wi.budgetAlerts = list; else delete wi.budgetAlerts;
     }
   }
 }
@@ -3195,7 +3228,8 @@ export class Database {
   getWorkItemSummary(workItemId: string): WorkItemSummary {
     const wi = this.ensureWorkItem(workItemId);
     const branches = this.getBranchesForWorkItem(workItemId);
-    const rollup = rollupBranchSummaries(branches.map(b => this.getSummaryForBranch(b)));
+    const branchSummaries = branches.map(b => this.getSummaryForBranch(b));
+    const rollup = rollupBranchSummaries(branchSummaries);
     // #21: fold hand-entered corrections into the tracked totals (additive) and
     // expose them separately as `manual` so the UI can show the auto/manual split.
     const manual = this.manualRollupForWorkItem(workItemId);
@@ -3209,10 +3243,11 @@ export class Database {
     // AI leverage instead of just wall-clock time.
     const actualHours = billableMs / MS_PER_HOUR;
     const billableHours = this.effectiveBillableHours(wi, actualHours);
+    const credits = this.getCreditsForWorkItem(workItemId);
     const roi = this.roiForSubject(
       wi.projectId ?? null,
       billableMs,
-      this.getCreditsForWorkItem(workItemId),
+      credits,
       billableHours
     );
     // #48: value of the generated lines (human + AI added, rolled up) at the
@@ -3242,8 +3277,116 @@ export class Database {
       manual,
       roi,
       generated,
-      timeEntries: this.timeEntriesForWorkItem(workItemId)
+      timeEntries: this.timeEntriesForWorkItem(workItemId),
+      budget: this.budgetFor(wi, actualHours, credits.credits, roi, rollup.effectiveByCategory, branchSummaries),
+      creditBudget: wi.creditBudget ?? null,
+      costBudget: wi.costBudget ?? null
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Work-item budgets (issue #94). The math is pure (analysis/budget.ts); this
+  // layer gathers consumption per day and per branch and reads the settings.
+  // ---------------------------------------------------------------------------
+
+  private readBudgetSettings(): { thresholds: number[]; creditsPerEstimatedHour: number | null } {
+    const c = vscode.workspace.getConfiguration('aiEffortTracker');
+    const cph = c.get<number>('budget.creditsPerEstimatedHour');
+    return {
+      thresholds: normalizeThresholds(c.get<number[]>('budget.thresholds')),
+      creditsPerEstimatedHour: typeof cph === 'number' && Number.isFinite(cph) && cph > 0 ? cph : null
+    };
+  }
+
+  /** Active hours and credits per local day for a work item (tracked time, manual effort, time log, ledger). */
+  private workItemDaily(workItemId: string, branches: string[]): BudgetDay[] {
+    const days = new Map<string, BudgetDay>();
+    const at = (date: string) => {
+      let d = days.get(date);
+      if (!d) { d = { date, hours: 0, credits: 0 }; days.set(date, d); }
+      return d;
+    };
+    for (const b of branches) {
+      for (const [date, bucket] of Object.entries(this.store[b]?.daily ?? {})) {
+        const ms = (bucket.humanCoding ?? 0) + (bucket.aiGenerating ?? 0) + (bucket.reviewing ?? 0);
+        if (ms > 0) at(date).hours += ms / MS_PER_HOUR;
+      }
+    }
+    for (const e of this.manualEffort) {
+      if (e.workItemId === workItemId && e.mode && e.mode !== 'idle' && (e.durationMs ?? 0) > 0) {
+        at(dayKey(e.ts)).hours += e.durationMs! / MS_PER_HOUR;
+      }
+    }
+    for (const e of this.timeEntriesForWorkItem(workItemId)) {
+      if (e.source === 'manual' && e.mode !== 'idle' && e.durationMs > 0) at(dayKey(timeEntryTs(e))).hours += e.durationMs / MS_PER_HOUR;
+    }
+    for (const e of this.creditLedger) {
+      if ((e.workItemId ?? null) === workItemId && Number.isFinite(e.credits)) at(dayKey(e.ts)).credits += e.credits;
+    }
+    return [...days.values()];
+  }
+
+  private budgetFor(
+    wi: WorkItem, usedHours: number, usedCredits: number, roi: RoiFigures,
+    byCategory: Record<string, { human: number; ai: number }>, branchSummaries: BranchSummary[]
+  ): BudgetStatus {
+    const settings = this.readBudgetSettings();
+    const projectCph = wi.projectId ? this.projects[wi.projectId]?.settings?.creditsPerEstimatedHour : undefined;
+    const inHours = (wi.estimateUnit ?? 'hours') === 'hours';
+    const categoryLines: Record<string, number> = {};
+    for (const [cat, v] of Object.entries(byCategory ?? {})) categoryLines[cat] = (v?.human ?? 0) + (v?.ai ?? 0);
+    const ledgerByBranch = new Map<string, number>();
+    for (const e of this.creditLedger) {
+      if ((e.workItemId ?? null) === wi.id && e.branch) ledgerByBranch.set(e.branch, (ledgerByBranch.get(e.branch) ?? 0) + (e.credits || 0));
+    }
+    return computeBudget({
+      estimateHours: inHours ? workItemTotalEstimate(wi) : null,
+      estimateBreakdown: inHours ? wi.estimateBreakdown : undefined,
+      creditBudget: wi.creditBudget ?? null,
+      costBudget: wi.costBudget ?? null,
+      creditsPerEstimatedHour: typeof projectCph === 'number' && Number.isFinite(projectCph) && projectCph > 0
+        ? projectCph : settings.creditsPerEstimatedHour,
+      hourlyCostRate: roi.hourlyCostRate,
+      creditCostPerUnit: roi.creditCostPerUnit,
+      usedHours,
+      usedCredits,
+      usedCost: roi.totalCost,
+      daily: this.workItemDaily(wi.id, branchSummaries.map(s => s.branch)),
+      categoryLines,
+      branches: branchSummaries.map(s => ({
+        branch: s.branch,
+        hours: (s.humanCodingMs + s.aiGeneratingMs + s.reviewingMs) / MS_PER_HOUR,
+        credits: ledgerByBranch.get(s.branch) ?? 0
+      })),
+      thresholds: settings.thresholds,
+      today: dayKey()
+    });
+  }
+
+  /**
+   * Set or clear a work item's explicit credit and/or money budget (issue #94).
+   * `undefined` leaves a field unchanged; `null`, 0 or an invalid value clears it.
+   */
+  setWorkItemBudget(workItemId: string, budget: { creditBudget?: number | null; costBudget?: number | null }): WorkItem {
+    const wi = this.ensureWorkItem(workItemId);
+    for (const key of ['creditBudget', 'costBudget'] as const) {
+      if (!(key in budget)) continue;
+      const v = budget[key];
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) wi[key] = v; else delete wi[key];
+    }
+    this.save();
+    return wi;
+  }
+
+  /** Record which budget thresholds have been notified for a work item (issue #94). */
+  setBudgetAlerts(workItemId: string, thresholds: number[]): void {
+    const wi = this.workItems[workItemId];
+    if (!wi) return;
+    const next = [...new Set(thresholds.filter(t => Number.isFinite(t) && t > 0))].sort((a, b) => a - b);
+    const cur = wi.budgetAlerts ?? [];
+    if (next.length === cur.length && next.every((t, i) => t === cur[i])) return;
+    if (next.length) wi.budgetAlerts = next; else delete wi.budgetAlerts;
+    this.save();
   }
 
   getAllWorkItemSummaries(): WorkItemSummary[] {

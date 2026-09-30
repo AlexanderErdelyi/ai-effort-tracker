@@ -39,6 +39,9 @@
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
 | `aiEffortTracker.mcpServer.enabled` | `true` | Offer the read-only usage-insights MCP server to Copilot |
+| `aiEffortTracker.sessions.showTitles` | `true` | Show chat titles in the Sessions tab |
+| `aiEffortTracker.budget.*` | | Budget alerts, status bar, thresholds, credits per estimated hour (see [Work item budgets](#work-item-budgets)) |
+| `aiEffortTracker.nudges.*` | | Live nudges and running chat cost (see [Live nudges](#live-nudges-while-you-chat)) |
 
 ## Branch changes and tracked time
 
@@ -208,8 +211,8 @@ or *"Analyse my usage for work item 1987"*. Tools:
 |------|---------|
 | `usage_overview` | Totals by model/agent/effort, cache misses by cause, tool sources |
 | `optimization_findings` | Ranked recommendations with evidence and credits at stake |
-| `list_work_items` | Credits per work item, to choose a scope |
-| `list_sessions` | Recent chat sessions with models, context size, avoidable cache misses |
+| `list_work_items` | Credits per work item plus budget status (used %, projection, warning/over), to choose a scope |
+| `list_sessions` | Recent chat sessions with models, context size, avoidable cache misses; `includeTitles` adds chat titles |
 | `session_detail` | Per-turn breakdown of one chat; `includePrompts` adds short prompt excerpts |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
@@ -217,6 +220,60 @@ All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 (`includePrompts`, 50–1000 characters) are read on demand from Copilot's own local
 debug logs while they exist; they are returned to the asking model and are never
 stored by the tracker. Disable the server with `aiEffortTracker.mcpServer.enabled`.
+
+## Chat sessions
+
+The dashboard's **💬 Sessions** tab lists recorded chats with their title, work
+item, branch, models, turns, credits, context size and avoidable cache misses.
+Filter by period, work item, branch, model, minimum credits or low-output chats,
+sort any column, expand a chat for its per-turn breakdown, or export the list as
+CSV. Titles are read on demand from VS Code's
+local chat history (renamed titles win); they are never copied into the store.
+Turn them off with `aiEffortTracker.sessions.showTitles`.
+
+## Work item budgets
+
+Each work item gets a budget from its estimate: **hours** (estimate in hours),
+**credits** (explicit, or estimated hours × `aiEffortTracker.budget.creditsPerEstimatedHour`
+or the project's value from **Set Project Rates**) and **cost** (explicit, or
+estimated hours × hourly cost). Set explicit values with **AI Effort Tracker: Set
+Work Item Budget** or the **💰 Set Budget** button on the work item's budget card.
+
+- The work item detail shows used %, a linear end-of-work projection, and a
+  burn-down chart of hours and credits against the budget lines, plus the split
+  by category and branch.
+- Project work item lists get a budget column and are sorted by risk.
+- A status bar item shows the current branch's work item (e.g. `WI 1761: 64% · 3.2h left`),
+  turning yellow at the warning threshold and red when over.
+- A notification appears once per threshold (`aiEffortTracker.budget.thresholds`,
+  default 80 % and 100 %) for work items active in the last 7 days, with
+  **Open work item** and **Adjust estimate**. Disable with `aiEffortTracker.budget.alerts`
+  or hide the status bar item with `aiEffortTracker.budget.showStatusBar`.
+- The MCP tool `list_work_items` includes the budget status of each work item.
+
+## Live nudges while you chat
+
+While a chat runs, the status bar shows its running cost (e.g. `chat 312 cr · 9.4/call`;
+hover for turns, context size, cache hit rate and model; click for the Sessions tab).
+After each recorded turn the tracker checks the new calls and may show one short
+tip with the credits at stake:
+
+| Nudge | When | Repeats |
+|-------|------|---------|
+| Model switch | Switching models mid-chat re-sent a large context uncached | Per chat after `nudges.cooldownMinutes` (30) |
+| Expired cache | A pause over 5 minutes made a large context billed again | Once per chat |
+| Context growth | The main chat's context passed `nudges.contextTokens` (150K) | Each time it doubles |
+| Light turns on a premium model | `nudges.lightTurnCount` (3) read-only/Q&A turns on a model at least twice as expensive as an available one | Once per chat |
+| Too many tools | `nudges.toolCount` (100) tools offered per request, or `tool_search` rounds | Once a day |
+
+Any two nudges are at least 10 minutes apart and cache nudges ignore breaks that
+wasted under 2 credits. Each notification offers **Don't show again for this chat**,
+**Mute this nudge** and **Open Optimize**; **AI Effort Tracker: Reset Nudge Mutes**
+undoes the mutes. Nudges use only recorded token and credit metadata, never prompt
+content, and never fire for history imported from older logs. Turn them off with
+`aiEffortTracker.nudges.enabled`, per type with `aiEffortTracker.nudges.modelSwitch`,
+`idleCache`, `contextGrowth`, `lightTurns` and `toolBloat`, and hide the running
+cost with `aiEffortTracker.nudges.showLiveChatCost`.
 
 ## Development
 

@@ -69,6 +69,8 @@ export function renderDashboardHtml(
   .card{background:var(--vscode-editor-inactiveSelectionBackground);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:16px;}
   .card h3{font-size:.9em;margin-bottom:12px;color:var(--vscode-descriptionForeground);text-transform:uppercase;letter-spacing:.05em;}
   .cw{position:relative;height:200px;}
+  .bud{height:6px;background:rgba(128,128,128,.2);border-radius:3px;overflow:hidden;min-width:70px;}
+  .budf{height:100%;border-radius:3px;}
   table{width:100%;border-collapse:collapse;font-size:.9em;}
   th{text-align:left;padding:8px 10px;color:var(--vscode-descriptionForeground);border-bottom:1px solid var(--vscode-panel-border);font-weight:normal;font-size:.85em;text-transform:uppercase;letter-spacing:.04em;}
   td{padding:8px 10px;border-bottom:1px solid var(--vscode-panel-border);vertical-align:middle;}
@@ -96,6 +98,8 @@ export function renderDashboardHtml(
   .extb{display:inline-block;padding:1px 5px;border-radius:3px;font-size:.8em;font-family:monospace;background:rgba(128,128,128,.15);margin-right:4px;}
   .dc{font-family:monospace;}
   .rng{display:flex;gap:6px;margin-bottom:16px;}
+  .rng label{font-size:.85em;display:inline-flex;gap:4px;align-items:center;}
+  .sesin{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px;}
   .hm{display:grid;grid-template-columns:auto repeat(24,1fr);gap:2px;font-size:.7em;}
   .hm .hc{width:100%;padding-top:100%;border-radius:2px;position:relative;background:rgba(128,128,128,.08);}
   .hm .hl{color:var(--vscode-descriptionForeground);display:flex;align-items:center;justify-content:flex-end;padding-right:6px;}
@@ -512,14 +516,65 @@ function renderProjectList(){
     +'<table><thead><tr><th>Project</th><th>Repos</th><th>Work Items</th><th>Active</th><th>Credits</th><th>ROI Net</th></tr></thead><tbody>'+projectRowsHtml()+'</tbody></table>'
     +'<p style="margin-top:12px;font-size:.8em;color:var(--vscode-descriptionForeground)">Project ROI net = value produced \\u2212 cost from the project\\u2019s effective rates. \\u201c\\u2014\\u201d means a required rate is not configured (set it with \\u201cSet Rates\\u201d).</p>';
 }
+// Work-item budgets (issue #94). The status is computed server-side
+// (analysis/budget.ts) and rides on each work item summary as w.budget.
+var BUD_COL={ok:'var(--added)',warning:'var(--review)',over:'var(--deleted)',unestimated:'var(--vscode-descriptionForeground)'};
+var BUD_DIM={time:'time',credits:'credits',cost:'cost'};
+function budRisk(w){var b=w.budget;return(b&&b.pct!=null)?b.pct:-1;}
+function budVal(k,v,cur){return k==='time'?(Math.round(v*10)/10)+'h':k==='credits'?(Math.round(v*10)/10)+' cr':fmtMoney(v,cur);}
+function budBar(b){
+  if(!b||b.state==='unestimated')return'<span class="badge" style="opacity:.75" title="No hour estimate or budget \\u2014 set one to track consumption">unestimated</span>';
+  return'<div class="bud" title="'+esc(BUD_DIM[b.worst]+': '+b.pct+'% used')+'"><div class="budf" style="width:'+Math.min(100,b.pct)+'%;background:'+BUD_COL[b.state]+'"></div></div><div style="font-size:.75em;color:'+BUD_COL[b.state]+'">'+b.pct+'% '+esc(BUD_DIM[b.worst])+'</div>';
+}
+function budgetCardHtml(w,cur){
+  var b=w.budget;if(!b)return'';
+  var btns='<button class="dtab" data-action="budSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB0 Set Budget</button> <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCCF Estimate</button>';
+  var head='<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><h3>\\uD83C\\uDFAF Budget</h3><div>'+btns+'</div></div>';
+  if(b.state==='unestimated'){
+    return'<div class="card" style="margin-top:12px">'+head+'<p style="color:var(--vscode-descriptionForeground);margin-top:6px">This work item has no hour estimate and no credit or money budget, so it cannot be tracked against one. Used so far: '+budVal('time',b.used.hours)+' \\u00b7 '+budVal('credits',b.used.credits)+'.</p></div>';
+  }
+  var src={explicit:'set explicitly',estimate:'from the estimate',project:'estimate \\u00d7 project credits/hour'};
+  var rows=['time','credits','cost'].filter(function(k){return b.dims[k];}).map(function(k){
+    var d=b.dims[k];var st=d.pct>=100?'over':(b.crossed.length&&d.pct>=Math.min.apply(null,b.crossed))?'warning':'ok';
+    return'<tr><td style="white-space:nowrap"><strong>'+esc(BUD_DIM[k])+'</strong><div style="font-size:.75em;color:var(--vscode-descriptionForeground)">'+esc(src[d.source]||d.source)+'</div></td>'
+      +'<td style="width:40%"><div class="bud"><div class="budf" style="width:'+Math.min(100,d.pct)+'%;background:'+BUD_COL[st]+'"></div></div></td>'
+      +'<td style="white-space:nowrap;color:'+BUD_COL[st]+'">'+d.pct+'%</td>'
+      +'<td style="white-space:nowrap">'+budVal(k,d.used,cur)+' / '+budVal(k,d.budget,cur)+'</td>'
+      +'<td style="white-space:nowrap">'+(d.remaining>=0?budVal(k,d.remaining,cur)+' left':'<span style="color:var(--deleted)">'+budVal(k,-d.remaining,cur)+' over</span>')+'</td></tr>';
+  }).join('');
+  var p=b.projection,bn=b.burn;
+  var pace='Last '+bn.days+' days: '+budVal('time',bn.hoursPerDay)+'/day \\u00b7 '+budVal('credits',bn.creditsPerDay)+'/day'+(bn.costPerDay!=null?' \\u00b7 '+fmtMoney(bn.costPerDay,cur)+'/day':'')+'. ';
+  var proj=!p?'No recent activity, so no run-out projection.':p.daysLeft<=0?'<span style="color:var(--deleted)">The '+esc(BUD_DIM[p.dimension])+' budget is used up.</span>':'At this pace the '+esc(BUD_DIM[p.dimension])+' budget runs out in <strong>'+p.daysLeft+' days</strong> (around '+esc(p.date)+').';
+  var cats=(b.categories||[]).filter(function(c){return c.budgetHours>0||c.usedHours>0;});
+  var catHtml=cats.some(function(c){return c.budgetHours>0;})?'<table style="margin-top:10px"><thead><tr><th>Category</th><th>Estimate</th><th>Used (by line share)</th><th>%</th></tr></thead><tbody>'+cats.map(function(c){return'<tr><td>'+esc(CAT[c.category]||c.category)+'</td><td>'+(c.budgetHours?budVal('time',c.budgetHours):'\\u2014')+'</td><td>'+budVal('time',c.usedHours)+'</td><td style="color:'+(c.pct==null?'inherit':c.pct>=100?'var(--deleted)':'inherit')+'">'+(c.pct==null?'\\u2014':c.pct+'%')+'</td></tr>';}).join('')+'</tbody></table>':'';
+  var br=b.branches||[];
+  var brHtml=br.length>1?'<table style="margin-top:10px"><thead><tr><th>Branch</th><th>Hours</th><th>Credits</th></tr></thead><tbody>'+br.map(function(x){return'<tr><td>'+esc(x.branch)+'</td><td>'+budVal('time',x.hours)+' ('+x.hoursPct+'%)</td><td>'+budVal('credits',x.credits)+' ('+x.creditsPct+'%)</td></tr>';}).join('')+'</tbody></table>':'';
+  return'<div class="card" style="margin-top:12px">'+head
+    +'<table style="margin-top:8px"><tbody>'+rows+'</tbody></table>'
+    +'<p style="margin-top:8px;font-size:.85em">'+pace+proj+'</p>'
+    +'<div class="cw" style="height:200px;margin-top:10px"><canvas id="cBudget"></canvas></div>'
+    +catHtml+brHtml
+    +'<p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Consumption across all branches, manual effort and the credit ledger. Alerts fire once per threshold crossing (settings: aiEffortTracker.budget.*).</p></div>';
+}
+function renderBudgetChart(w){
+  dc('budget');
+  var cv=document.getElementById('cBudget');var b=w.budget;
+  if(!cv||!b||!b.series||!b.series.length||typeof Chart==='undefined')return;
+  var labels=b.series.map(function(s){return s.date.slice(5);});
+  var ds=[{label:'Hours used',data:b.series.map(function(s){return s.hours;}),borderColor:'rgba(78,201,176,1)',backgroundColor:'rgba(78,201,176,.15)',fill:true,tension:.2,pointRadius:0,yAxisID:'y'},
+    {label:'Credits used',data:b.series.map(function(s){return s.credits;}),borderColor:'rgba(206,145,120,1)',tension:.2,pointRadius:0,yAxisID:'y1'}];
+  if(b.dims.time)ds.push({label:'Hour budget',data:b.series.map(function(){return b.dims.time.budget;}),borderColor:'rgba(78,201,176,.6)',borderDash:[6,4],pointRadius:0,yAxisID:'y'});
+  if(b.dims.credits)ds.push({label:'Credit budget',data:b.series.map(function(){return b.dims.credits.budget;}),borderColor:'rgba(206,145,120,.6)',borderDash:[6,4],pointRadius:0,yAxisID:'y1'});
+  charts.budget=new Chart(cv,{type:'line',data:{labels:labels,datasets:ds},options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg(),maxTicksLimit:10},grid:{color:gc}},y:{beginAtZero:true,position:'left',ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'hours',color:dfg()}},y1:{beginAtZero:true,position:'right',ticks:{color:dfg()},grid:{drawOnChartArea:false},title:{display:true,text:'credits',color:dfg()}}}}});
+}
 function wiRowsHtml(items){
   var rows=items.map(function(w){
     var I=insights(w);
     var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
     var roiColor=moneyColor(I.roi);
-    return'<tr data-action="wi" data-value="'+esc(w.workItemId)+'"><td><strong>'+esc(w.title||('#'+w.workItemId))+'</strong><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></td><td>'+est+'</td><td>'+fmt(activeMsOf(w))+'</td><td><span class="badge '+(aiPctOf(w)>50?'ba':'bh')+'">'+aiPctOf(w)+'%</span></td><td>'+(w.creditsTotal||0).toFixed(1)+'</td><td style="color:'+roiColor+'">'+fmtMoney(I.roi,I.currency)+'</td></tr>';
+    return'<tr data-action="wi" data-value="'+esc(w.workItemId)+'"><td><strong>'+esc(w.title||('#'+w.workItemId))+'</strong><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></td><td>'+est+'</td><td>'+budBar(w.budget)+'</td><td>'+fmt(activeMsOf(w))+'</td><td><span class="badge '+(aiPctOf(w)>50?'ba':'bh')+'">'+aiPctOf(w)+'%</span></td><td>'+(w.creditsTotal||0).toFixed(1)+'</td><td style="color:'+roiColor+'">'+fmtMoney(I.roi,I.currency)+'</td></tr>';
   });
-  if(!rows.length)return'<tr><td colspan="6" style="color:var(--vscode-descriptionForeground)">No work items here yet.</td></tr>';
+  if(!rows.length)return'<tr><td colspan="7" style="color:var(--vscode-descriptionForeground)">No work items here yet.</td></tr>';
   return rows.join('');
 }
 function renderProjectDetail(){
@@ -527,7 +582,7 @@ function renderProjectDetail(){
   var p=PROJ.find(function(x){return x.projectId===selProj;});
   var isNone=selProj==='__none__';
   if(!p&&!isNone){projView='list';return renderProjectList();}
-  var items=wiOfProject(selProj);
+  var items=wiOfProject(selProj).slice().sort(function(a,b){return budRisk(b)-budRisk(a);});
   var name=isNone?'\\uD83D\\uDCE5 Unassigned':esc(p.name);
   var act=isNone?items.reduce(function(a,w){return a+activeMsOf(w);},0):activeMsOf(p);
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
@@ -542,7 +597,7 @@ function renderProjectDetail(){
     +translationSummaryHtml(p)
     +'<p class="sub" style="margin:12px 0 6px">Repos: '+repos+'</p>'
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
-    +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
+    +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th title="Worst budget dimension (time, credits or cost); sorted by risk">Budget</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
 }
 function meModeLabel(m){return {humanCoding:'Human coding',aiGenerating:'AI generating',reviewing:'Reviewing',idle:'Idle'}[m]||m;}
 function meFor(wid){return (ME||[]).filter(function(e){return e.workItemId===wid;});}
@@ -658,12 +713,14 @@ function renderWorkItemDetail(){
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
     +'</div>'
     +manualSplitHtml(w)
+    +budgetCardHtml(w,I.currency)
     +translationSummaryHtml(w)
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button>'+(genH==null?'':'<button class="dtab" data-action="bhUse" data-id="'+esc(w.workItemId)+'" data-hours="'+esc(genH)+'" title="Prefill billable hours with the generated-lines equivalent (\\u2248 '+genH+'h)">\\u26A1 Use as Billable Hours</button>')+'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button><button class="dtab" data-action="wiDel" data-id="'+esc(w.workItemId)+'" title="Delete this work item \\u2014 its branches, credits and effort move to Unassigned (nothing is deleted)">\\uD83D\\uDDD1 Delete Work Item</button></div>'
     +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
     +timeLogCardHtml(w.timeEntries||[],'data-id="'+esc(w.workItemId)+'"')
     +'<div class="card" style="margin-top:12px"><h3>Reassignment History</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Audit trail of branch \\u2192 work item moves touching this work item (newest first).</p></div>';
+  renderBudgetChart(w);
 }
 function renderProjectsView(){
   if(projView==='project')return renderProjectDetail();
@@ -900,6 +957,7 @@ function showTab(name){
   else if(name==='projects'){document.getElementById('tab-projects').classList.add('active');renderProjectsView();}
   else if(name==='ledger'){document.getElementById('tab-ledger').classList.add('active');renderLedger();}
   else if(name==='optimize'){document.getElementById('tab-optimize').classList.add('active');requestOptimize();}
+  else if(name==='sessions'){document.getElementById('tab-sessions').classList.add('active');requestSessions();}
   else{document.getElementById('dtab').classList.add('active');}
 }
 
@@ -948,8 +1006,89 @@ function renderOptimize(){
 }
 function bindOptWi(){var s=document.getElementById('optWi');if(s)s.addEventListener('change',function(){optWi=this.value;requestOptimize();});}
 
+// #95 Sessions tab: all chat sessions with titles, filters, sorting, paging, CSV.
+var SES=null,sesLoading=false,sesOpen={},sesDet={};
+var sesQ={days:30,from:'',to:'',workItemId:'',branch:'',model:'',minCredits:0,lowOutputOnly:false,sort:'end',descending:true,offset:0,limit:50};
+function sesMsg(type){return Object.assign({type:type},sesQ);}
+function requestSessions(){sesLoading=true;renderSessions();vscode.postMessage(sesMsg('sessions'));}
+function sesSelect(id,first,items,val){
+  return'<select id="'+id+'" class="sesin"><option value="">'+esc(first)+'</option>'+items.map(function(o){return'<option value="'+esc(o[0])+'"'+(o[0]===val?' selected':'')+'>'+esc(o[1])+'</option>';}).join('')+'</select>';
+}
+function sesWhen(s){return esc(String(s||'').slice(0,16).replace('T',' '));}
+function sesDetailHtml(id){
+  var d=sesDet[id];
+  if(!d)return'<em>Loading\\u2026</em>';
+  if(!d.detail)return'<em>No captured usage for this session.</em>';
+  var P=d.prompts||{};
+  var rows=d.detail.turns.map(function(t){
+    var tools=(t.tools||[]).slice().sort(function(a,b){return b.calls-a.calls;}).slice(0,3).map(function(x){return esc(x.name)+' \\u00d7'+x.calls;}).join(', ');
+    var add=0,rem=0;(t.filesEdited||[]).forEach(function(f){add+=f.added||0;rem+=f.removed||0;});
+    var cb=(t.cacheBreaks||[]).filter(function(b){return b.cause!=='new-context';}).map(function(b){return esc(b.cause);}).join(', ');
+    var p=P[t.turnId];
+    return'<tr><td style="white-space:nowrap">'+sesWhen(t.at)+'</td><td style="max-width:320px">'+(p?esc(p):'<span style="color:var(--vscode-descriptionForeground)">\\u2014</span>')+'</td><td>'+esc((t.models||[]).join(', '))+'</td><td>'+t.calls+'</td><td>'+n2(t.credits)+'</td><td>'+t.cacheHitPct+'%</td><td>'+(tools||'\\u2014')+'</td><td>+'+add+' / \\u2212'+rem+'</td><td>'+(cb||'\\u2014')+'</td><td>'+esc(t.workItemId?('#'+t.workItemId):(t.branch||''))+'</td><td><button class="dtab" data-action="ledEdit" data-id="'+esc(t.entryId||'')+'" title="Edit / reassign this turn\\u2019s credits to another work item">\\u270E</button></td></tr>';
+  });
+  return'<div style="padding:6px 0"><div style="font-size:.8em;color:var(--vscode-descriptionForeground);margin-bottom:6px">Session '+esc(id)+'</div>'
+    +optTable(['Turn','Prompt','Models','Calls','Credits','Cache hit','Top tools','Lines','Cache misses','Work item','' ],rows,'No turns')+'</div>';
+}
+function renderSessions(){
+  var el=document.getElementById('sessions');
+  var wiItems=(WI||[]).map(function(w){return[w.workItemId,'#'+w.workItemId+(w.title?' \\u2013 '+w.title:'')];});
+  var S=SES&&!SES.error?SES:{rows:[],total:0,offset:0,totals:{credits:0,turns:0,lowOutput:0},models:[],branches:[],titles:{}};
+  var ctl='<div class="rng" style="flex-wrap:wrap;gap:6px;align-items:center">'
+    +[7,30,90,365].map(function(d){return'<button class="dtab'+(!sesQ.from&&d===sesQ.days?' active':'')+'" data-action="sesDays" data-value="'+d+'">'+(d===365?'1 year':d+' days')+'</button>';}).join('')
+    +' <label>From <input type="date" id="sesFrom" class="sesin" value="'+esc(sesQ.from)+'"></label><label>To <input type="date" id="sesTo" class="sesin" value="'+esc(sesQ.to)+'"></label>'
+    +sesSelect('sesWi','All work items',wiItems,sesQ.workItemId)
+    +sesSelect('sesBranch','All branches',S.branches.map(function(b){return[b,b];}),sesQ.branch)
+    +sesSelect('sesModel','All models',S.models.map(function(m){return[m,m];}),sesQ.model)
+    +'<label>Min credits <input type="number" min="0" step="1" id="sesMin" class="sesin" style="width:70px" value="'+(sesQ.minCredits||'')+'"></label>'
+    +'<label><input type="checkbox" id="sesLow"'+(sesQ.lowOutputOnly?' checked':'')+'> Expensive, low output only</label>'
+    +'<button class="dtab" data-action="sesRefresh">\\u21bb Refresh</button><button class="dtab" data-action="sesCsv">\\u2B07 Export CSV</button></div>';
+  var info='<p style="margin:10px 0;font-size:.85em;color:var(--vscode-descriptionForeground)">Every Copilot chat session with captured usage. Titles are the chat names VS Code shows (or the first prompt), read from local files on demand and never stored'+(SES&&SES.showTitles===false?' \\u2013 <strong>hidden</strong> by <code>aiEffortTracker.sessions.showTitles</code>':'')+'. Click a row for per-turn detail. \\uD83D\\uDCB8 = top-quartile credits but fewer than 10 lines changed.</p>';
+  if(SES&&SES.error){el.innerHTML=ctl+info+'<p style="color:var(--deleted)">'+esc(SES.error)+'</p>';bindSes();return;}
+  if(!SES){el.innerHTML=ctl+info+'<p>'+(sesLoading?'Loading\\u2026':'No data yet.')+'</p>';bindSes();return;}
+  var cols=[['title','Chat',0],['end','Last activity',1],['durationMin','Duration',1],['wi','Work item / branch',0],['models','Models',0],['turns','Turns',1],['calls','Calls',1],['credits','Credits',1],['creditsPerTurn','Cr / turn',1],['cacheHitPct','Cache hit',1],['maxInputTokens','Max context',1],['linesChanged','Lines \\u00b1',1],['avoidableCacheBreaks','Avoidable misses',1]];
+  var head='<tr>'+cols.map(function(c){
+    if(!c[2])return'<th>'+c[1]+'</th>';
+    var arrow=sesQ.sort===c[0]?(sesQ.descending?' \\u25BC':' \\u25B2'):'';
+    return'<th data-action="sesSort" data-value="'+c[0]+'" style="cursor:pointer;white-space:nowrap" title="Sort">'+c[1]+arrow+'</th>';
+  }).join('')+'</tr>';
+  var T=S.titles||{};
+  var body=S.rows.map(function(s){
+    var open=!!sesOpen[s.sessionId];
+    var title=T[s.sessionId]?esc(T[s.sessionId]):'<span style="color:var(--vscode-descriptionForeground)">'+esc(s.sessionId.slice(0,8))+'\\u2026</span>';
+    var flag=s.expensiveLowOutput?' <span class="badge bd" title="Top-quartile credits in this period but fewer than 10 lines changed">\\uD83D\\uDCB8 low output</span>':'';
+    var where=s.workItems.length?'#'+s.workItems.join(', #'):s.branches.join(', ');
+    var row='<tr data-action="sesRow" data-id="'+esc(s.sessionId)+'" style="cursor:pointer"><td style="max-width:280px" title="'+esc(s.sessionId)+'">'+(open?'\\u25BE ':'\\u25B8 ')+title+flag+'</td><td style="white-space:nowrap">'+sesWhen(s.end)+'</td><td>'+fmtMin(s.durationMin)+'</td><td>'+esc(where)+'</td><td>'+esc(s.models.join(', '))+'</td><td>'+s.turns+'</td><td>'+s.calls+'</td><td>'+n2(s.credits)+'</td><td>'+n2(s.creditsPerTurn)+'</td><td>'+s.cacheHitPct+'%</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>+'+s.linesAdded+' / \\u2212'+s.linesRemoved+'</td><td>'+s.avoidableCacheBreaks+'</td></tr>';
+    return open?row+'<tr><td colspan="'+cols.length+'">'+sesDetailHtml(s.sessionId)+'</td></tr>':row;
+  }).join('')||'<tr><td colspan="'+cols.length+'" style="color:var(--vscode-descriptionForeground)">No sessions match these filters.</td></tr>';
+  var first=S.total?S.offset+1:0,last=Math.min(S.total,S.offset+S.rows.length);
+  var pager='<div style="display:flex;gap:8px;align-items:center;margin-top:10px"><button class="dtab" data-action="sesPage" data-value="-1"'+(S.offset>0?'':' disabled')+'>\\u2190 Prev</button><span>'+first+'\\u2013'+last+' of '+S.total+'</span><button class="dtab" data-action="sesPage" data-value="1"'+(last<S.total?'':' disabled')+'>Next \\u2192</button></div>';
+  var stats='<div class="sg">'+sc('Sessions',String(S.total))+sc('Credits',n2(S.totals.credits),'var(--cost)')+sc('Turns',String(S.totals.turns))+sc('Expensive, low output',String(S.totals.lowOutput),'var(--deleted)')+'</div>';
+  el.innerHTML=ctl+info+stats+'<div class="card" style="overflow-x:auto"><table><thead>'+head+'</thead><tbody>'+body+'</tbody></table>'+pager+'</div>';
+  bindSes();
+}
+function bindSes(){
+  var on=function(id,fn){var n=document.getElementById(id);if(n)n.addEventListener('change',function(){fn(this);sesQ.offset=0;requestSessions();});};
+  on('sesFrom',function(n){sesQ.from=n.value;});
+  on('sesTo',function(n){sesQ.to=n.value;});
+  on('sesWi',function(n){sesQ.workItemId=n.value;});
+  on('sesBranch',function(n){sesQ.branch=n.value;});
+  on('sesModel',function(n){sesQ.model=n.value;});
+  on('sesMin',function(n){sesQ.minCredits=parseFloat(n.value)||0;});
+  on('sesLow',function(n){sesQ.lowOutputOnly=!!n.checked;});
+}
+function toggleSession(id){
+  if(sesOpen[id]){delete sesOpen[id];renderSessions();return;}
+  sesOpen[id]=true;delete sesDet[id];renderSessions();
+  vscode.postMessage({type:'sessionDetail',sessionId:id});
+}
+
 window.addEventListener('message',function(e){
   var msg=e.data;
+  if(msg.type==='sessionsData'){sesLoading=false;SES=msg;var sv=document.querySelector('.view.active');if(sv&&sv.id==='sessions')renderSessions();return;}
+  if(msg.type==='sessionDetailData'){sesDet[msg.sessionId]=msg;var dv=document.querySelector('.view.active');if(dv&&dv.id==='sessions')renderSessions();return;}
+  if(msg.type==='openWorkItem'&&msg.id){selWi=String(msg.id);projView='workitem';showTab('projects');return;}
+  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
   if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
   if(msg.type==='update'){
     allData=msg.summaries;currentBranch=msg.currentBranch;
@@ -983,6 +1122,7 @@ document.getElementById('tab-ghview').addEventListener('click',function(){showTa
 document.getElementById('tab-projects').addEventListener('click',function(){showTab('projects');});
 document.getElementById('tab-ledger').addEventListener('click',function(){showTab('ledger');});
 document.getElementById('tab-optimize').addEventListener('click',function(){showTab('optimize');});
+document.getElementById('tab-sessions').addEventListener('click',function(){showTab('sessions');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -997,6 +1137,12 @@ document.addEventListener('click',function(e){
   else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
   else if(a==='optDays'){optDays=parseInt(v,10)||30;requestOptimize();}
   else if(a==='optRefresh')requestOptimize();
+  else if(a==='sesDays'){sesQ.days=parseInt(v,10)||30;sesQ.from='';sesQ.to='';sesQ.offset=0;requestSessions();}
+  else if(a==='sesRefresh')requestSessions();
+  else if(a==='sesCsv')vscode.postMessage(sesMsg('sessionsCsv'));
+  else if(a==='sesSort'){if(sesQ.sort===v)sesQ.descending=!sesQ.descending;else{sesQ.sort=v;sesQ.descending=true;}sesQ.offset=0;requestSessions();}
+  else if(a==='sesPage'){sesQ.offset=Math.max(0,sesQ.offset+(parseInt(v,10)||0)*sesQ.limit);requestSessions();}
+  else if(a==='sesRow')toggleSession(t.dataset.id);
   else if(a==='proj'){selProj=v;selWi=null;projView='project';renderProjectsView();}
   else if(a==='wi'){selWi=v;projView='workitem';renderProjectsView();}
   else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
@@ -1018,8 +1164,10 @@ document.addEventListener('click',function(e){
   else if(a==='tadjSet')vscode.postMessage({type:'cmd',value:'adjustTrackedTime',arg:t.dataset.id+'\\u0000'+t.dataset.mode});
   else if(a==='tadjReset')vscode.postMessage({type:'cmd',value:'resetTrackedTime',arg:t.dataset.id});
   else if(a==='estSet')vscode.postMessage({type:'cmd',value:'setWorkItemEstimate',arg:t.dataset.id});
+  else if(a==='budSet')vscode.postMessage({type:'cmd',value:'setWorkItemBudget',arg:t.dataset.id});
   else if(a==='ratesSet')vscode.postMessage({type:'cmd',value:'setProjectRates',arg:t.dataset.id});
-});`;
+});
+vscode.postMessage({type:'ready'});`;
 
   return [
     '<!DOCTYPE html><html lang="en"><head>',
@@ -1038,6 +1186,7 @@ document.addEventListener('click',function(e){
     '  <button class="tab" id="tab-projects">\uD83D\uDCC1 Projects</button>',
     '  <button class="tab" id="tab-ledger">\uD83E\uDDFE Ledger</button>',
     '  <button class="tab" id="tab-optimize">\uD83D\uDCA1 Optimize</button>',
+    '  <button class="tab" id="tab-sessions">\uD83D\uDCAC Sessions</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
@@ -1047,6 +1196,7 @@ document.addEventListener('click',function(e){
     '<div id="projects" class="view"></div>',
     '<div id="ledger" class="view"></div>',
     '<div id="optimize" class="view"></div>',
+    '<div id="sessions" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,
