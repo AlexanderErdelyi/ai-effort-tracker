@@ -1,11 +1,15 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import * as readline from 'readline';
 import type { UsageData } from '../store/database';
 import { readStore } from '../store/persistence';
 import {
   listSessions, optimizationFindings, sessionDetail, usageOverview, workItemUsage, type InsightFilter
 } from '../analysis/usageInsights';
+import { promptExcerpts, SessionTitleResolver, storageRoots } from '../util/sessionTitles';
+import { BUDGET_SNAPSHOT_FILE } from '../analysis/budget';
+import * as path from 'path';
+
+export { promptExcerpts };
 
 /**
  * Read-only MCP server (stdio, newline-delimited JSON-RPC 2.0) exposing usage
@@ -16,7 +20,8 @@ import {
 
 const SERVER = { name: 'ai-effort-tracker', version: process.env.AET_VERSION || '0.0.0' };
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
-const MAX_LOG_BYTES = 256 * 1024 * 1024;
+let resolver: SessionTitleResolver | undefined;
+const titles = () => resolver ??= new SessionTitleResolver(storageRoots(process.env.AET_WORKSPACE_STORAGE));
 
 type Json = Record<string, unknown>;
 
@@ -45,17 +50,21 @@ export const TOOLS = [
   },
   {
     name: 'list_work_items',
-    title: 'Credits per work item',
-    description: 'Work items with credits, sessions, branches and models in the period. Use to choose a workItemId scope.',
+    title: 'Credits and budgets per work item',
+    description: 'Work items with credits, sessions, branches and models in the period, plus budget status where known (state ok/warning/over/unestimated, worst dimension and percent, time/credit/money budget vs used, 7-day burn rate and projected run-out). Budget status is all-time and as of budgetAsOf. Use to choose a workItemId scope.',
     inputSchema: { type: 'object', properties: filterProps, additionalProperties: false }
   },
   {
     name: 'list_sessions',
     title: 'Recent chat sessions',
-    description: 'Copilot chat sessions (newest first) with turns, credits, models, max context size and avoidable cache breaks.',
+    description: 'Copilot chat sessions (newest first) with turns, credits, duration, models, max context, cache-hit rate, lines changed, avoidable cache breaks and an expensiveLowOutput flag (top-quartile credits but < 10 lines changed). With includeTitles, adds the chat title VS Code shows (or the first prompt), read on demand from local files and never stored.',
     inputSchema: {
       type: 'object',
-      properties: { ...filterProps, limit: { type: 'number', description: 'Max sessions (1-100, default 20).' } },
+      properties: {
+        ...filterProps,
+        limit: { type: 'number', description: 'Max sessions (1-100, default 20).' },
+        includeTitles: { type: 'boolean', description: 'Add each chat\'s title (default false).' }
+      },
       additionalProperties: false
     }
   },
@@ -122,38 +131,47 @@ function parseFilter(args: Json): InsightFilter {
   return f;
 }
 
-function sessionLog(sessionId: string): string | undefined {
-  if (!/^[\w.-]{1,128}$/.test(sessionId)) return undefined;
-  const roots = (process.env.AET_WORKSPACE_STORAGE ?? '').split(path.delimiter).filter(Boolean);
-  let best: { file: string; mtime: number } | undefined;
-  for (const root of roots) {
-    let workspaces: string[];
-    try { workspaces = fs.readdirSync(root); } catch { continue; }
-    for (const ws of workspaces) {
-      const file = path.join(root, ws, 'GitHub.copilot-chat', 'debug-logs', sessionId, 'main.jsonl');
-      try {
-        const st = fs.statSync(file);
-        if (st.size <= MAX_LOG_BYTES && (!best || st.mtimeMs > best.mtime)) best = { file, mtime: st.mtimeMs };
-      } catch { /* not in this workspace */ }
-    }
-  }
-  return best?.file;
+interface BudgetSnapshot { generatedAt?: string; workItems: Record<string, Json> }
+
+let budgetCache: { stamp: string; value: BudgetSnapshot | null } | undefined;
+
+/** Budget status written by the extension (it needs VS Code settings); null when absent. */
+export function loadBudgetSnapshot(file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), BUDGET_SNAPSHOT_FILE) : ''): BudgetSnapshot | null {
+  if (!file) return null;
+  let stamp: string;
+  try { const st = fs.statSync(file); stamp = `${file}|${st.mtimeMs}|${st.size}`; } catch { return null; }
+  if (budgetCache?.stamp === stamp) return budgetCache.value;
+  let value: BudgetSnapshot | null = null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Json;
+    value = { generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : undefined, workItems: record(raw.workItems) as Record<string, Json> };
+  } catch { /* partial or corrupt snapshot: treat as absent */ }
+  budgetCache = { stamp, value };
+  return value;
 }
 
-/** User-prompt excerpts keyed by span id (= turn id). Returned only, never persisted. */
-export function promptExcerpts(file: string, maxChars: number): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
-    if (!line.includes('"user_message"')) continue;
-    try {
-      const row = JSON.parse(line);
-      const text = row?.type === 'user_message' && typeof row.attrs?.content === 'string' ? row.attrs.content : '';
-      if (!text || typeof row.spanId !== 'string' || out.has(row.spanId)) continue;
-      const flat = text.replace(/\s+/g, ' ').trim();
-      out.set(row.spanId, flat.length > maxChars ? flat.slice(0, maxChars) + '…' : flat);
-    } catch { /* partial line */ }
+export function listWorkItems(data: UsageData, filter: InsightFilter, snapshot = loadBudgetSnapshot()) {
+  const rows: Json[] = workItemUsage(data, filter).slice(0, 100);
+  if (!snapshot) return { workItems: rows, budgetNote: 'No budget snapshot yet (it is written by the extension about once a minute while VS Code runs).' };
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const id = row.workItemId as string | null;
+    if (!id) continue;
+    seen.add(id);
+    if (snapshot.workItems[id]) row.budget = snapshot.workItems[id];
   }
-  return out;
+  // At-risk work items without usage in the period are still worth knowing about.
+  if (!filter.sessionId && !filter.branch) {
+    for (const [id, budget] of Object.entries(snapshot.workItems)) {
+      if (seen.has(id) || rows.length >= 100) continue;
+      if (budget.state !== 'warning' && budget.state !== 'over') continue;
+      if (filter.workItemId && filter.workItemId !== id) continue;
+      const wi = data.workItems[id];
+      if (filter.projectId && wi?.projectId !== filter.projectId) continue;
+      rows.push({ workItemId: id, title: wi?.title ?? null, projectId: wi?.projectId ?? null, calls: 0, credits: 0, budget });
+    }
+  }
+  return { workItems: rows, budgetAsOf: snapshot.generatedAt ?? null };
 }
 
 export function callTool(name: string, args: Json, data = loadData()): unknown {
@@ -163,10 +181,13 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       const findings = optimizationFindings(data, parseFilter(args));
       return findings.length ? { findings } : { findings, note: 'No optimization opportunities detected in this period, or no debug-log usage was captured yet.' };
     }
-    case 'list_work_items': return { workItems: workItemUsage(data, parseFilter(args)).slice(0, 100) };
-    case 'list_sessions': return {
-      sessions: listSessions(data, parseFilter(args), typeof args.limit === 'number' ? args.limit : 20)
-    };
+    case 'list_work_items': return listWorkItems(data, parseFilter(args));
+    case 'list_sessions': {
+      const sessions = listSessions(data, parseFilter(args), typeof args.limit === 'number' ? args.limit : 20);
+      if (args.includeTitles !== true) return { sessions };
+      const t = titles();
+      return { sessions: sessions.map(s => ({ ...s, title: t.title(s.sessionId) ?? null })) };
+    }
     case 'session_detail': {
       const id = typeof args.sessionId === 'string' ? args.sessionId : '';
       if (!id) throw new Error('"sessionId" is required.');
@@ -174,7 +195,7 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       if (!detail) throw new Error(`No captured usage for session "${id}". Use list_sessions to find ids.`);
       if (args.includePrompts !== true) return detail;
       const chars = Math.max(50, Math.min(1000, typeof args.promptChars === 'number' ? args.promptChars : 300));
-      const file = sessionLog(id);
+      const file = titles().logFile(id);
       if (!file) return { ...detail, promptsNote: 'Copilot\'s debug log for this session no longer exists; prompts are unavailable.' };
       const prompts = promptExcerpts(file, chars);
       return { ...detail, turns: detail.turns.map(t => ({ ...t, prompt: prompts.get(t.turnId) ?? null })) };

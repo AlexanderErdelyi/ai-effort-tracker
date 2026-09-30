@@ -143,7 +143,7 @@ export function collectCalls(data: UsageData, filter: InsightFilter = {}, now = 
   return calls.sort((a, b) => a.ts - b.ts);
 }
 
-function priceOf(prices: Record<string, ModelPrice>, model: string): ModelPrice | undefined {
+export function priceOf(prices: Record<string, ModelPrice>, model: string): ModelPrice | undefined {
   return prices[model] ?? prices[model.replace(/-\d{4}-\d{2}-\d{2}$/, '')];
 }
 
@@ -151,7 +151,7 @@ function priceOf(prices: Record<string, ModelPrice>, model: string): ModelPrice 
  * Recorded credits × (list cost of alternative ÷ list cost of actual tokens).
  * Scaling the real charge keeps any discount or multiplier that applied.
  */
-function scaled(call: Call, price: ModelPrice | undefined, tokens: { input: number; cached: number; output: number },
+export function scaled(call: Call, price: ModelPrice | undefined, tokens: { input: number; cached: number; output: number },
   target: ModelPrice | undefined = price): number | undefined {
   if (!price || !target || call.credits === null) return undefined;
   const actual = listCost(price, { inputTokens: call.input, cachedTokens: call.cached, outputTokens: call.output });
@@ -331,7 +331,7 @@ function severity(credits: number, total: number): Finding['severity'] {
   return share >= 0.1 ? 'high' : share >= 0.03 ? 'medium' : 'low';
 }
 
-const READ_ONLY = /^(read_file|list_dir|file_search|grep_search|semantic_search|fetch_webpage|get_errors|view_image|tool_search|memory|manage_todo_list|get_terminal_output|github_repo)$|search|find|list|read|query|fetch|_get/i;
+export const READ_ONLY_TOOL = /^(read_file|list_dir|file_search|grep_search|semantic_search|fetch_webpage|get_errors|view_image|tool_search|memory|manage_todo_list|get_terminal_output|github_repo)$|search|find|list|read|query|fetch|_get/i;
 
 function cacheFinding(id: string, category: Finding['category'], list: CacheBreak[], total: number,
   title: string, detail: (credits: number, wasted: number) => string, recommendation: string): Finding {
@@ -415,7 +415,7 @@ export function optimizationFindings(data: UsageData, filter: InsightFilter = {}
     const tc = byTurn.get(`${e.debugUsage!.sessionId}|${e.debugUsage!.turnId}`);
     if (!tc?.length || (e.analysis?.files.length ?? 0) > 0) continue;
     if (tc.reduce((n, c) => n + c.output, 0) > 4000) continue;
-    if ((e.analysis?.tools ?? []).some(t => !READ_ONLY.test(t.name))) continue;
+    if ((e.analysis?.tools ?? []).some(t => !READ_ONLY_TOOL.test(t.name))) continue;
     for (const c of tc) {
       const s = light.get(c.model) ?? { turns: 0, credits: 0, alt: {} };
       s.credits += c.credits ?? 0;
@@ -493,22 +493,140 @@ export function optimizationFindings(data: UsageData, filter: InsightFilter = {}
   return findings.sort((a, b) => order[a.severity] - order[b.severity] || (b.creditsAtStake ?? 0) - (a.creditsAtStake ?? 0));
 }
 
-export function listSessions(data: UsageData, filter: InsightFilter = {}, limit = 20, now = Date.now()) {
+export interface SessionRow {
+  sessionId: string;
+  start: string;
+  end: string;
+  /** Wall-clock span from first call to end of last call. */
+  durationMin: number;
+  turns: number;
+  calls: number;
+  credits: number;
+  creditsPerTurn: number;
+  models: string[];
+  maxInputTokens: number;
+  cacheHitPct: number;
+  outputTokens: number;
+  subagentCredits: number;
+  linesAdded: number;
+  linesRemoved: number;
+  filesEdited: number;
+  avoidableCacheBreaks: number;
+  branches: string[];
+  workItems: string[];
+  /** Expensive relative to the other sessions in the period, yet changed almost no lines. */
+  expensiveLowOutput: boolean;
+}
+
+/** Sessions below this many changed lines count as "low output". */
+export const LOW_OUTPUT_LINES = 10;
+const LOW_OUTPUT_MIN_CREDITS = 10;
+
+/** Every session in the period with its aggregates, newest first. */
+export function sessionRows(data: UsageData, filter: InsightFilter = {}, now = Date.now()): SessionRow[] {
   const calls = collectCalls(data, filter, now);
   const breaks = detectCacheBreaks(calls, data.modelPrices);
-  return [...group(calls, c => c.sessionId).entries()].map(([id, list]) => ({
-    sessionId: id,
-    start: iso(list[0].ts),
-    end: iso(list[list.length - 1].ts),
-    turns: new Set(list.map(c => c.turnId)).size,
-    calls: list.length,
-    credits: r2(creditsOf(list)),
-    models: [...new Set(list.map(c => c.model))],
-    maxInputTokens: Math.max(...list.map(c => c.input)),
-    avoidableCacheBreaks: breaks.filter(b => b.sessionId === id && b.cause !== 'new-context').length,
-    branches: [...new Set(list.map(c => c.branch).filter(Boolean))],
-    workItems: [...new Set(list.map(c => c.workItemId).filter(Boolean))]
-  })).sort((a, b) => b.end.localeCompare(a.end)).slice(0, Math.max(1, Math.min(limit, 100)));
+  const avoidable = new Map<string, number>();
+  for (const b of breaks) if (b.cause !== 'new-context') avoidable.set(b.sessionId, (avoidable.get(b.sessionId) ?? 0) + 1);
+  const entries = group(turnsOf(data, calls), e => e.debugUsage!.sessionId);
+  const rows = [...group(calls, c => c.sessionId).entries()].map(([id, list]): SessionRow => {
+    const b = bucket();
+    list.forEach(c => add(b, c));
+    const turns = new Set(list.map(c => c.turnId)).size;
+    const last = list[list.length - 1];
+    let linesAdded = 0, linesRemoved = 0;
+    const files = new Set<string>();
+    for (const e of entries.get(id) ?? []) {
+      for (const f of e.analysis?.files ?? []) {
+        linesAdded += f.added ?? 0; linesRemoved += f.removed ?? 0; files.add(f.path);
+      }
+    }
+    return {
+      sessionId: id,
+      start: iso(list[0].ts),
+      end: iso(last.ts),
+      durationMin: Math.round((last.ts + last.durationMs - list[0].ts) / 6000) / 10,
+      turns,
+      calls: list.length,
+      credits: r2(b.credits),
+      creditsPerTurn: turns ? r2(b.credits / turns) : 0,
+      models: [...new Set(list.map(c => c.model))],
+      maxInputTokens: Math.max(...list.map(c => c.input)),
+      cacheHitPct: b.input ? pct(b.cached / b.input) : 0,
+      outputTokens: b.output,
+      subagentCredits: r2(creditsOf(list.filter(c => c.subagent))),
+      linesAdded, linesRemoved, filesEdited: files.size,
+      avoidableCacheBreaks: avoidable.get(id) ?? 0,
+      branches: [...new Set(list.map(c => c.branch).filter((x): x is string => !!x))],
+      workItems: [...new Set(list.map(c => c.workItemId).filter((x): x is string => !!x))],
+      expensiveLowOutput: false
+    };
+  });
+  // "Expensive" = top quartile of the period (and at least a few credits).
+  const sorted = rows.map(r => r.credits).sort((a, b) => a - b);
+  const p75 = sorted.length ? sorted[Math.ceil((sorted.length - 1) * 0.75)] : 0;
+  const threshold = Math.max(p75, LOW_OUTPUT_MIN_CREDITS);
+  for (const r of rows) r.expensiveLowOutput = r.credits >= threshold && r.linesAdded + r.linesRemoved < LOW_OUTPUT_LINES;
+  return rows.sort((a, b) => b.end.localeCompare(a.end));
+}
+
+export function listSessions(data: UsageData, filter: InsightFilter = {}, limit = 20, now = Date.now()): SessionRow[] {
+  return sessionRows(data, filter, now).slice(0, Math.max(1, Math.min(limit, 100)));
+}
+
+export type SessionSortKey = 'end' | 'start' | 'durationMin' | 'turns' | 'calls' | 'credits' | 'creditsPerTurn'
+  | 'cacheHitPct' | 'maxInputTokens' | 'linesChanged' | 'avoidableCacheBreaks';
+
+export interface SessionQuery {
+  filter?: InsightFilter;
+  model?: string;
+  minCredits?: number;
+  lowOutputOnly?: boolean;
+  sort?: SessionSortKey;
+  descending?: boolean;
+  offset?: number;
+  /** Page size (1-500, default 50). */
+  limit?: number;
+}
+
+/** Filtered, sorted, paged session list for the dashboard's Sessions tab. */
+export function querySessions(data: UsageData, q: SessionQuery = {}, now = Date.now()) {
+  const all = sessionRows(data, q.filter ?? {}, now);
+  const rows = all.filter(r => (!q.model || r.models.includes(q.model))
+    && (!q.minCredits || r.credits >= q.minCredits)
+    && (!q.lowOutputOnly || r.expensiveLowOutput));
+  const key = q.sort ?? 'end';
+  const val = (r: SessionRow): number | string => key === 'linesChanged' ? r.linesAdded + r.linesRemoved : r[key];
+  const dir = q.descending === false ? 1 : -1;
+  rows.sort((a, b) => {
+    const x = val(a), y = val(b);
+    return (typeof x === 'string' ? x.localeCompare(y as string) : x - (y as number)) * dir || b.end.localeCompare(a.end);
+  });
+  const limit = Math.max(1, Math.min(q.limit ?? 50, 500));
+  const offset = Math.max(0, Math.min(q.offset ?? 0, Math.max(0, rows.length - 1)));
+  return {
+    total: rows.length,
+    offset,
+    totals: { credits: r2(rows.reduce((n, r) => n + r.credits, 0)), turns: rows.reduce((n, r) => n + r.turns, 0),
+      lowOutput: rows.filter(r => r.expensiveLowOutput).length },
+    models: [...new Set(all.flatMap(r => r.models))].sort(),
+    branches: [...new Set(all.flatMap(r => r.branches))].sort(),
+    rows: rows.slice(offset, offset + limit)
+  };
+}
+
+/** CSV for a list of sessions; titles are optional and never stored. */
+export function sessionsCsv(rows: SessionRow[], titles: Record<string, string> = {}): string {
+  const cell = (v: unknown) => {
+    const s = Array.isArray(v) ? v.join('; ') : String(v ?? '');
+    return /[",\r\n]/.test(s) || /^[=+\-@]/.test(s) ? `"${s.replace(/^([=+\-@])/, "'$1").replace(/"/g, '""')}"` : s;
+  };
+  const head = ['sessionId', 'title', 'start', 'end', 'durationMin', 'turns', 'calls', 'credits', 'creditsPerTurn', 'models',
+    'maxInputTokens', 'cacheHitPct', 'outputTokens', 'subagentCredits', 'linesAdded', 'linesRemoved', 'filesEdited',
+    'avoidableCacheBreaks', 'branches', 'workItems', 'expensiveLowOutput'];
+  return [head.join(','), ...rows.map(r => [r.sessionId, titles[r.sessionId] ?? '', r.start, r.end, r.durationMin, r.turns, r.calls,
+    r.credits, r.creditsPerTurn, r.models, r.maxInputTokens, r.cacheHitPct, r.outputTokens, r.subagentCredits, r.linesAdded,
+    r.linesRemoved, r.filesEdited, r.avoidableCacheBreaks, r.branches, r.workItems, r.expensiveLowOutput].map(cell).join(','))].join('\r\n');
 }
 
 /** Credits per work item in the period, so an assistant can pick a scope for the other tools. */
@@ -546,6 +664,7 @@ export function sessionDetail(data: UsageData, sessionId: string) {
       tc.forEach(c => add(b, c));
       return {
         turnId,
+        entryId: e.id,
         at: iso(e.ts),
         branch: e.branch, workItemId: e.workItemId,
         ...show(b),

@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -108,6 +108,22 @@
         "title": "AI Effort Tracker: Set Billable (Could-Charge) Hours"
       },
       {
+        "command": "aiEffortTracker.setWorkItemBudget",
+        "title": "AI Effort Tracker: Set Work Item Budget (Credits / Money)"
+      },
+      {
+        "command": "aiEffortTracker.openWorkItem",
+        "title": "AI Effort Tracker: Open Work Item in Dashboard"
+      },
+      {
+        "command": "aiEffortTracker.openDashboardTab",
+        "title": "AI Effort Tracker: Open Optimize Tab"
+      },
+      {
+        "command": "aiEffortTracker.resetNudgeMutes",
+        "title": "AI Effort Tracker: Reset Nudge Mutes"
+      },
+      {
         "command": "aiEffortTracker.adjustTrackedTime",
         "title": "AI Effort Tracker: Adjust Tracked Time (Correct Auto Value)"
       },
@@ -181,6 +197,105 @@
           "type": "boolean",
           "default": true,
           "description": "Offer the read-only 'AI Effort Tracker usage insights' MCP server to Copilot agent mode, so you can ask an AI how to optimize your credit usage. It reads the tracker's local data and, only when asked, short prompt excerpts from Copilot's local debug logs."
+        },
+        "aiEffortTracker.sessions.showTitles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show chat titles (the name VS Code shows for a chat, or its first prompt) and prompt excerpts in the dashboard's Sessions tab. They are read from VS Code's local files on demand and never stored by the tracker. Turn off when sharing your screen."
+        },
+        "aiEffortTracker.budget.alerts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify once when a work item crosses a budget threshold (time, credits or money). Thresholds re-arm when consumption drops below them, for example after raising the estimate."
+        },
+        "aiEffortTracker.budget.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the current branch's work-item budget in the status bar, e.g. \"WI 1761: 64% · 3.2h left\"."
+        },
+        "aiEffortTracker.budget.thresholds": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "default": [
+            80,
+            100
+          ],
+          "description": "Budget alert thresholds in percent of the most-used budget dimension."
+        },
+        "aiEffortTracker.budget.creditsPerEstimatedHour": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Default credit budget per estimated hour when a work item has no explicit credit budget (0 = no derived credit budget). A project can override it with \"Set Project Rates\"."
+        },
+        "aiEffortTracker.nudges.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show live nudges while you chat when the Copilot debug log shows a costly pattern (model switch, expired cache, large context, light turns on a premium model, too many tools). Uses token/credit metadata only, never prompt content."
+        },
+        "aiEffortTracker.nudges.showLiveChatCost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the running credits of the current chat in the status bar (e.g. \"chat 312 cr · 9.4/call\")."
+        },
+        "aiEffortTracker.nudges.modelSwitch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nudge when switching models mid-chat re-sent the whole conversation without cache."
+        },
+        "aiEffortTracker.nudges.idleCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nudge when a pause let the prompt cache expire and a large context was billed again."
+        },
+        "aiEffortTracker.nudges.contextGrowth": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nudge when the chat's context grows past aiEffortTracker.nudges.contextTokens."
+        },
+        "aiEffortTracker.nudges.lightTurns": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nudge when several consecutive read-only/Q&A turns ran on a model at least twice as expensive as an available alternative."
+        },
+        "aiEffortTracker.nudges.toolBloat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Nudge (at most once a day) when many tools are offered per request or the model had to search for tools."
+        },
+        "aiEffortTracker.nudges.contextTokens": {
+          "type": "number",
+          "default": 150000,
+          "minimum": 1000,
+          "description": "Context size (input tokens of the main chat) that triggers the context-growth nudge. It fires again each time the context doubles (e.g. 150K, 300K, 600K)."
+        },
+        "aiEffortTracker.nudges.cacheMinTokens": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "description": "Minimum uncached context (tokens) for model-switch and expired-cache nudges."
+        },
+        "aiEffortTracker.nudges.toolCount": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "description": "Tools offered per request that trigger the tool nudge."
+        },
+        "aiEffortTracker.nudges.lightTurnCount": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "description": "Consecutive light turns on a premium model before the light-turns nudge."
+        },
+        "aiEffortTracker.nudges.cooldownMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Minimum minutes before the model-switch nudge repeats for the same chat. Expired-cache and light-turn nudges show once per chat, the tool nudge at most once a day, and any two nudges are at least 10 minutes apart."
         },
         "aiEffortTracker.idleThresholdSeconds": {
           "type": "number",

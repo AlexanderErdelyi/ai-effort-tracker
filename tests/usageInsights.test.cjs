@@ -8,6 +8,7 @@ const { parseDebugLog } = require('../out/util/debugLog');
 const { parseModelPrices, listCost, parseToolset, serverKeys, BUILTIN_SERVER } = require('../out/util/modelCatalog');
 const ui = require('../out/analysis/usageInsights');
 const { handle, promptExcerpts, decodeUsageData } = require('../out/mcp/server');
+const { SessionTitleResolver, readChatTitle, readFirstPrompt } = require('../out/util/sessionTitles');
 
 const tier = (input, cacheRead, cacheWrite, output, max) =>
   ({ input_price: input, cache_read_price: cacheRead, cache_write_price: cacheWrite, output_price: output, max_prompt_tokens: max });
@@ -189,6 +190,14 @@ function tempEnv(t) {
   fs.writeFileSync(store, JSON.stringify({ schemaVersion: 11, ...fixture() }));
   const logs = path.join(dir, 'workspaceStorage', 'ws1', 'GitHub.copilot-chat', 'debug-logs', 's1');
   fs.mkdirSync(logs, { recursive: true });
+  const chats = path.join(dir, 'workspaceStorage', 'ws1', 'chatSessions');
+  fs.mkdirSync(chats, { recursive: true });
+  fs.writeFileSync(path.join(chats, 's1.jsonl'), [
+    { kind: 0, v: { sessionId: 's1', requests: [{ message: { text: 'mentions \"customTitle\":\"FAKE\"' } }] } },
+    { kind: 1, k: ['customTitle'], v: 'First title' },
+    { kind: 2, k: ['requests'], v: [{ response: 'x'.repeat(3000) }] },
+    { kind: 1, k: ['customTitle'], v: 'Billing   code\nreview' }
+  ].map(r => JSON.stringify(r)).join('\n') + '\n');
   fs.writeFileSync(path.join(logs, 'main.jsonl'), [
     { type: 'user_message', sid: 's1', spanId: 't1', ts: T0, attrs: { content: 'Explain   the\nbilling code ' + 'x'.repeat(2000) } },
     { type: 'user_message', sid: 's1', spanId: 't2', ts: T0, attrs: { content: 'Now fix it' } }
@@ -261,6 +270,10 @@ test('stdio MCP server answers tool calls from a read-only store', async t => {
   assert.equal(detail.json.turns[2].prompt, null);
   const plain = await toolCall('session_detail', { sessionId: 's1' });
   assert.equal(plain.json.turns[0].prompt, undefined);
+  const listed = await toolCall('list_sessions', { from: new Date(T0 - MIN).toISOString(), to: new Date(NOW).toISOString(), includeTitles: true });
+  assert.deepEqual(listed.json.sessions.map(s => [s.sessionId, s.title]), [['s2', null], ['s1', 'Billing code review']]);
+  const untitled = await toolCall('list_sessions', { from: new Date(T0 - MIN).toISOString(), to: new Date(NOW).toISOString() });
+  assert.equal(untitled.json.sessions[0].title, undefined);
   const noLog = await toolCall('session_detail', { sessionId: 's2', includePrompts: true });
   assert.match(noLog.json.promptsNote, /no longer exists/);
   const bad = await toolCall('usage_overview', { from: 'yesterday-ish' });
@@ -269,4 +282,70 @@ test('stdio MCP server answers tool calls from a read-only store', async t => {
   assert.equal(missing.isError, true);
   assert.equal(fs.readFileSync(store, 'utf8'), before);
   assert.deepEqual(fs.readdirSync(path.dirname(store)).sort(), ['effort-tracker.json', 'workspaceStorage']);
+});
+
+test('session list aggregates, flags, filters, sorts and pages sessions', () => {
+  const data = fixture();
+  // Make s2 the expensive, low-output one: plenty of credits, no lines.
+  data.creditLedger.push(entry('s2', 'u2', [call('g', 61 * MIN, 'claude-opus-5.5', 190000, 0, 30000)], { workItemId: 'WI-2', branch: 'main' }));
+  const rows = ui.sessionRows(data, {}, NOW);
+  assert.deepEqual(rows.map(r => r.sessionId), ['s2', 's1']);
+  const [s2, s1] = rows;
+  assert.equal(s1.turns, 5);
+  assert.equal(s1.calls, 6);
+  assert.equal(s1.linesAdded, 5);
+  assert.equal(s1.linesRemoved, 1);
+  assert.equal(s1.filesEdited, 1);
+  assert.equal(s1.durationMin, 25);
+  assert.ok(s1.subagentCredits > 0);
+  assert.deepEqual(s1.workItems, ['WI-1']);
+  assert.equal(s1.creditsPerTurn, Math.round(s1.credits / 5 * 100) / 100);
+  assert.ok(s1.cacheHitPct > 0 && s1.cacheHitPct < 100);
+  assert.equal(s2.expensiveLowOutput, true);
+  assert.equal(s1.expensiveLowOutput, false);
+
+  const byCredits = ui.querySessions(data, { sort: 'credits', descending: false }, NOW);
+  assert.equal(byCredits.rows[0].credits <= byCredits.rows[1].credits, true);
+  assert.deepEqual(byCredits.models, ['cheap', 'claude-opus-5.5', 'claude-sonnet-5.5']);
+  assert.deepEqual(byCredits.branches, ['feature/1', 'main']);
+  assert.equal(ui.querySessions(data, { model: 'cheap' }, NOW).total, 1);
+  assert.equal(ui.querySessions(data, { lowOutputOnly: true }, NOW).rows[0].sessionId, 's2');
+  assert.equal(ui.querySessions(data, { minCredits: 1e9 }, NOW).total, 0);
+  assert.equal(ui.querySessions(data, { filter: { workItemId: 'WI-1' } }, NOW).total, 1);
+  const page = ui.querySessions(data, { limit: 1, offset: 1 }, NOW);
+  assert.equal(page.total, 2);
+  assert.deepEqual(page.rows.map(r => r.sessionId), ['s1']);
+  assert.equal(page.totals.lowOutput, 1);
+  assert.deepEqual(ui.listSessions(data, {}, 1, NOW).map(r => r.sessionId), ['s2']);
+
+  const csv = ui.sessionsCsv(rows, { s1: 'Fix "billing", =now' }).split('\r\n');
+  assert.equal(csv.length, 3);
+  assert.match(csv[0], /^sessionId,title,start,end/);
+  assert.ok(csv[2].startsWith('s1,"Fix ""billing"", =now",'));
+  assert.ok(ui.sessionsCsv(rows, { s2: '=cmd' }).includes(`s2,"'=cmd"`));
+});
+
+test('session titles come from VS Code chat names, else the first prompt', t => {
+  const { storage } = tempEnv(t);
+  const chat = path.join(storage, 'ws1', 'chatSessions', 's1.jsonl');
+  assert.equal(readChatTitle(chat), 'Billing code review');
+  assert.equal(readChatTitle(chat, 7), 'Billing…');
+  const log = path.join(storage, 'ws1', 'GitHub.copilot-chat', 'debug-logs', 's1', 'main.jsonl');
+  assert.ok(readFirstPrompt(log, 20).startsWith('Explain the billing'));
+  // Only a debug log: fall back to its first prompt. Empty-window chats live in globalStorage.
+  const logs3 = path.join(storage, 'ws2', 'GitHub.copilot-chat', 'debug-logs', 's3');
+  fs.mkdirSync(logs3, { recursive: true });
+  fs.writeFileSync(path.join(logs3, 'main.jsonl'), JSON.stringify({ type: 'user_message', spanId: 'x', attrs: { content: 'Why is CI red?' } }) + '\n');
+  const empty = path.join(path.dirname(storage), 'globalStorage', 'emptyWindowChatSessions');
+  fs.mkdirSync(empty, { recursive: true });
+  fs.writeFileSync(path.join(empty, 's4.json'), JSON.stringify({ sessionId: 's4', customTitle: 'Loose chat', requests: [] }));
+  const r = new SessionTitleResolver([storage]);
+  assert.deepEqual(r.titlesFor(['s1', 's3', 's4', 'nope', '../evil']), { s1: 'Billing code review', s3: 'Why is CI red?', s4: 'Loose chat' });
+  assert.equal(r.logFile('s1'), log);
+  assert.equal(r.logFile('s4'), undefined);
+  // Renames are picked up once the file changes.
+  fs.appendFileSync(chat, JSON.stringify({ kind: 1, k: ['customTitle'], v: 'Renamed' }) + '\n');
+  const later = new Date(Date.now() + 5000);
+  fs.utimesSync(chat, later, later);
+  assert.equal(r.title('s1'), 'Renamed');
 });
