@@ -19,11 +19,20 @@ export type LineStatus = ReviewVerdict | 'todo';
 
 export interface LineKey { c: string; p: string }
 
+/** Who said a flagged issue is fixed: Copilot via MCP (`review_resolve_issue`) or the developer. */
+export type FixedBy = 'ai' | 'user';
+export interface IssueFix { at: number; by: FixedBy; note?: string }
+
 export interface ReviewMark {
   id: string;
   status: MarkStatus;
   note?: string;
   at: number;
+  /** Issues: branch it was flagged on and its 1-based first line, to find it again once its lines are gone. */
+  branch?: string;
+  line?: number;
+  /** Issues: reported fixed, waiting for the developer to verify (lines may be empty then). */
+  fixed?: IssueFix;
   /** `c` + `p` hashes, 12 hex chars each. */
   lines: string[];
 }
@@ -45,6 +54,18 @@ export interface OpenIssue {
   markId?: string;
 }
 
+/**
+ * A flagged issue that needs a second look: reported fixed (by Copilot or the
+ * developer), or `changed` = all its flagged lines were edited away. `lines`
+ * counts the flagged lines still in the file (0 when they are gone).
+ */
+export interface ResolvedIssue extends OpenIssue {
+  markId: string;
+  by: FixedBy | 'changed';
+  fixedAt?: number;
+  fixNote?: string;
+}
+
 export interface BranchCoverage {
   at: number;
   base: string;
@@ -53,6 +74,8 @@ export interface BranchCoverage {
   issueLines: number;
   files: FileCoverage[];
   issues: OpenIssue[];
+  /** Fixed / changed issues waiting for verification. */
+  resolved?: ResolvedIssue[];
 }
 
 export interface RepoReview {
@@ -174,9 +197,13 @@ export interface FileReview {
   reviewed: number;
   issueLines: number;
   /** Flagged issues matched in this file (one per mark, first matching line). */
-  issues: { line: number; lines: number; note: string; at: number; markId: string; indices: number[] }[];
+  issues: { line: number; lines: number; note: string; at: number; markId: string; indices: number[]; flagged: number }[];
+  /** Issues reported fixed whose lines are still (partly) in the file. */
+  fixed: { markId: string; line: number; indices: number[] }[];
   /** Runs of unreviewed changed lines (0-based, inclusive), blank lines bridge a run. */
   todoBlocks: { start: number; end: number; lines: number }[];
+  /** Runs of reviewed changed lines (0-based, inclusive), `at` = newest mark in the run. */
+  reviewedBlocks: { start: number; end: number; lines: number; at: number }[];
 }
 
 /**
@@ -188,7 +215,9 @@ export function evaluateFile(lines: readonly string[], changed: ReadonlySet<numb
   const keys = lineKeys(lines);
   const { byC, byP } = indexMarks(marks);
   const status: (LineStatus | undefined)[] = new Array(lines.length);
+  const okAt: number[] = new Array(lines.length);
   const issueMap = new Map<string, FileReview['issues'][number]>();
+  const fixedMap = new Map<string, FileReview['fixed'][number]>();
   let total = 0, reviewed = 0, issueLines = 0;
   let prevP: string | undefined;
   const nextP: (string | undefined)[] = new Array(lines.length);
@@ -204,29 +233,137 @@ export function evaluateFile(lines: readonly string[], changed: ReadonlySet<numb
         && ((prevP !== undefined && byP.has(prevP)) || (nextP[i] !== undefined && byP.has(nextP[i]!)))) mark = moved;
     }
     prevP = k.p;
-    const verdict = mark && mark.status !== 'clear' ? mark.status : undefined;
+    if (mark?.fixed) {
+      const hit = fixedMap.get(mark.id);
+      if (hit) hit.indices.push(i); else fixedMap.set(mark.id, { markId: mark.id, line: i, indices: [i] });
+    }
+    const verdict = mark && mark.status !== 'clear' && !mark.fixed ? mark.status : undefined;
     const isChanged = changed ? changed.has(i) : true;
     if (verdict === 'issue') {
       status[i] = 'issue';
       issueLines++;
       const hit = issueMap.get(mark!.id);
-      if (hit) { hit.lines++; hit.indices.push(i); } else issueMap.set(mark!.id, { line: i, lines: 1, note: mark!.note ?? '', at: mark!.at, markId: mark!.id, indices: [i] });
+      if (hit) { hit.lines++; hit.indices.push(i); } else issueMap.set(mark!.id, { line: i, lines: 1, note: mark!.note ?? '', at: mark!.at, markId: mark!.id, indices: [i], flagged: mark!.lines.length });
     }
     if (!isChanged) continue;
     total++;
-    if (verdict === 'ok') { status[i] = 'ok'; reviewed++; }
+    if (verdict === 'ok') { status[i] = 'ok'; okAt[i] = mark!.at; reviewed++; }
     else if (verdict !== 'issue') status[i] = 'todo';
   }
   const todoBlocks: FileReview['todoBlocks'] = [];
+  const reviewedBlocks: FileReview['reviewedBlocks'] = [];
   let cur: FileReview['todoBlocks'][number] | undefined;
+  let ok: FileReview['reviewedBlocks'][number] | undefined;
   for (let i = 0; i < lines.length; i++) {
+    if (!keys[i]) continue;
     if (status[i] === 'todo') {
       if (cur) { cur.end = i; cur.lines++; } else todoBlocks.push(cur = { start: i, end: i, lines: 1 });
-    } else if (keys[i]) cur = undefined;
+    } else cur = undefined;
+    if (status[i] === 'ok') {
+      if (ok) { ok.end = i; ok.lines++; ok.at = Math.max(ok.at, okAt[i]); } else reviewedBlocks.push(ok = { start: i, end: i, lines: 1, at: okAt[i] });
+    } else ok = undefined;
   }
   const issues = [...issueMap.values()].sort((x, y) => x.line - y.line);
-  return { status, total, reviewed, issueLines, issues, todoBlocks };
+  return { status, total, reviewed, issueLines, issues, todoBlocks, reviewedBlocks, fixed: [...fixedMap.values()] };
 }
+
+/**
+ * Issues of one file that need verification: marks reported fixed, and open
+ * issues none of whose lines are left (edited away, e.g. by Copilot). `review`
+ * is null when the file is gone. An issue only counts on the branch it was
+ * flagged on (older marks without a branch: when the file changed on this branch),
+ * so switching to a branch without that code does not report it as fixed.
+ */
+export function resolvedIssuesOf(rel: string, marks: readonly ReviewMark[], review: FileReview | null, branch: string | null, fileChanged: boolean): ResolvedIssue[] {
+  const open = new Set(review?.issues.map(i => i.markId) ?? []);
+  const hits = new Map((review?.fixed ?? []).map(f => [f.markId, f]));
+  const out: ResolvedIssue[] = [];
+  for (const m of marks) {
+    if (m.status !== 'issue' || open.has(m.id)) continue;
+    const hit = hits.get(m.id);
+    const mine = m.branch ? m.branch === branch : fileChanged;
+    if (!hit && !mine) continue;
+    const base = { path: rel, line: hit ? hit.line + 1 : m.line ?? 1, lines: hit?.indices.length ?? 0, note: m.note ?? '', at: m.at, markId: m.id };
+    if (m.fixed) out.push({ ...base, by: m.fixed.by, fixedAt: m.fixed.at, ...(m.fixed.note ? { fixNote: m.fixed.note } : {}) });
+    else out.push({ ...base, by: 'changed' });
+  }
+  return out.sort((a, b) => a.line - b.line);
+}
+
+/** Report an issue fixed (`fix`) or open it again (`null`); null when the mark is not there. */
+export function setIssueFix(marks: readonly ReviewMark[], markId: string, fix: IssueFix | null): ReviewMark[] | null {
+  const i = marks.findIndex(m => m.id === markId && m.status === 'issue');
+  if (i < 0) return null;
+  const m: ReviewMark = { ...marks[i] };
+  if (fix) {
+    m.fixed = { at: fix.at, by: fix.by };
+    const text = fix.note?.trim();
+    if (text) m.fixed.note = text.slice(0, 2000);
+  } else delete m.fixed;
+  const next = [...marks];
+  if (m.lines.length || m.fixed) next[i] = m; else next.splice(i, 1);
+  return next;
+}
+
+/** Remove one mark (e.g. a verified fix); null when it is not there. */
+export function dropMark(marks: readonly ReviewMark[], markId: string): ReviewMark[] | null {
+  const next = marks.filter(m => m.id !== markId);
+  return next.length === marks.length ? null : next;
+}
+
+const DECLARATION = [
+  /^\s*(?:(?:local|internal|protected|public|private|static|async|export|override|abstract|virtual|default)\s+)*(procedure|trigger|function|def|class|interface|enum|struct|record)\s+("[^"]+"|[\w$.]+)/i,
+  /^\s*(field|action|group|part|area|layout|dataitem|column|key|value)\s*\(\s*(?:\d+\s*;\s*)?("[^"]+"|[\w$.]+)/i,
+  /^\s*(codeunit|table|page|report|query|xmlport|enumextension|tableextension|pageextension|reportextension|permissionset|profile|controladdin)\s+\d*\s*("[^"]+"|[\w$.]+)/i,
+  /^\s*(?:(?:public|private|protected|internal|static|async|readonly|override|virtual|abstract|export)\s+)+[\w<>[\],.? ]+?\s+([A-Za-z_$][\w$]*)\s*\(/
+];
+
+const CONTEXT_WINDOW = 400;
+const clipContext = (s: string) => { const t = s.replace(/\s+/g, ' ').trim(); return t.length > 70 ? t.slice(0, 69) + '…' : t; };
+
+/** A Markdown heading or code declaration on this line, e.g. "## Setup" or "procedure SyncJob". */
+function declarationAt(line: string, markdown: boolean, code: boolean): string | undefined {
+  if (markdown) {
+    const h = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (h) return clipContext(`${h[1]} ${h[2]}`);
+  }
+  if (!code || line.length > 400) return undefined;
+  for (const re of DECLARATION) {
+    const m = re.exec(line);
+    if (m) return clipContext(m.length > 2 ? `${m[1].toLowerCase()} ${m[2]}` : `${m[1]}()`);
+  }
+  return undefined;
+}
+
+/**
+ * Where each block of lines sits, for lists: the nearest heading or declaration
+ * at or above its start ("procedure SyncJob", "## Acceptance criteria"), else
+ * its first non-blank line. One pass over the file; at most 70 characters each.
+ * Headings count in Markdown files (or when `file` is unknown), declarations
+ * in every other file.
+ */
+export function blockContexts(lines: readonly string[], blocks: readonly { start: number; end: number }[], file?: string): string[] {
+  if (!blocks.length) return [];
+  const markdown = !file || /\.(md|markdown|mdx)$/i.test(file);
+  const code = !file || !markdown;
+  const last = Math.min(lines.length - 1, Math.max(...blocks.map(b => b.start)));
+  const nearest: (number | undefined)[] = new Array(last + 1);
+  const found = new Map<number, string>();
+  let cur: number | undefined;
+  for (let i = 0; i <= last; i++) {
+    const d = declarationAt(lines[i], markdown, code);
+    if (d) { cur = i; found.set(i, d); }
+    nearest[i] = cur;
+  }
+  return blocks.map(({ start, end }) => {
+    const at = start >= 0 && start <= last ? nearest[start] : undefined;
+    if (at !== undefined && start - at <= CONTEXT_WINDOW) return found.get(at)!;
+    for (let i = Math.max(0, start); i <= Math.min(end, lines.length - 1); i++) if (lines[i].trim()) return clipContext(lines[i]);
+    return '';
+  });
+}
+
+export const blockContext = (lines: readonly string[], start: number, end = start, file?: string): string => blockContexts(lines, [{ start, end }], file)[0];
 
 /** Keys of the non-blank lines in [start, end] (0-based, inclusive). */
 export function keysForRange(lines: readonly string[], start: number, end: number): string[] {
@@ -248,19 +385,21 @@ export function keysForLines(lines: readonly string[], indices: Iterable<number>
  * removed from older marks so the newest decision wins; marks older than
  * ~13 months and the oldest marks beyond a per-file cap are pruned.
  */
-export function applyMark(marks: readonly ReviewMark[], keys: readonly string[], status: MarkStatus, now: number, id: string, note?: string): ReviewMark[] {
+export function applyMark(marks: readonly ReviewMark[], keys: readonly string[], status: MarkStatus, now: number, id: string, note?: string, where?: { branch?: string; line?: number }): ReviewMark[] {
   const unique = [...new Set(keys)];
   const contexts = new Set(unique.map(k => decodeKey(k).c));
   const kept: ReviewMark[] = [];
   for (const m of marks) {
     if (m.at < now - MARK_TTL_MS) continue;
     const lines = m.lines.filter(s => !contexts.has(decodeKey(s).c));
-    if (lines.length) kept.push(lines.length === m.lines.length ? m : { ...m, lines });
+    if (lines.length || m.fixed) kept.push(lines.length === m.lines.length ? m : { ...m, lines });
   }
   if (unique.length) {
     const mark: ReviewMark = { id, status, at: now, lines: unique };
     const text = note?.trim();
     if (text && status === 'issue') mark.note = text.slice(0, 2000);
+    if (status === 'issue' && where?.branch && where.branch !== 'HEAD') mark.branch = where.branch.slice(0, 300);
+    if (status === 'issue' && where?.line && where.line > 0) mark.line = Math.floor(where.line);
     kept.push(mark);
   }
   kept.sort((x, y) => x.at - y.at);
@@ -280,9 +419,16 @@ function decodeMark(v: unknown): ReviewMark | undefined {
   const status = v.status === 'ok' || v.status === 'issue' || v.status === 'clear' ? v.status : undefined;
   if (!status) return undefined;
   const lines = v.lines.filter((s): s is string => typeof s === 'string' && s.length === HASH_LEN * 2);
-  if (!lines.length) return undefined;
+  const f = status === 'issue' && isObj(v.fixed) && (v.fixed.by === 'ai' || v.fixed.by === 'user') ? v.fixed : undefined;
+  if (!lines.length && !f) return undefined;
   const m: ReviewMark = { id: v.id, status, at: num(v.at), lines };
   if (typeof v.note === 'string' && v.note) m.note = v.note;
+  if (typeof v.branch === 'string' && v.branch && v.branch.length <= 300) m.branch = v.branch;
+  if (typeof v.line === 'number' && Number.isInteger(v.line) && v.line > 0) m.line = v.line;
+  if (f) {
+    m.fixed = { at: num(f.at), by: f.by as FixedBy };
+    if (typeof f.note === 'string' && f.note) m.fixed.note = f.note;
+  }
   return m;
 }
 
@@ -295,7 +441,15 @@ function decodeCoverage(v: unknown): BranchCoverage | undefined {
     path: String(i.path ?? ''), line: num(i.line), lines: num(i.lines), note: typeof i.note === 'string' ? i.note : '', at: num(i.at),
     ...(typeof i.markId === 'string' && i.markId ? { markId: i.markId } : {})
   })).filter(i => i.path) : [];
-  return { at: num(v.at), base: typeof v.base === 'string' ? v.base : '', total: num(v.total), reviewed: num(v.reviewed), issueLines: num(v.issueLines), files, issues };
+  const resolved: ResolvedIssue[] = Array.isArray(v.resolved) ? v.resolved.filter(isObj).flatMap(i => {
+    const by = i.by === 'ai' || i.by === 'user' || i.by === 'changed' ? i.by : undefined;
+    if (!by || typeof i.path !== 'string' || !i.path || typeof i.markId !== 'string' || !i.markId) return [];
+    return [{
+      path: i.path, line: num(i.line), lines: num(i.lines), note: typeof i.note === 'string' ? i.note : '', at: num(i.at), markId: i.markId, by,
+      ...(typeof i.fixedAt === 'number' ? { fixedAt: i.fixedAt } : {}), ...(typeof i.fixNote === 'string' && i.fixNote ? { fixNote: i.fixNote } : {})
+    }];
+  }) : [];
+  return { at: num(v.at), base: typeof v.base === 'string' ? v.base : '', total: num(v.total), reviewed: num(v.reviewed), issueLines: num(v.issueLines), files, issues, ...(resolved.length ? { resolved } : {}) };
 }
 
 /** Strict enough to reject a foreign/corrupt file (recovery then tries .bak), lenient per entry. */
@@ -331,7 +485,9 @@ export function decodeReviewStore(raw: string): ReviewStoreData {
 /** Store the latest coverage of a branch (bounded lists, oldest branches pruned). */
 export function withCoverage(repo: RepoReview, branch: string, cov: BranchCoverage): RepoReview {
   const files = [...cov.files].sort((x, y) => (y.total - y.reviewed) - (x.total - x.reviewed) || x.path.localeCompare(y.path)).slice(0, MAX_COVERAGE_FILES);
-  const coverage = { ...repo.coverage, [branch]: { ...cov, files, issues: cov.issues.slice(0, MAX_COVERAGE_ISSUES) } };
+  const next: BranchCoverage = { ...cov, files, issues: cov.issues.slice(0, MAX_COVERAGE_ISSUES) };
+  if (cov.resolved?.length) next.resolved = cov.resolved.slice(0, MAX_COVERAGE_ISSUES); else delete next.resolved;
+  const coverage = { ...repo.coverage, [branch]: next };
   const names = Object.keys(coverage);
   if (names.length > MAX_BRANCHES_PER_REPO) {
     names.sort((x, y) => coverage[x].at - coverage[y].at);
@@ -387,7 +543,7 @@ export function issueExcerpt(lines: readonly string[], flagged: readonly number[
 }
 
 /** Chat prompt asking Copilot to fix flagged review issues (VS Code "Fix with Copilot"). */
-export function fixIssuesPrompt(branch: string | null, issues: readonly { path: string; line: number; lines: number; note: string; code?: string }[], total = issues.length): string {
+export function fixIssuesPrompt(branch: string | null, issues: readonly { path: string; line: number; lines: number; note: string; code?: string; markId?: string }[], total = issues.length): string {
   const one = total === 1;
   const out = [
     `Fix the code review ${one ? 'issue' : `issues (${total})`} I flagged${branch ? ` on branch \`${branch}\`` : ''}.`,
@@ -395,11 +551,13 @@ export function fixIssuesPrompt(branch: string | null, issues: readonly { path: 
     ''
   ];
   issues.forEach((i, n) => {
-    out.push(`${n + 1}. \`${i.path}:${i.line}\`${i.lines > 1 ? ` (${i.lines} lines)` : ''}: ${i.note || '(no note)'}`);
+    out.push(`${n + 1}. \`${i.path}:${i.line}\`${i.lines > 1 ? ` (${i.lines} lines)` : ''}: ${i.note || '(no note)'}${i.markId ? ` (issueId \`${i.markId}\`)` : ''}`);
     if (i.code) out.push('   ```', ...i.code.split('\n').map(l => '   ' + l), '   ```');
   });
   if (total > issues.length) out.push(`… and ${total - issues.length} more (see \`review_issues\`).`);
   out.push('', 'For each issue make the smallest fix that addresses the note and do not change unrelated code. '
+    + 'After fixing an issue, call the MCP tool `review_resolve_issue` with its issueId and a one-line note of what you changed, '
+    + 'so it shows up as "fixed by Copilot" for me to verify (skip this if the tool is not available). '
     + 'When you are done, list each issue with what you changed, or why you left it unchanged.');
   return out.join('\n');
 }
@@ -424,6 +582,7 @@ export function reviewIssues(
   const pathOk = (rel: string) => !pathFilter || rel.toLowerCase().includes(pathFilter);
   const live: Record<string, unknown>[] = [];
   const elsewhere: Record<string, unknown>[] = [];
+  const toVerify: Record<string, unknown>[] = [];
   const seen = new Set<string>();
   const sig = (rel: string, at: number, note: string) => `${rel}\u0000${at}\u0000${note}`;
   let checkedOut: { repo: string; root: string; branch: string | null }[] = [];
@@ -450,7 +609,17 @@ export function reviewIssues(
         if (text === null) continue;
         const lines = splitLines(text);
         if (lines.length > 60_000) continue;
-        for (const i of evaluateFile(lines, new Set(), marks).issues) {
+        const ev = evaluateFile(lines, new Set(), marks);
+        for (const m of marks) {
+          if (!m.fixed || seen.has(m.id)) continue;
+          seen.add(m.id);
+          const hit = ev.fixed.find(x => x.markId === m.id);
+          toVerify.push({
+            repo: repoId, file: rel, issueId: m.id, line: hit ? hit.line + 1 : m.line ?? null, note: m.note || '(no note)',
+            fixedBy: m.fixed.by === 'ai' ? 'Copilot' : 'developer', fixNote: m.fixed.note ?? null, fixedAt: new Date(m.fixed.at).toISOString()
+          });
+        }
+        for (const i of ev.issues) {
           const idx = [...i.indices].sort((a, b) => a - b);
           const start = idx[0], end = idx[idx.length - 1];
           const code = issueExcerpt(lines, idx, ctxLines);
@@ -458,7 +627,7 @@ export function reviewIssues(
           seen.add(i.markId);
           seen.add(sig(rel, i.at, i.note));
           live.push({
-            repo: repoId, root, file: rel, absolutePath: joinPath(root, rel), startLine: start + 1, endLine: end + 1,
+            issueId: i.markId, repo: repoId, root, file: rel, absolutePath: joinPath(root, rel), startLine: start + 1, endLine: end + 1,
             flaggedLines: idx.length, note: i.note || '(no note)', flaggedAt: new Date(i.at).toISOString(), branch: current, code
           });
         }
@@ -475,7 +644,7 @@ export function reviewIssues(
         if (!stillFlagged) continue;
         seen.add(i.markId ?? sig(i.path, i.at, i.note));
         elsewhere.push({
-          repo: repoId, branch: b, file: i.path, line: i.line, flaggedLines: i.lines, note: i.note || '(no note)',
+          ...(i.markId ? { issueId: i.markId } : {}), repo: repoId, branch: b, file: i.path, line: i.line, flaggedLines: i.lines, note: i.note || '(no note)',
           flaggedAt: new Date(i.at).toISOString(), asOf: new Date(cov.at).toISOString(),
           hint: root ? `Not in the files checked out now (${current ?? 'detached HEAD'}). Check out ${b} to fix it; line numbers are from ${new Date(cov.at).toISOString()}.`
             : 'The folder of this repository is not known on this machine yet; open it in VS Code with the extension once.'
@@ -492,11 +661,13 @@ export function reviewIssues(
     openIssues: live.length, issues: live.slice(0, MAX_LIVE_ISSUES),
     ...(live.length > MAX_LIVE_ISSUES ? { truncated: live.length - MAX_LIVE_ISSUES } : {}),
     onOtherBranches: elsewhere.slice(0, 50),
+    ...(toVerify.length ? { fixedAwaitingVerification: toVerify.slice(0, 50) } : {}),
     instructions: 'The developer flagged these lines while reviewing code in VS Code; "note" says what is wrong. Fix each issue in "file" around startLine–endLine '
       + '(lines marked ">" in "code" are the flagged ones; line numbers are for the file on disk now). Keep changes minimal and do not touch unrelated code. '
-      + 'Editing a flagged line clears its flag automatically and the new code shows up as "to review" for the developer. '
-      + 'If the right fix does not change a flagged line, say so, so the developer can resolve it in VS Code ("Resolved — mark reviewed").',
-    ...(live.length || elsewhere.length ? {} : { note: store.repos && Object.keys(store.repos).length
+      + 'After fixing an issue, call review_resolve_issue with its issueId and a short note of what you changed: it moves to "Fixed — to verify" in VS Code '
+      + 'and the changed code shows up as "to review". If you left an issue unchanged, say why instead of resolving it. '
+      + '"fixedAwaitingVerification" lists issues already reported fixed; do not fix them again unless asked.',
+    ...(live.length || elsewhere.length || toVerify.length ? {} : { note: store.repos && Object.keys(store.repos).length
       ? 'No open review issues. Flag issues in VS Code with the CodeLens "⚑ Flag issue" or the editor context menu.'
       : 'No review marks saved yet. Flag issues in VS Code with the CodeLens "⚑ Flag issue" or the editor context menu.' })
   };
@@ -516,7 +687,8 @@ export function reviewStatus(
     ...roll, asOf: roll.asOf ? new Date(roll.asOf).toISOString() : null,
     branches: roll.branches.map(b => ({ ...b, at: new Date(b.at).toISOString() })),
     filesLeft: roll.filesLeft.slice(0, 50),
-    issues: roll.issues.slice(0, 50).map(i => ({ ...i, at: new Date(i.at).toISOString() }))
+    issues: roll.issues.slice(0, 50).map(i => ({ ...i, at: new Date(i.at).toISOString() })),
+    resolved: roll.resolved.slice(0, 50).map(i => ({ ...i, at: new Date(i.at).toISOString(), ...(i.fixedAt ? { fixedAt: new Date(i.fixedAt).toISOString() } : {}) }))
   } : null;
   if (args.workItemId) {
     const names = Object.keys(branches).filter(b => branches[b]?.workItemId === args.workItemId);
@@ -539,7 +711,7 @@ export function reviewStatus(
       else if (!loose.includes(b)) loose.push(b);
     }
   }
-  const row = (roll: ReviewRollup) => ({ total: roll.total, reviewed: roll.reviewed, pct: roll.pct, unreviewed: roll.unreviewed, openIssues: roll.openIssues, complete: roll.complete, asOf: roll.asOf ? new Date(roll.asOf).toISOString() : null });
+  const row = (roll: ReviewRollup) => ({ total: roll.total, reviewed: roll.reviewed, pct: roll.pct, unreviewed: roll.unreviewed, openIssues: roll.openIssues, fixedToVerify: roll.toVerify, complete: roll.complete, asOf: roll.asOf ? new Date(roll.asOf).toISOString() : null });
   const items = [...byWi].map(([id, names]) => {
     const roll = rollupCoverage(store, names)!;
     return { workItemId: id, title: workItems[id]?.title ?? null, status: workItems[id]?.status ?? 'open', branches: names, ...row(roll) };
@@ -600,6 +772,9 @@ export interface ReviewRollup {
   branches: { repo: string; branch: string; total: number; reviewed: number; issueLines: number; openIssues: number; pct: number; at: number }[];
   filesLeft: { repo: string; path: string; unreviewed: number; total: number }[];
   issues: (OpenIssue & { repo: string; branch: string })[];
+  /** Fixed / changed issues waiting for the developer to verify. */
+  toVerify: number;
+  resolved: (ResolvedIssue & { repo: string; branch: string })[];
 }
 
 /**
@@ -611,6 +786,7 @@ export function rollupCoverage(store: ReviewStoreData, branches: readonly string
   const wanted = new Set(branches);
   const perFile = new Map<string, { repo: string; f: FileCoverage; at: number }>();
   const issueMap = new Map<string, OpenIssue & { repo: string; branch: string }>();
+  const resolvedMap = new Map<string, ResolvedIssue & { repo: string; branch: string }>();
   const rows: ReviewRollup['branches'] = [];
   let asOf: number | null = null;
   for (const [repo, r] of Object.entries(store.repos)) {
@@ -628,6 +804,7 @@ export function rollupCoverage(store: ReviewStoreData, branches: readonly string
         const hit = issueMap.get(key);
         if (!hit || hit.at <= i.at) issueMap.set(key, { ...i, repo, branch });
       }
+      for (const i of cov.resolved ?? []) if (!resolvedMap.has(repo + '\u0000' + i.markId)) resolvedMap.set(repo + '\u0000' + i.markId, { ...i, repo, branch });
     }
   }
   if (!rows.length) return null;
@@ -644,6 +821,7 @@ export function rollupCoverage(store: ReviewStoreData, branches: readonly string
   return {
     total, reviewed, unreviewed: total - reviewed, issueLines, openIssues: issues.length,
     pct: coveragePct(reviewed, total), complete: reviewed >= total && issues.length === 0,
-    asOf, branches: rows, filesLeft, issues
+    asOf, branches: rows, filesLeft, issues,
+    toVerify: resolvedMap.size, resolved: [...resolvedMap.values()].sort((x, y) => (y.fixedAt ?? y.at) - (x.fixedAt ?? x.at))
   };
 }

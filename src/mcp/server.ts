@@ -9,11 +9,15 @@ import { promptExcerpts, SessionTitleResolver, storageRoots } from '../util/sess
 import { BUDGET_SNAPSHOT_FILE } from '../analysis/budget';
 import { HEALTH_SNAPSHOT_FILE } from '../analysis/dataHealth';
 import { CATEGORY_RULES_SNAPSHOT_FILE, defaultClassifier, modelEfficiency, toolProfile } from '../analysis/efficiency';
-import { sanitizeRules } from '../util/categoryRules';
+import { categorizeWith, sanitizeRules } from '../util/categoryRules';
 import { ESTIMATION_SNAPSHOT_FILE, estimateAccuracy, suggestEstimate, type EstimationItem } from '../analysis/estimation';
 import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewIssues, reviewStatus, type ReviewIssuesIo } from '../analysis/review';
+import { reviewMark, reviewResolveIssue, type ResolveAction, type ReviewMarkArgs, type ReviewMarkIo } from '../analysis/reviewMark';
+import { ReviewStore } from '../review/reviewStore';
+import { changedFilesSync, contentAtSync, resolveReviewBaseSync } from '../review/reviewGit';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
+import { randomUUID } from 'crypto';
 
 export { promptExcerpts };
 
@@ -42,10 +46,25 @@ const reviewFileIo: ReviewIssuesIo = {
   }
 };
 
+/** Git and store access for `review_mark` / `review_resolve_issue`, the only tools that write (review marks, never the effort store). */
+const reviewMarkIo: ReviewMarkIo = {
+  ...reviewFileIo,
+  resolveBase: resolveReviewBaseSync,
+  changedFiles: changedFilesSync,
+  contentAt: contentAtSync,
+  update: (repoId, change) => {
+    if (!process.env.AET_STORE_PATH) throw new Error('AET_STORE_PATH is not set.');
+    new ReviewStore(path.dirname(process.env.AET_STORE_PATH)).updateRepo(repoId, change);
+  },
+  now: () => Date.now(),
+  newId: () => randomUUID()
+};
+
 /**
- * Read-only MCP server (stdio, newline-delimited JSON-RPC 2.0) exposing usage
+ * MCP server (stdio, newline-delimited JSON-RPC 2.0) exposing usage
  * insights to AI assistants. Started by VS Code through the extension's MCP
- * server definition provider. Never writes the store. Prompt text is read on
+ * server definition provider. Never writes the effort store; only `review_mark`
+ * and `review_resolve_issue` write review marks. Prompt text is read on
  * demand from Copilot's own local debug logs and only returned, never stored.
  */
 
@@ -185,7 +204,53 @@ export const TOOLS = [
       additionalProperties: false
     }
   }
-].map(t => ({ ...t, annotations: { readOnlyHint: true, openWorldHint: false } }));
+].map(t => ({ ...t, annotations: { readOnlyHint: true, openWorldHint: false } as Json })).concat([{
+  name: 'review_mark',
+  title: 'Mark code as reviewed',
+  description: 'Mark changed code as reviewed in the developer\'s VS Code review tracking, or remove review marks, or flag lines as a review issue. '
+    + 'ONLY call this when the developer explicitly asks you to (e.g. "mark the specs as reviewed", "mark NOBJQMSyncMgt as reviewed", "unmark the page files"); never mark code you wrote or reviewed yourself on your own initiative. '
+    + 'Select files with "paths" (repository-relative paths, folders, name fragments or globs like "app/specs/**" or "*.Table.al") and/or "category"; "all": true selects every changed file. '
+    + 'Without a line range, status "reviewed" marks only the changed lines still to review and "clear" removes only reviewed marks (flagged issues stay). '
+    + 'With startLine/endLine (one file) every non-blank line in the range is marked; "issue" needs a range and a "note". Use "dryRun": true to preview when the selection is unclear. '
+    + 'Works on the files checked out now; returns the files and line ranges that were marked.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      status: { type: 'string', enum: ['reviewed', 'clear', 'issue'], description: 'reviewed (default), clear (remove marks) or issue (flag lines, needs startLine and note).' },
+      paths: { type: 'array', items: { type: 'string' }, description: 'Files to mark: repository-relative paths, folders, name fragments or globs.' },
+      category: { type: 'string', description: 'Only files of this effort category: programming, specification, documentation, translation, deployment, config or other.' },
+      all: { type: 'boolean', description: 'Every changed file on the branch (combine with category to narrow).' },
+      startLine: { type: 'number', description: '1-based first line (exactly one file must match).' },
+      endLine: { type: 'number', description: '1-based last line (default startLine).' },
+      note: { type: 'string', description: 'What is wrong (status issue).' },
+      repo: { type: 'string', description: 'Repository (part of its remote URL or folder) when several are open.' },
+      branch: { type: 'string', description: 'Use the folder that has this branch checked out.' },
+      workItemId: { type: 'string', description: 'Use the folder that has a branch of this work item checked out.' },
+      dryRun: { type: 'boolean', description: 'Only report what would be marked.' }
+    },
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as Json
+}, {
+  name: 'review_resolve_issue',
+  title: 'Report a review issue as fixed',
+  description: 'Update a review issue the developer flagged in VS Code. After you fixed an issue from review_issues, call this with its issueId, action "fixed" (default) and a one-line note of what you changed: '
+    + 'the issue then waits under "Fixed — to verify" in the developer\'s Review view, so they can check your fix. '
+    + 'Use action "reopen" to undo that. Use action "remove" (deletes the flag) ONLY when the developer explicitly asks to remove or dismiss the issue. '
+    + 'Do not report an issue as fixed when you did not change the code for it.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      issueId: { type: 'string', description: 'issueId from review_issues.' },
+      file: { type: 'string', description: 'Instead of issueId: path or name of a file with exactly one matching issue.' },
+      action: { type: 'string', enum: ['fixed', 'reopen', 'remove'], description: 'fixed (default): fixed, waits for verification; reopen: open again; remove: delete the flag (only when asked).' },
+      note: { type: 'string', description: 'What you changed to fix it (shown to the developer).' },
+      repo: { type: 'string', description: 'Repository (part of its remote URL or folder) to narrow the search.' }
+    },
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as Json
+}]);
 
 let cache: { stamp: string; data: UsageData } | undefined;
 
@@ -362,6 +427,27 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       return reviewIssues(loadReviewStore(), data.branches as Record<string, { workItemId?: string | null }>, data.workItems as Record<string, { title?: string | null; status?: string }>,
         { workItemId: str(args.workItemId), branch: str(args.branch), path: str(args.path), contextLines: typeof args.contextLines === 'number' ? args.contextLines : undefined },
         reviewFileIo);
+    }
+    case 'review_mark': {
+      const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+      const numArg = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+      const status = str(args.status);
+      if (status && status !== 'reviewed' && status !== 'clear' && status !== 'issue') throw new Error('"status" must be reviewed, clear or issue.');
+      const paths = Array.isArray(args.paths) ? args.paths.filter((p): p is string => typeof p === 'string') : typeof args.paths === 'string' ? [args.paths] : undefined;
+      const rules = sanitizeRules(record(loadSnapshotFile(CATEGORY_RULES_SNAPSHOT_FILE)?.rules) as never);
+      const markArgs: ReviewMarkArgs = {
+        status: status as ReviewMarkArgs['status'], paths, category: str(args.category), all: args.all === true,
+        startLine: numArg(args.startLine), endLine: numArg(args.endLine), note: str(args.note),
+        repo: str(args.repo), branch: str(args.branch), workItemId: str(args.workItemId), dryRun: args.dryRun === true
+      };
+      return reviewMark(loadReviewStore(), data.branches as Record<string, { workItemId?: string | null }>, markArgs, rel => categorizeWith(rel, rules), reviewMarkIo);
+    }
+    case 'review_resolve_issue': {
+      const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+      const action = str(args.action);
+      if (action && action !== 'fixed' && action !== 'reopen' && action !== 'remove') throw new Error('"action" must be fixed, reopen or remove.');
+      return reviewResolveIssue(loadReviewStore(),
+        { issueId: str(args.issueId), file: str(args.file), action: action as ResolveAction | undefined, note: str(args.note), repo: str(args.repo) }, reviewMarkIo);
     }
     default: throw new Error(`Unknown tool "${name}".`);
   }

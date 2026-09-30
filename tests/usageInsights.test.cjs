@@ -223,8 +223,15 @@ test('JSON-RPC handler negotiates protocol and rejects unknown input', () => {
   assert.equal(handle({ jsonrpc: '2.0', id: 3, method: 'nope' }).error.code, -32601);
   assert.equal(handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'nope' } }).error.code, -32602);
   const tools = handle({ jsonrpc: '2.0', id: 5, method: 'tools/list' }).result.tools;
-  assert.deepEqual(tools.map(x => x.name), ['usage_overview', 'optimization_findings', 'list_work_items', 'list_sessions', 'session_detail', 'model_efficiency', 'tool_profile', 'suggest_estimate', 'estimate_accuracy', 'data_health', 'review_status', 'review_issues']);
-  assert.ok(tools.every(x => x.annotations.readOnlyHint));
+  assert.deepEqual(tools.map(x => x.name), ['usage_overview', 'optimization_findings', 'list_work_items', 'list_sessions', 'session_detail', 'model_efficiency', 'tool_profile', 'suggest_estimate', 'estimate_accuracy', 'data_health', 'review_status', 'review_issues', 'review_mark', 'review_resolve_issue']);
+  assert.ok(tools.filter(x => !['review_mark', 'review_resolve_issue'].includes(x.name)).every(x => x.annotations.readOnlyHint));
+  const resolveTool = tools.find(x => x.name === 'review_resolve_issue');
+  assert.equal(resolveTool.annotations.readOnlyHint, false);
+  assert.match(resolveTool.description, /ONLY when the developer explicitly asks to remove/);
+  const markTool = tools.find(x => x.name === 'review_mark');
+  assert.equal(markTool.annotations.readOnlyHint, false, 'the only tool that writes says so');
+  assert.equal(markTool.annotations.destructiveHint, false);
+  assert.match(markTool.description, /ONLY call this when the developer explicitly asks/);
 });
 
 test('stdio MCP server answers tool calls from a read-only store', async t => {

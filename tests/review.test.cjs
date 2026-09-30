@@ -253,7 +253,7 @@ test('review_issues reads flagged code live with current line numbers and lists 
     assert.match(i.code, /^7>\|         exit\(Round\(x, 1\)\);$/m);
     assert.match(i.code, /^4 \|/m);
     assert.deepEqual(out.onOtherBranches.map(x => [x.branch, x.file, x.note]), [['feature/9-y', 'src/Gone.al', 'other branch']]);
-    assert.match(out.instructions, /Editing a flagged line clears its flag/);
+    assert.match(out.instructions, /call review_resolve_issue with its issueId/);
 
     // Work item filter: WI 7 is checked out, so its issues are live; WI 9's issue only exists on its branch.
     assert.equal(r.reviewIssues(store, branches, {}, { workItemId: '7' }, io).openIssues, 1);

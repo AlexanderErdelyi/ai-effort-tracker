@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 
 export const MCP_PROVIDER_ID = 'aiEffortTracker.usageInsights';
 
-/** Offer the read-only usage-insights MCP server to VS Code's MCP support (Copilot agent mode). */
+/** Offer the usage-insights MCP server (read-only except review marks) to VS Code's MCP support (Copilot agent mode). */
 export function registerUsageInsightsMcp(context: vscode.ExtensionContext): void {
   const lm = vscode.lm as Partial<typeof vscode.lm> | undefined;
   if (typeof lm?.registerMcpServerDefinitionProvider !== 'function') return;
