@@ -357,7 +357,10 @@ edits.
   menu has the same actions for a selection, plus **Clear review mark**.
 - **Next unreviewed** jumps to the next open block across the branch's changed files.
 - **AI Effort: Review** (Explorer) lists open issues, files with review left and a
-  collapsed list of fully reviewed files. The status bar shows `Review NN%` and the
+  collapsed list of fully reviewed files. Files are grouped by effort category (your
+  `aiEffortTracker.categoryRules`), then by folder with single-folder chains compacted;
+  switch to a plain folder tree or a flat list with the **Group Files By…** button
+  (`aiEffortTracker.review.groupBy`). The status bar shows `Review NN%` and the
   open issue count.
 - **Set Review Baseline** compares against another ref for this branch (e.g. a
   release tag or the commit you last reviewed).
@@ -387,7 +390,7 @@ tracker's store, with the same locking, `.bak` and history as the main store, so
 several windows can review at once.
 
 Settings: `aiEffortTracker.review.enabled`, `review.showDecorations`,
-`review.codeLens`, `review.showStatusBar`, `review.exclude` (globs, default lock
+`review.codeLens`, `review.showStatusBar`, `review.groupBy`, `review.exclude` (globs, default lock
 files, build output, minified files, source maps and generated `*.g.xlf`) and `review.baseRef` (default baseline for
 all branches).
 

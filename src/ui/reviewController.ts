@@ -4,6 +4,8 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { normalizeRepoId } from '../store/database';
 import * as R from '../analysis/review';
+import * as T from '../analysis/reviewTree';
+import { ALL_CATEGORIES, CATEGORY_LABELS, categorizeWith, readUserRules, type FileCategory } from '../util/fileTypes';
 import { ReviewStore } from '../review/reviewStore';
 import * as G from '../review/reviewGit';
 
@@ -41,7 +43,8 @@ type Node =
   | { kind: 'summary' }
   | { kind: 'issues' }
   | { kind: 'issue'; issue: R.OpenIssue }
-  | { kind: 'file'; row: FileRow }
+  | { kind: 'file'; row: FileRow; showDir?: boolean }
+  | { kind: 'group'; group: T.ReviewTreeGroup<FileRow>; section: 'open' | 'done' }
   | { kind: 'done' };
 
 const CTX_TTL_MS = 20_000;
@@ -119,7 +122,9 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       vscode.workspace.onDidRenameFiles(() => { this.invalidateCtx(); this.scheduleCoverage(1500); }),
       vscode.window.onDidChangeWindowState(s => { if (s.focused) void this.poll(); }),
       vscode.workspace.onDidChangeConfiguration(e => {
-        if (!e.affectsConfiguration('aiEffortTracker.review')) return;
+        if (e.affectsConfiguration('aiEffortTracker.review.groupBy') || e.affectsConfiguration('aiEffortTracker.categoryRules')) this.treeEmitter.fire();
+        const keys = ['enabled', 'showDecorations', 'codeLens', 'showStatusBar', 'exclude', 'baseRef'];
+        if (!keys.some(k => e.affectsConfiguration('aiEffortTracker.review.' + k))) return;
         this.readConfig();
         this.invalidateCtx();
         this.refreshAll();
@@ -347,6 +352,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       reg('setBaseline', () => this.setBaseline()),
       reg('refresh', () => { this.invalidateCtx(); this.refreshAll(); this.scheduleCoverage(50); }),
       reg('openFile', (root: string, rel: string, line?: number) => this.openAt(path.join(root, rel), line)),
+      reg('changeGrouping', () => this.chooseGrouping()),
       reg('showProgress', () => vscode.commands.executeCommand('aiEffortTracker.reviewView.focus')),
       reg('fixWithCopilot', async (target?: Node | vscode.Uri, line?: number) => {
         if (target instanceof vscode.Uri) {
@@ -751,12 +757,26 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         const item = new vscode.TreeItem(path.posix.basename(r.path));
         const dir = path.posix.dirname(r.path);
         const done = r.reviewed >= r.total;
-        item.description = `${dir === '.' ? '' : dir + ' · '}${r.reviewed}/${r.total}${r.issueLines ? ' · ⚑' : ''}`;
+        item.description = `${node.showDir && dir !== '.' ? dir + ' · ' : ''}${r.reviewed}/${r.total}${r.issueLines ? ' · ⚑' : ''}`;
         item.tooltip = `${r.path}\n${r.reviewed} of ${r.total} changed lines reviewed (${R.coveragePct(r.reviewed, r.total)} %)${r.issueLines ? `\n${plural(r.issueLines, 'flagged line')}` : ''}`;
         item.resourceUri = vscode.Uri.file(path.join(r.root, r.path));
         item.iconPath = new vscode.ThemeIcon(done ? 'pass' : r.reviewed ? 'circle-large' : 'circle-large-outline',
           done ? new vscode.ThemeColor('testing.iconPassed') : undefined);
         item.command = { command: 'aiEffortTracker.review.openFile', title: 'Open', arguments: [r.root, r.path, done ? undefined : r.firstTodo] };
+        return item;
+      }
+      case 'group': {
+        const g = node.group;
+        const done = g.reviewed >= g.total && !g.issueLines;
+        const item = new vscode.TreeItem(g.label, node.section === 'open' ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
+        item.id = `review:${g.id}`;
+        const counts = `${g.reviewed}/${g.total}${g.issueLines ? ' · ⚑' : ''}`;
+        item.description = g.type === 'category' && g.commonPath ? `${counts} · ${g.commonPath}` : counts;
+        item.tooltip = `${g.type === 'folder' ? g.key : g.label.replace(/^\P{L}+/u, '')}${g.commonPath ? `\n${g.commonPath}` : ''}\n${plural(g.files, 'file')}, ${g.reviewed} of ${g.total} changed lines reviewed (${R.coveragePct(g.reviewed, g.total)} %)${g.issueLines ? `\n${plural(g.issueLines, 'flagged line')}` : ''}`;
+        if (g.type === 'folder') {
+          item.resourceUri = vscode.Uri.file(path.join(snap.ctx.root, g.key));
+          item.iconPath = vscode.ThemeIcon.Folder;
+        } else item.iconPath = new vscode.ThemeIcon(done ? 'pass' : 'symbol-folder', done ? new vscode.ThemeColor('testing.iconPassed') : undefined);
         return item;
       }
       case 'done': {
@@ -777,13 +797,44 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     if (!node) {
       const out: Node[] = [{ kind: 'summary' }];
       if (snap.cov.issues.length) out.push({ kind: 'issues' });
-      out.push(...open.map(row => ({ kind: 'file', row }) as Node));
+      out.push(...this.fileNodes(open, 'open'));
       if (done.length) out.push({ kind: 'done' });
       return out;
     }
-    if (node.kind === 'issues') return snap.cov.issues.map(issue => ({ kind: 'issue', issue }));
-    if (node.kind === 'done') return done.map(row => ({ kind: 'file', row }));
+    if (node.kind === 'issues') return [...snap.cov.issues].sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line).map(issue => ({ kind: 'issue', issue }));
+    if (node.kind === 'done') return this.fileNodes(done, 'done');
+    if (node.kind === 'group') return node.group.children.map(n => this.toNode(n, node.section));
     return [];
+  }
+
+  private groupBy(): T.ReviewGroupBy {
+    const v = cfg().get<string>('groupBy');
+    return v === 'folder' || v === 'none' ? v : 'category';
+  }
+
+  /** Files of one section (open / fully reviewed), grouped as configured. */
+  private fileNodes(rows: FileRow[], section: 'open' | 'done'): Node[] {
+    const groupBy = this.groupBy();
+    if (groupBy === 'none') return rows.map(row => ({ kind: 'file', row, showDir: true }));
+    const rules = readUserRules();
+    const tree = T.buildReviewTree(rows, groupBy, p => categorizeWith(p, rules), c => CATEGORY_LABELS[c as FileCategory] ?? c, ALL_CATEGORIES, section);
+    return tree.map(n => this.toNode(n, section));
+  }
+
+  private toNode(n: T.ReviewTreeNode<FileRow>, section: 'open' | 'done'): Node {
+    return n.kind === 'file' ? { kind: 'file', row: n.row } : { kind: 'group', group: n, section };
+  }
+
+  private async chooseGrouping() {
+    const cur = this.groupBy();
+    const items: (vscode.QuickPickItem & { value: T.ReviewGroupBy })[] = [
+      { label: '$(symbol-folder) Category, then folder', description: 'Programming, Specification, Documentation, …', value: 'category' },
+      { label: '$(list-tree) Folder', description: 'like the Explorer', value: 'folder' },
+      { label: '$(list-flat) Flat list', description: 'most lines left first', value: 'none' }
+    ];
+    for (const i of items) if (i.value === cur) i.description = `${i.description} · current`;
+    const pick = await vscode.window.showQuickPick(items, { title: 'Group review files by' });
+    if (pick && pick.value !== cur) await cfg().update('groupBy', pick.value, vscode.ConfigurationTarget.Global);
   }
 
   dispose() {

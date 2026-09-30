@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -278,6 +278,12 @@
         "title": "Review: Fix Review Issues with Copilot",
         "category": "AI Effort Tracker",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "aiEffortTracker.review.changeGrouping",
+        "title": "Review: Group Files By…",
+        "category": "AI Effort Tracker",
+        "icon": "$(list-tree)"
       }
     ],
     "mcpServerDefinitionProviders": [
@@ -685,6 +691,21 @@
           "type": "string",
           "default": "",
           "description": "Branch, tag or commit to review against. Empty = the merge-base with the default branch (origin/HEAD, main or master). The command \"Review: Set Review Baseline…\" overrides this per branch."
+        },
+        "aiEffortTracker.review.groupBy": {
+          "type": "string",
+          "enum": [
+            "category",
+            "folder",
+            "none"
+          ],
+          "enumDescriptions": [
+            "By effort category (your category rules), then folder",
+            "By folder, like the Explorer",
+            "Flat list, most lines left to review first"
+          ],
+          "default": "category",
+          "description": "How the AI Effort: Review view groups changed files."
         }
       }
     },
@@ -739,14 +760,19 @@
           "group": "navigation@2"
         },
         {
-          "command": "aiEffortTracker.review.toggleHighlights",
+          "command": "aiEffortTracker.review.changeGrouping",
           "when": "view == aiEffortTracker.reviewView",
           "group": "navigation@3"
         },
         {
-          "command": "aiEffortTracker.review.refresh",
+          "command": "aiEffortTracker.review.toggleHighlights",
           "when": "view == aiEffortTracker.reviewView",
           "group": "navigation@4"
+        },
+        {
+          "command": "aiEffortTracker.review.refresh",
+          "when": "view == aiEffortTracker.reviewView",
+          "group": "navigation@5"
         }
       ],
       "commandPalette": [
