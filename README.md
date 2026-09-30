@@ -224,6 +224,7 @@ or *"Analyse my usage for work item 1987"*. Tools:
 | `suggest_estimate` | Hours and credits for a new work item from similar finished ones, corrected by your estimation bias |
 | `estimate_accuracy` | Estimated vs. actual hours of finished work items, bias by category and over time |
 | `data_health` | The data health report (see below) |
+| `review_status` | Code review coverage per work item and branch, files left and open review issues |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -340,6 +341,41 @@ estimate, projects without rates, unpriced requests and models without prices,
 future timestamps and implausible days. Most findings have a one-click fix or a
 button that opens the right command. Copilot can read the report through the MCP
 tool `data_health`.
+
+## Code review tracking
+
+When you accept AI code and commit it to test first, you can review it later and
+mark what you checked. Changed lines are the lines that differ from the branch's
+merge-base with `origin/HEAD` (or `main`/`master`), plus untracked files and unsaved
+edits.
+
+- **In the editor:** unreviewed changed lines get an amber gutter mark, reviewed
+  lines a green one, flagged lines a red one with your note on hover. CodeLens above
+  each unreviewed block offers **✓ Mark reviewed** and **⚑ Flag issue**; the file
+  header shows progress and **Mark file reviewed** (with Undo). The editor context
+  menu has the same actions for a selection, plus **Clear review mark**.
+- **Next unreviewed** jumps to the next open block across the branch's changed files.
+- **AI Effort: Review** (Explorer) lists open issues, files with review left and a
+  collapsed list of fully reviewed files. The status bar shows `Review NN%` and the
+  open issue count.
+- **Set Review Baseline** compares against another ref for this branch (e.g. a
+  release tag or the commit you last reviewed).
+- The work item detail shows a 🔍 Code review card with coverage over all its
+  branches, files left and open issues. A file changed on several branches counts
+  once. The health check warns when a work item marked done is not fully reviewed,
+  and Copilot can read coverage through the MCP tool `review_status`.
+
+Marks are anchored to the line's content and its neighbours, not to line numbers,
+so they survive edits elsewhere, rebases and branch switches, and a moved block
+keeps its marks. Editing a reviewed line makes it (and its direct neighbours)
+unreviewed again. Marks are stored per repository in `review-marks.json` next to the
+tracker's store, with the same locking, `.bak` and history as the main store, so
+several windows can review at once.
+
+Settings: `aiEffortTracker.review.enabled`, `review.showDecorations`,
+`review.codeLens`, `review.showStatusBar`, `review.exclude` (globs, default lock
+files, build output, minified files, source maps and generated `*.g.xlf`) and `review.baseRef` (default baseline for
+all branches).
 
 ## Development
 

@@ -91,6 +91,8 @@ export interface HealthEnv {
   lastSaveError?: { ts: number; message: string } | null;
   /** Effective rates per project (project override, else global default); null = not configured. */
   rates?: Record<string, { cost: number | null; sell: number | null }>;
+  /** Saved review coverage per work item (all its branches); omitted when review tracking is off. */
+  review?: Record<string, { total: number; reviewed: number; openIssues: number }>;
 }
 
 const ACTIVE_MODES = ['humanCoding', 'aiGenerating', 'reviewing'] as const;
@@ -325,6 +327,20 @@ export function checkDataHealth(data: HealthData, env: HealthEnv, now = Date.now
       count: noRates.length,
       detail: 'Without an hourly cost and sell rate (per project or as global default) ROI and value produced stay empty.',
       examples: examples(noRates, p => ({ label: `${p.name}: ${env.rates![p.id]?.cost == null ? 'no cost rate' : ''}${env.rates![p.id]?.cost == null && env.rates![p.id]?.sell == null ? ', ' : ''}${env.rates![p.id]?.sell == null ? 'no sell rate' : ''}`, action: { label: 'Set rates', command: 'setProjectRates', arg: p.id } }))
+    });
+  }
+
+  if (env.review) {
+    const unreviewed = Object.values(wis).filter(w => w.status === 'done' && env.review![w.id]
+      && (env.review![w.id].reviewed < env.review![w.id].total || env.review![w.id].openIssues > 0));
+    add({
+      id: 'done-not-reviewed', severity: 'warning', title: 'Finished work items are fully reviewed',
+      count: unreviewed.length,
+      detail: 'These work items are marked done, but changed lines on their branches are not marked reviewed yet or have open review issues. Open the file and use "Mark reviewed" / "Flag issue", or the AI Effort: Review view.',
+      examples: examples(unreviewed, w => {
+        const r = env.review![w.id];
+        return { label: `#${w.id}${w.title ? ' ' + w.title : ''}: ${r.reviewed}/${r.total} lines reviewed${r.openIssues ? `, ${r.openIssues} open issue${r.openIssues === 1 ? '' : 's'}` : ''}`, action: { label: 'Review', command: 'review.showProgress' } };
+      })
     });
   }
 
