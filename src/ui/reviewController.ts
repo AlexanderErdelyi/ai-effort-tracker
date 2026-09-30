@@ -316,6 +316,10 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         title: `⚑ ${note.length > 70 ? note.slice(0, 69) + '…' : note}`, command: 'aiEffortTracker.review.issueActions', arguments: [uri, issue.line],
         tooltip: 'Resolve, edit or remove this review issue'
       }));
+      lenses.push(new vscode.CodeLens(at(issue.line), {
+        title: '✨ Fix with Copilot', command: 'aiEffortTracker.review.fixWithCopilot', arguments: [uri, issue.line],
+        tooltip: 'Open a new chat with a prompt to fix this issue'
+      }));
     }
     return lenses;
   }
@@ -343,7 +347,16 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       reg('setBaseline', () => this.setBaseline()),
       reg('refresh', () => { this.invalidateCtx(); this.refreshAll(); this.scheduleCoverage(50); }),
       reg('openFile', (root: string, rel: string, line?: number) => this.openAt(path.join(root, rel), line)),
-      reg('showProgress', () => vscode.commands.executeCommand('aiEffortTracker.reviewView.focus'))
+      reg('showProgress', () => vscode.commands.executeCommand('aiEffortTracker.reviewView.focus')),
+      reg('fixWithCopilot', async (target?: Node | vscode.Uri, line?: number) => {
+        if (target instanceof vscode.Uri) {
+          const ev = await this.ensureEval(await vscode.workspace.openTextDocument(target));
+          const i = ev.review.issues.find(x => typeof line === 'number' && (x.indices.includes(line) || x.line === line));
+          if (!i) throw new Error('This issue no longer exists (the lines were changed).');
+          return this.fixWithCopilot({ path: ev.rel, line: i.line + 1, lines: i.lines, note: i.note, at: i.at, markId: i.markId }, ev.ctx.branch);
+        }
+        return this.fixWithCopilot(target && typeof target === 'object' && target.kind === 'issue' ? target.issue : undefined);
+      })
     ];
   }
 
@@ -416,7 +429,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       const next = change(before);
       const files = { ...repo.files };
       if (next.length) files[rel] = next; else delete files[rel];
-      return { ...repo, files };
+      return R.withRoot({ ...repo, files }, ctx.root);
     });
     return before;
   }
@@ -450,6 +463,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const issue = ev.review.issues.find(i => i.indices.includes(line)) ?? ev.review.issues.find(i => i.line === line);
     if (!issue) throw new Error('This issue no longer exists (the lines were changed).');
     const items = [
+      { label: '$(sparkle) Ask Copilot to fix it', id: 'fix' },
       { label: '$(check) Resolved — mark reviewed', id: 'ok' },
       { label: '$(edit) Edit note', id: 'edit' },
       { label: '$(close) Remove flag (back to unreviewed)', id: 'clear' },
@@ -458,6 +472,10 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const pick = await vscode.window.showQuickPick(items, { title: issue.note || 'Review issue', placeHolder: `${plural(issue.lines, 'line')} flagged ${new Date(issue.at).toLocaleString()}` });
     if (!pick) return;
     if (pick.id === 'copy') { await vscode.env.clipboard.writeText(`${ev.rel}:${issue.line + 1} ${issue.note}`); return; }
+    if (pick.id === 'fix') {
+      await this.fixWithCopilot({ path: ev.rel, line: issue.line + 1, lines: issue.lines, note: issue.note, at: issue.at, markId: issue.markId }, ev.ctx.branch);
+      return;
+    }
     const keys = R.keysForLines(R.splitLines(doc.getText()), issue.indices);
     let note: string | undefined;
     if (pick.id === 'edit') {
@@ -467,6 +485,33 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const status: R.MarkStatus = pick.id === 'edit' ? 'issue' : pick.id as R.MarkStatus;
     this.writeMarks(ev.ctx, ev.rel, marks => R.applyMark(marks, keys, status, Date.now(), randomUUID(), note));
     await this.afterMark(doc);
+  }
+
+  /** Open a new chat with a prompt to fix one issue or all open issues of the current branch. */
+  private async fixWithCopilot(issue?: R.OpenIssue, branch?: string) {
+    const snap = issue ? this.snapshot : this.snapshot ?? await this.computeCoverage();
+    const all = issue ? [issue] : snap?.cov.issues ?? [];
+    if (!all.length) { void vscode.window.showInformationMessage('No open review issues on this branch.'); return; }
+    const root = snap?.ctx.root ?? this.currentRoot;
+    const withCode = await Promise.all(all.slice(0, 25).map(async (i, n) => {
+      if (n >= 10 || !root) return i;
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(root, i.path)));
+        const ev = await this.evaluate(doc);
+        const hit = ev?.review.issues.find(x => (i.markId && x.markId === i.markId) || (x.at === i.at && x.note === i.note));
+        if (!hit) return i;
+        return { ...i, line: hit.line + 1, code: R.issueExcerpt(R.splitLines(doc.getText()), hit.indices, 2, 40) };
+      } catch { return i; }
+    }));
+    const prompt = R.fixIssuesPrompt(branch ?? snap?.ctx.branch ?? null, withCode, all.length);
+    await vscode.env.clipboard.writeText(prompt);
+    try {
+      await vscode.commands.executeCommand('workbench.action.chat.newChat');
+      await vscode.commands.executeCommand('workbench.action.chat.open', { query: prompt, isPartialQuery: true });
+      void vscode.window.setStatusBarMessage('AI Effort Tracker: fix prompt is ready in a new chat (also on the clipboard). Pick Agent mode and send it.', 6000);
+    } catch {
+      void vscode.window.showInformationMessage('AI Effort Tracker: fix prompt copied to the clipboard – paste it into a chat.');
+    }
   }
 
   private async openAt(file: string, line?: number) {
@@ -613,7 +658,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         const ev = R.evaluateFile(lines, changed, repo.files[rel] ?? []);
         if (!ev.total && !ev.issues.length) continue;
         rows.push({ path: rel, total: ev.total, reviewed: ev.reviewed, issueLines: ev.issueLines, root, firstTodo: ev.todoBlocks[0]?.start });
-        for (const i of ev.issues) issues.push({ path: rel, line: i.line + 1, lines: i.lines, note: i.note, at: i.at });
+        for (const i of ev.issues) issues.push({ path: rel, line: i.line + 1, lines: i.lines, note: i.note, at: i.at, markId: i.markId });
       }
       const sum = (k: 'total' | 'reviewed' | 'issueLines') => rows.reduce((s, r) => s + r[k], 0);
       const cov: R.BranchCoverage = {
@@ -638,10 +683,11 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const sig = `${ctx.repoId}|${ctx.branch}|${JSON.stringify(rest)}`;
     const prev = (() => { try { return this.store.repo(ctx.repoId).coverage[ctx.branch]; } catch { return undefined; } })();
     const stale = !prev || Date.now() - prev.at > 6 * 3600_000;
-    if (sig === this.lastPersisted && !stale) return;
+    const rootKnown = (() => { try { return (this.store.repo(ctx.repoId).roots ?? []).includes(ctx.root); } catch { return true; } })();
+    if (sig === this.lastPersisted && !stale && rootKnown) return;
     if (!cov.total && !cov.issues.length && !prev) { this.lastPersisted = sig; return; }
     try {
-      this.store.updateRepo(ctx.repoId, repo => R.withCoverage(repo, ctx.branch, cov));
+      this.store.updateRepo(ctx.repoId, repo => R.withRoot(R.withCoverage(repo, ctx.branch, cov), ctx.root));
       this.lastPersisted = sig;
       this.storeStamp = this.stamp();
     } catch (error) {
@@ -687,6 +733,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       case 'issues': {
         const item = new vscode.TreeItem(`Issues (${snap.cov.issues.length})`, vscode.TreeItemCollapsibleState.Expanded);
         item.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'));
+        item.contextValue = 'aetReviewIssues';
         return item;
       }
       case 'issue': {
@@ -695,6 +742,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         item.description = `${i.path}:${i.line}`;
         item.tooltip = `${i.note || 'Issue'}\n${i.path}:${i.line} · ${plural(i.lines, 'line')} · ${new Date(i.at).toLocaleString()}`;
         item.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('errorForeground'));
+        item.contextValue = 'aetReviewIssue';
         item.command = { command: 'aiEffortTracker.review.openFile', title: 'Open', arguments: [snap.ctx.root, i.path, i.line - 1] };
         return item;
       }

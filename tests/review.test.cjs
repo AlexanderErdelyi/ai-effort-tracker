@@ -221,3 +221,84 @@ test('MCP review_status: overview, work item and branch detail', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('review_issues reads flagged code live with current line numbers and lists other-branch issues', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aet-review-issues-'));
+  try {
+    const v1 = ['codeunit 50100 Calc', '{', '    procedure Total(x: Decimal): Decimal', '    begin', '        exit(Round(x, 1));', '    end;', '}'];
+    let marks = mark([], r.keysForLines(v1, [4]), 'issue', 1000, 'rounding precision should be 0.01');
+    marks = mark(marks, r.keysForLines(v1, [2]), 'ok', 1100);
+    // File on disk now has two extra lines at the top: the issue moved from line 5 to 7.
+    const now = ['// header', '', ...v1];
+    fs.mkdirSync(path.join(dir, 'src'));
+    fs.writeFileSync(path.join(dir, 'src', 'Calc.al'), now.join('\r\n'));
+    let repo = r.withRoot(r.emptyRepoReview(), dir);
+    repo.files['src/Calc.al'] = marks;
+    repo.files['src/Gone.al'] = mark([], r.keysForLines(['a line that is only on another branch'], [0]), 'issue', 2000, 'other branch');
+    repo = r.withCoverage(repo, 'feature/9-y', { at: 3000, base: 'b', total: 1, reviewed: 0, issueLines: 1,
+      files: [{ path: 'src/Gone.al', total: 1, reviewed: 0, issueLines: 1 }], issues: [{ path: 'src/Gone.al', line: 1, lines: 1, note: 'other branch', at: 2000, markId: repo.files['src/Gone.al'][0].id }] });
+    const store = r.emptyReviewStore();
+    store.repos['github.com/o/r'] = repo;
+    const io = { exists: d => fs.existsSync(d), readFile: f => { try { return fs.readFileSync(f, 'utf8'); } catch { return null; } }, currentBranch: () => 'feature/7-x' };
+    const branches = { 'feature/7-x': { workItemId: '7' }, 'feature/9-y': { workItemId: '9' } };
+    const out = r.reviewIssues(store, branches, { 7: { title: 'Seven' } }, {}, io);
+    assert.equal(out.openIssues, 1);
+    const i = out.issues[0];
+    assert.equal(i.file, 'src/Calc.al');
+    assert.equal(i.startLine, 7);
+    assert.equal(i.endLine, 7);
+    assert.equal(i.note, 'rounding precision should be 0.01');
+    assert.equal(i.branch, 'feature/7-x');
+    assert.ok(fs.existsSync(i.absolutePath));
+    assert.match(i.code, /^7>\|         exit\(Round\(x, 1\)\);$/m);
+    assert.match(i.code, /^4 \|/m);
+    assert.deepEqual(out.onOtherBranches.map(x => [x.branch, x.file, x.note]), [['feature/9-y', 'src/Gone.al', 'other branch']]);
+    assert.match(out.instructions, /Editing a flagged line clears its flag/);
+
+    // Work item filter: WI 7 is checked out, so its issues are live; WI 9's issue only exists on its branch.
+    assert.equal(r.reviewIssues(store, branches, {}, { workItemId: '7' }, io).openIssues, 1);
+    const wi9 = r.reviewIssues(store, branches, {}, { workItemId: '9' }, io);
+    assert.equal(wi9.openIssues, 0);
+    assert.equal(wi9.onOtherBranches.length, 1);
+    assert.equal(r.reviewIssues(store, branches, {}, { path: 'nomatch' }, io).openIssues, 0);
+    assert.equal(r.reviewIssues(store, branches, {}, { contextLines: 0 }, io).issues[0].code.split('\n').length, 1);
+
+    // Fixing the flagged line clears the issue; resolving the other-branch mark drops it too.
+    fs.writeFileSync(path.join(dir, 'src', 'Calc.al'), now.join('\n').replace('Round(x, 1)', 'Round(x, 0.01)'));
+    store.repos['github.com/o/r'].files['src/Gone.al'] = mark(repo.files['src/Gone.al'], r.keysForLines(['a line that is only on another branch'], [0]), 'ok', 4000);
+    const after = r.reviewIssues(store, branches, {}, {}, io);
+    assert.equal(after.openIssues, 0);
+    assert.equal(after.onOtherBranches.length, 0);
+    assert.match(after.note, /No open review issues/);
+
+    // Unknown folder: issues fall back to the saved coverage with a hint.
+    const lost = r.reviewIssues(store, branches, {}, {}, { ...io, exists: () => false });
+    assert.equal(lost.openIssues, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repo roots and issue mark ids persist; excerpt and fix prompt format', () => {
+  let repo = r.withRoot(r.emptyRepoReview(), 'C:\\a');
+  repo = r.withRoot(repo, 'C:\\b');
+  assert.equal(r.withRoot(repo, 'C:\\b'), repo, 'unchanged when already first');
+  repo = r.withRoot(repo, 'C:\\a');
+  assert.deepEqual(repo.roots, ['C:\\a', 'C:\\b']);
+  repo = r.withCoverage(repo, 'x', { at: 1, base: '', total: 0, reviewed: 0, issueLines: 1, files: [], issues: [{ path: 'p', line: 1, lines: 1, note: 'n', at: 1, markId: 'm1' }] });
+  const store = r.emptyReviewStore();
+  store.repos.r = repo;
+  const back = r.decodeReviewStore(JSON.stringify(store));
+  assert.deepEqual(back.repos.r.roots, ['C:\\a', 'C:\\b']);
+  assert.equal(back.repos.r.coverage.x.issues[0].markId, 'm1');
+
+  const lines = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k'];
+  assert.equal(r.issueExcerpt(lines, [9, 10], 1), ' 9 | i\n10>| j\n11>| k');
+  const prompt = r.fixIssuesPrompt('feature/1', [{ path: 'src/a.al', line: 10, lines: 2, note: 'wrong filter', code: '10>| j' }, { path: 'b.al', line: 3, lines: 1, note: '' }], 5);
+  assert.match(prompt, /issues \(5\) I flagged on branch `feature\/1`/);
+  assert.match(prompt, /1\. `src\/a\.al:10` \(2 lines\): wrong filter\n   ```\n   10>\| j\n   ```/);
+  assert.match(prompt, /2\. `b\.al:3`: \(no note\)/);
+  assert.match(prompt, /and 3 more/);
+  assert.match(prompt, /review_issues/);
+  assert.match(r.fixIssuesPrompt(null, [{ path: 'a', line: 1, lines: 1, note: 'x' }]), /^Fix the code review issue I flagged\./);
+});
