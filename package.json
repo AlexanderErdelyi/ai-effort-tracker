@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.28.1",
+  "version": "0.29.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -110,6 +110,10 @@
       {
         "command": "aiEffortTracker.setWorkItemBudget",
         "title": "AI Effort Tracker: Set Work Item Budget (Credits / Money)"
+      },
+      {
+        "command": "aiEffortTracker.setMonthlyCreditBudget",
+        "title": "AI Effort Tracker: Set Monthly Credit Budget"
       },
       {
         "command": "aiEffortTracker.markWorkItemDone",
@@ -562,6 +566,19 @@
           "type": "number",
           "default": 0.04,
           "description": "USD cost per Copilot premium request (credit), used to estimate AI spend."
+        },
+        "aiEffortTracker.credits.monthlyBudget": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Monthly Copilot credit budget shown on the dashboard Overview with a pace projection. 0 turns it off. Set it with “AI Effort Tracker: Set Monthly Credit Budget”."
+        },
+        "aiEffortTracker.credits.renewalDay": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 31,
+          "description": "Day of the month your Copilot billing period starts. Days past the end of a short month use its last day."
         },
         "aiEffortTracker.dailyActiveGoalMinutes": {
           "type": "number",

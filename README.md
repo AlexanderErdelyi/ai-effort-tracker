@@ -42,6 +42,27 @@
 | `aiEffortTracker.sessions.showTitles` | `true` | Show chat titles in the Sessions tab |
 | `aiEffortTracker.budget.*` | | Budget alerts, status bar, thresholds, credits per estimated hour (see [Work item budgets](#work-item-budgets)) |
 | `aiEffortTracker.nudges.*` | | Live nudges and running chat cost (see [Live nudges](#live-nudges-while-you-chat)) |
+| `aiEffortTracker.credits.monthlyBudget` | `0` | Monthly Copilot credit budget for the Overview pace card (0 = off) |
+| `aiEffortTracker.credits.renewalDay` | `1` | Day of the month the credit budget period renews (1–31) |
+
+## Overview dashboard
+
+The Overview tab opens with a credit summary:
+
+- KPI cards for today, the last 7 days, the current billing period and the
+  average per active day, each compared with the previous period.
+- A monthly budget card with a progress bar, the projected end-of-period
+  spend and the date it will run out at the current pace. Set it with
+  **AI Effort Tracker: Set Monthly Credit Budget** (budget and renewal day).
+- A daily spend chart, stacked by model with a cumulative line (and the budget
+  line in the "This period" view), for this period, 30 or 90 days.
+- Insights: budget pace, spend spikes, credits not linked to a work item,
+  one dominant model, and big week-on-week changes.
+- "Where the credits went": model, work item, weekday and source breakdowns
+  for the period, 7, 30 or 90 days. Click a work item to open it in Projects.
+
+Activity, branches, hotspots and keystrokes sit in collapsible sections below;
+which sections are open and the chosen ranges are remembered.
 
 ## Branch changes and tracked time
 
