@@ -39,6 +39,52 @@
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
 
+## Branch changes and tracked time
+
+Switching branches settles the pending heartbeat and closes the current focus
+session on the branch being left, then checkpoints the store. Returning to a
+branch continues its existing totals; it does not start them over. Manual
+work-item assignments remain sticky.
+
+Branch detection polls Git every five seconds. Polls do not overlap, and results
+received after the tracker is disposed are ignored. Time attribution follows the
+detected transition, so changes between polls can still have up to one polling
+interval of attribution uncertainty. Sleep/stall gaps are not counted as work.
+
+## Shared storage and recovery
+
+VS Code windows share the extension's local `effort-tracker.json` store. Saves
+take an interprocess lock, read the latest committed data, and merge only local
+changes before atomically replacing the file. Automatic counters merge as deltas;
+manual values and recorded credit charges are not blindly added together.
+Unchanged stale data cannot overwrite another window's changes. Concurrent edits
+to the same scalar field use commit order; deletion wins over a stale edit to an
+existing item. Clean windows refresh shared data every two seconds for subsequent
+dashboard renders.
+
+Failed saves retain pending changes, show a warning, and retry every two seconds.
+Shutdown uses the same transaction path and reports failure instead of silently
+discarding pending changes. The short disk commit is synchronous; it can briefly
+block the extension host. Shutdown waits up to five seconds for a competing writer.
+
+Recovery copies live beside the main store:
+
+- `effort-tracker.json.bak` is an atomically replaced copy of the previous main.
+- Immutable history retains the first pre-save snapshot in each UTC hour/day,
+  keeping up to **24 hourly and 7 daily snapshots**. These are sampled restore
+  points, not a record of every edit.
+- Loading does not overwrite healthy recovery copies. A damaged main can recover
+  from backup/history while preserving damaged bytes. If every available copy is
+  unusable, loading fails explicitly rather than silently starting an empty store.
+
+**After upgrading, reload every VS Code window running the extension.** Older
+extension hosts do not obey the new locking protocol and can still overwrite the
+shared file. These safeguards cover cooperating processes on a local filesystem,
+not network/cloud-sync storage or arbitrary external file edits. File contents are
+fsynced; Windows does not support the directory fsync used on other platforms.
+The fix cannot reconstruct history already overwritten before recovery copies
+existed. Export important reports separately for longer-term backup.
+
 ## Translation line tracking
 
 XLF, XLIFF, PO, POT and RESX files default to the **Translations** category.

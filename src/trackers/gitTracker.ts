@@ -20,27 +20,36 @@ export interface NetLineChange {
 export class GitTracker implements vscode.Disposable {
   private watcher: vscode.FileSystemWatcher | undefined;
   private pollInterval: NodeJS.Timeout | undefined;
+  private refreshing = false;
+  private disposed = false;
 
   constructor(private db: Database, private timeTracker: TimeTracker) {}
 
-  start(context: vscode.ExtensionContext) {
+  start(_context: vscode.ExtensionContext) {
+    if (this.pollInterval || this.disposed) return;
     // Poll git branch every 5 seconds (lightweight)
-    this.pollInterval = setInterval(() => this.refreshBranch(), 5000);
-    this.refreshBranch();
+    this.pollInterval = setInterval(() => void this.refreshBranch(), 5000);
+    void this.refreshBranch();
   }
 
   private async refreshBranch() {
-    const branch = await GitTracker.getCurrentBranch();
-    if (!branch) return;
+    if (this.refreshing || this.disposed) return;
+    this.refreshing = true;
+    try {
+      const branch = await GitTracker.getCurrentBranch();
+      if (!branch || this.disposed) return;
 
-    const prev = this.timeTracker.getBranch();
-    if (branch !== prev) {
-      this.timeTracker.setBranch(branch);
-      // Try to resolve work item from branch name (e.g. feature/1234-auth or 1234-auth)
-      const workItemId = GitTracker.extractWorkItemId(branch);
-      if (workItemId) {
-        this.db.setWorkItemForBranch(branch, workItemId);
+      const prev = this.timeTracker.getBranch();
+      if (branch !== prev) {
+        this.timeTracker.setBranch(branch);
+        // Manual mappings remain sticky in the database.
+        const workItemId = GitTracker.extractWorkItemId(branch);
+        if (workItemId) {
+          this.db.setWorkItemForBranch(branch, workItemId);
+        }
       }
+    } finally {
+      this.refreshing = false;
     }
   }
 
@@ -48,7 +57,7 @@ export class GitTracker implements vscode.Disposable {
     const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!wsFolder) return undefined;
     return new Promise(resolve => {
-      cp.exec('git rev-parse --abbrev-ref HEAD', { cwd: wsFolder }, (err, stdout) => {
+      cp.exec('git rev-parse --abbrev-ref HEAD', { cwd: wsFolder, timeout: 4000, windowsHide: true }, (err, stdout) => {
         resolve(err ? undefined : stdout.trim());
       });
     });
@@ -176,6 +185,7 @@ export class GitTracker implements vscode.Disposable {
   }
 
   dispose() {
+    this.disposed = true;
     clearInterval(this.pollInterval);
     this.watcher?.dispose();
   }
