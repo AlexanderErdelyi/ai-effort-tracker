@@ -306,7 +306,7 @@ test('dashboard script parses and debug detail shows partial usage without fabri
   const end = script.indexOf('var detailSubTab=', start);
   let detail;
   const context = {
-    LEDGER: [entry], CAT: {}, esc: s => String(s).replaceAll('<', '&lt;'), fmt: String,
+    LEDGER: [entry], ledOpen: {}, CAT: {}, esc: s => String(s).replaceAll('<', '&lt;'), fmt: String,
     document: {
       getElementById: id => id === 'led-' + entry.id ? { parentNode: { appendChild: tr => { detail = tr.innerHTML; } } } : null,
       createElement: () => ({})
@@ -315,6 +315,7 @@ test('dashboard script parses and debug detail shows partial usage without fabri
   vm.createContext(context);
   vm.runInContext(script.slice(start, end), context);
   context.toggleLedgerDetail(entry.id);
+  assert.equal(context.ledOpen[entry.id], true);
   assert.match(detail, /Incomplete request detail/);
   assert.match(detail, /2\.000000/);
   assert.doesNotMatch(detail, /10× cheaper|credits \/ net line|Balanced input\/output/);

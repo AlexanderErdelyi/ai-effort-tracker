@@ -30,6 +30,7 @@ import { newChatWithHandoff } from './ui/handoff';
 import { buildTimesheet, normalizeRounding, timesheetCsv, weekStartOf } from './analysis/timesheet';
 import { defaultClassifier, modelEfficiency, toolProfile } from './analysis/efficiency';
 import { checkDataHealth, HEALTH_SNAPSHOT_FILE, type HealthReport } from './analysis/dataHealth';
+import { buildCreditOverview } from './analysis/creditOverview';
 import { readUserRules } from './util/fileTypes';
 import { suggestEstimate, adjustForBias, toEstimationItem, estimateAccuracy, isFinished } from './analysis/estimation';
 import { NudgeController } from './ui/nudgeController';
@@ -83,7 +84,38 @@ function getAnalytics() {
     todayActiveMs: db.getTodayActiveMs(),
     topFiles: db.getTopFiles(12),
     timeline: db.getTodayTimeline(),
+    credits: getCreditOverview(),
   };
+}
+
+function getCreditOverview() {
+  const c = vscode.workspace.getConfiguration('aiEffortTracker');
+  return buildCreditOverview(db.getCreditEntries(), {
+    now: Date.now(),
+    monthlyBudget: c.get<number>('credits.monthlyBudget') ?? 0,
+    renewalDay: c.get<number>('credits.renewalDay') ?? 1,
+  });
+}
+
+async function setMonthlyCreditBudget(): Promise<void> {
+  const c = vscode.workspace.getConfiguration('aiEffortTracker');
+  const current = c.get<number>('credits.monthlyBudget') ?? 0;
+  const budget = await vscode.window.showInputBox({
+    title: 'Monthly Copilot credit budget',
+    prompt: 'Credits you plan to spend per billing period. 0 turns the budget off.',
+    value: current > 0 ? String(current) : '',
+    validateInput: v => v.trim() === '' || (Number.isFinite(Number(v)) && Number(v) >= 0) ? undefined : 'Enter a number of credits (0 or more).',
+  });
+  if (budget === undefined) return;
+  const day = await vscode.window.showInputBox({
+    title: 'Billing period start',
+    prompt: 'Day of the month your Copilot plan renews (1–31). Days past the end of a short month use its last day.',
+    value: String(c.get<number>('credits.renewalDay') ?? 1),
+    validateInput: v => /^\d+$/.test(v.trim()) && Number(v) >= 1 && Number(v) <= 31 ? undefined : 'Enter a day between 1 and 31.',
+  });
+  if (day === undefined) return;
+  await c.update('credits.monthlyBudget', Number(budget.trim() || 0), vscode.ConfigurationTarget.Global);
+  await c.update('credits.renewalDay', Number(day.trim()), vscode.ConfigurationTarget.Global);
 }
 
 const KNOWN_MODELS = [
@@ -319,6 +351,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.setWorkItemBudget', (workItemId?: string) =>
       setWorkItemBudget(workItemId)
     ),
+    vscode.commands.registerCommand('aiEffortTracker.setMonthlyCreditBudget', () => setMonthlyCreditBudget()),
     vscode.commands.registerCommand('aiEffortTracker.openWorkItem', async (workItemId?: string) => {
       const id = workItemId || await pickWorkItem('Open which work item?');
       if (!id) return;
