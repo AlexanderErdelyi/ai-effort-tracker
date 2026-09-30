@@ -9,6 +9,20 @@ export interface DebugLogRequest {
   outputTokens: number;
   cachedTokens?: number;
   credits: number | null;
+  /** Call start (epoch ms). */
+  ts?: number;
+  durationMs?: number;
+  ttftMs?: number;
+  /** Copilot call purpose, e.g. `panel/editAgent`. */
+  agent?: string;
+  /** Requested reasoning effort (`low`/`medium`/`high`/…), when present. */
+  effort?: string;
+  maxTokens?: number;
+  /** Session-local tool definition file offered to this call (resolved to a toolset hash by the tracker). */
+  toolsFile?: string;
+  toolset?: string;
+  /** True when the call ran inside a subagent session. */
+  subagent?: boolean;
 }
 
 export interface DebugLogTurn {
@@ -62,6 +76,18 @@ function analysis(): TurnAnalysis {
 
 function successful(row: Row): boolean {
   return row.status === 'ok' || row.status === 'success';
+}
+
+/** Reasoning effort from Anthropic (`output_config.effort`) or OpenAI (`reasoning.effort`) options. */
+export function requestEffort(options: unknown): string | undefined {
+  let value: unknown = options;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { return undefined; }
+  }
+  if (!object(value)) return undefined;
+  const effort = (object(value.output_config) && str(value.output_config.effort)) ||
+    (object(value.reasoning) && str(value.reasoning.effort)) || str(value.reasoning_effort);
+  return effort ? effort.slice(0, 20) : undefined;
 }
 
 /**
@@ -196,13 +222,23 @@ export function parseDebugLog(mainText: string, relatedLogs: string[] = []): Deb
       continue;
     }
     const a = row.attrs, responseId = str(a.responseId);
+    const agent = str(a.debugName).slice(0, 60), effort = requestEffort(a.requestOptions);
+    const toolsFile = str(a.toolsFile);
     const request: DebugLogRequest = {
       spanId: persistedId(row),
       ...(responseId ? { responseId } : {}),
       model: str(a.model) || row.name.replace(/^chat:/, '') || 'unknown',
       inputTokens: num(a.inputTokens), outputTokens: num(a.outputTokens),
       ...(validNumber(a.cachedTokens) ? { cachedTokens: a.cachedTokens } : {}),
-      credits: validNumber(a.copilotUsageNanoAiu) ? a.copilotUsageNanoAiu / 1e9 : null
+      credits: validNumber(a.copilotUsageNanoAiu) ? a.copilotUsageNanoAiu / 1e9 : null,
+      ...(Number.isFinite(row.ts) ? { ts: row.ts } : {}),
+      ...(row.dur ? { durationMs: row.dur } : {}),
+      ...(validNumber(a.ttft) ? { ttftMs: a.ttft } : {}),
+      ...(agent ? { agent } : {}),
+      ...(effort ? { effort } : {}),
+      ...(validNumber(a.maxTokens) ? { maxTokens: a.maxTokens } : {}),
+      ...(/^tools_\d+\.json$/.test(toolsFile) ? { toolsFile } : {}),
+      ...(parentSessions.has(row.scope) ? { subagent: true } : {})
     };
     turn.requests.push(request);
     if (responseId && !turn.responseIds.includes(responseId)) turn.responseIds.push(responseId);
@@ -227,16 +263,27 @@ export function parseDebugLog(mainText: string, relatedLogs: string[] = []): Deb
     // Persisted logs do not expose per-tier charges; never invent an allocation.
   }
   for (const row of tools.values()) {
-    if (!successful(row) || toolResultFailed(row.attrs.result)) continue;
+    const failed = !successful(row) || toolResultFailed(row.attrs.result);
     const turn = rootOf(row);
     if (!turn) {
-      diagnostics.push(`Line ${row.line}: tool has no user-message root; ignored.`);
+      if (!failed) diagnostics.push(`Line ${row.line}: tool has no user-message root; ignored.`);
       continue;
     }
     const name = row.name || 'unknown';
+    let tool = turn.analysis.tools.find(t => t.name === name);
+    if (!tool) {
+      tool = { name, count: 0 };
+      turn.analysis.tools.push(tool);
+    }
+    tool.durationMs = (tool.durationMs ?? 0) + row.dur;
+    if (failed) {
+      // Failed calls still cost a model round; they are counted separately and never as edits.
+      tool.failed = (tool.failed ?? 0) + 1;
+      turn.analysis.failedToolCalls = (turn.analysis.failedToolCalls ?? 0) + 1;
+      continue;
+    }
     turn.analysis.toolCalls++;
-    const tool = turn.analysis.tools.find(t => t.name === name);
-    if (tool) tool.count++; else turn.analysis.tools.push({ name, count: 1 });
+    tool.count++;
     const impact = toolEditImpact(name, row.attrs.args);
     diagnostics.push(...impact.diagnostics.map(d => `Line ${row.line}: ${d}`));
     for (const file of impact.files) {

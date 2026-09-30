@@ -38,6 +38,7 @@
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
+| `aiEffortTracker.mcpServer.enabled` | `true` | Offer the read-only usage-insights MCP server to Copilot |
 
 ## Branch changes and tracked time
 
@@ -79,7 +80,11 @@ Recovery copies live beside the main store:
 
 **After upgrading, reload every VS Code window running the extension.** Older
 extension hosts do not obey the new locking protocol and can still overwrite the
-shared file. These safeguards cover cooperating processes on a local filesystem,
+shared file. Since 0.22.0 every save stamps the store; when a save finds the stamp
+missing (an older window replaced the whole file from its stale copy), the dropped
+branches, work items, ledger rows and keys are restored, automatic counters keep the
+larger value, and a warning asks you to reload all windows. Deletions made by such
+an older window are not trusted. These safeguards cover cooperating processes on a local filesystem,
 not network/cloud-sync storage or arbitrary external file edits. File contents are
 fsynced; Windows does not support the directory fsync used on other platforms.
 The fix cannot reconstruct history already overwritten before recovery copies
@@ -125,10 +130,16 @@ extension-host restart is isolated from previous requests.
   Disabling it restores the export-folder mode or one legacy estimator.
 - New user turns observed while the extension is running are tracked automatically.
   The branch is captured when the turn is first observed and retained through later
-  rounds and restarts. A branch transition between polls is ambiguous; those turns
-  are parked under `unknown` rather than silently assigned to the wrong work item.
-- Existing, unsynced history is **not** assigned to the currently checked-out
-  branch automatically. Run **AI Effort Tracker: Import Copilot Debug Session**
+  rounds and restarts. When the branch changed between polls, the git reflog
+  decides which branch was checked out at the turn's start; if that is unknowable
+  (detached HEAD, a switch within two seconds, no reflog), the turn is parked under
+  `unknown` rather than silently assigned to the wrong work item.
+- Turns from the last **7 days** that are missing from the store (window reloaded
+  mid-chat, crash, or data dropped by an older window) are recovered on start and
+  attributed the same way via the reflog. Each recovery is logged in
+  **AI Effort Tracker — Debug Usage**. A captured row you deleted in the Ledger can
+  reappear this way while its log still exists.
+- Older history is **not** assigned automatically. Run **AI Effort Tracker: Import Copilot Debug Session**
   (also in the Ledger) and explicitly select the chat and branch. Repeat imports
   update the same entries; they do not rewrite existing attribution.
 - Ledger drill-down shows token counts and successful, measurable tool edits,
@@ -137,13 +148,20 @@ extension-host restart is isolated from previous requests.
   Terminal scripts, external changes, failed tools, or tools without before/after
   data cannot be treated as measured changes.
 
-Only compact request identities, charges, token counts, file paths and edit counts
-are saved in the effort store. Prompts, source content, tool arguments and results
-are discarded after parsing; the system-prompt and tool-definition files are not
-read. The live scanner retains metadata for at most 200 recent sessions and 5,000
-turn bindings, reads at most 16 MiB per log and 64 MiB / 200 log files per session,
-and skips oversized sessions with a message
-in **AI Effort Tracker — Debug Usage**. It never deletes Copilot's own logs. Older
+Only compact request identities, charges, token counts, timing, model, agent name,
+reasoning effort, file paths and edit counts are saved in the effort store. Prompts,
+source content, tool arguments and results are discarded after parsing; the
+system-prompt file is not read. Tool-definition files (`tools_N.json`) are reduced
+to a content-free fingerprint (MCP tool names, counts and definition sizes;
+descriptions and schemas are discarded), and `models.json` to per-model token
+prices. The live scanner retains metadata for at most 200 recent sessions and 5,000
+turn bindings, reads at most 256 MiB per log and 512 MiB / 200 log files per session.
+Sessions larger than 16 MiB are re-read only after a minute without new log writes
+or at most every five minutes, so long chats do not stall the editor. Oversized
+sessions are skipped with one message per log state
+in **AI Effort Tracker — Debug Usage**. Copilot itself may cut the start of very large
+logs; calls whose user turn was cut off cannot be attributed and are reported as
+warnings. It never deletes Copilot's own logs. Older
 sessions remain available for explicit import; compact ledger history is retained.
 
 Capture requires logs to exist locally in this window's workspace storage. Missing
@@ -155,6 +173,50 @@ Existing manual entries are preserved. Older automatic/imported entries are
 reconciled only when request identities establish an overlap; unrelated history is
 never globally deleted. Old entries without usable identities may need manual
 review before importing overlapping history.
+
+## Usage optimization insights and MCP server
+
+The dashboard's **💡 Optimize** tab and the built-in MCP server analyse the recorded
+debug-log usage to show where credits go and how to use fewer of them:
+
+- credits, calls, tokens and prompt-cache hit rate by model, agent, reasoning
+  effort and subagents; recent chat sessions with their context size;
+- prompt-cache misses by cause — new chat/subagent (expected), **model switch**
+  mid-chat, **pause over 5 minutes**, **tools changed** mid-chat, other — with
+  the avoidable extra cost;
+- enabled tools per source (built-in or MCP server) vs. tools actually used,
+  duplicate MCP servers, `tool_search` rounds and failing tools;
+- ranked findings with an estimated number of credits at stake, e.g. read-only or
+  question turns that ran on a premium model, chats that grew past 100K tokens,
+  mostly high reasoning effort.
+
+Savings are **estimates**: the recorded charge is scaled by Copilot's list prices
+(captured from `models.json`) for the alternative, so discounts that applied are
+kept. Different models use different token counts, so model comparisons are a
+starting point, not a quality judgement. Usage captured before 0.22 has no timing,
+effort or tool-set details until its debug log is re-read (automatic on restart
+while the log still exists).
+
+### Ask an AI (MCP)
+
+The extension registers the read-only MCP server **AI Effort Tracker usage insights**
+(VS Code 1.101+). In Copilot agent mode, enable it in the tool picker and ask, e.g.
+*"Use the AI Effort Tracker usage insights to tell me how I can use fewer credits"*
+or *"Analyse my usage for work item 1987"*. Tools:
+
+| Tool | Returns |
+|------|---------|
+| `usage_overview` | Totals by model/agent/effort, cache misses by cause, tool sources |
+| `optimization_findings` | Ranked recommendations with evidence and credits at stake |
+| `list_work_items` | Credits per work item, to choose a scope |
+| `list_sessions` | Recent chat sessions with models, context size, avoidable cache misses |
+| `session_detail` | Per-turn breakdown of one chat; `includePrompts` adds short prompt excerpts |
+
+All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
+`sessionId` filters. The server only reads the tracker's store. Prompt excerpts
+(`includePrompts`, 50–1000 characters) are read on demand from Copilot's own local
+debug logs while they exist; they are returned to the asking model and are never
+stored by the tracker. Disable the server with `aiEffortTracker.mcpServer.enabled`.
 
 ## Development
 

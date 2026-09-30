@@ -899,11 +899,58 @@ function showTab(name){
   else if(name==='ghview'){document.getElementById('tab-ghview').classList.add('active');renderGhMetrics();}
   else if(name==='projects'){document.getElementById('tab-projects').classList.add('active');renderProjectsView();}
   else if(name==='ledger'){document.getElementById('tab-ledger').classList.add('active');renderLedger();}
+  else if(name==='optimize'){document.getElementById('tab-optimize').classList.add('active');requestOptimize();}
   else{document.getElementById('dtab').classList.add('active');}
 }
 
+var OPT=null,optDays=30,optWi='',optLoading=false;
+function requestOptimize(){optLoading=true;renderOptimize();vscode.postMessage({type:'optimize',days:optDays,workItemId:optWi||undefined});}
+function n2(v){return(Math.round((v||0)*100)/100).toLocaleString();}
+function sevBadge(s){var c=s==='high'?'bd':s==='medium'?'ba':'bh';return'<span class="badge '+c+'">'+esc(s)+'</span>';}
+function optTable(head,rows,empty){
+  return'<table><thead><tr>'+head.map(function(h){return'<th>'+esc(h)+'</th>';}).join('')+'</tr></thead><tbody>'
+    +(rows.length?rows.join(''):'<tr><td colspan="'+head.length+'" style="color:var(--vscode-descriptionForeground)">'+esc(empty)+'</td></tr>')+'</tbody></table>';
+}
+function renderOptimize(){
+  var el=document.getElementById('optimize');
+  var wiOpts=['<option value="">All work items</option>'].concat((WI||[]).map(function(w){
+    return'<option value="'+esc(w.workItemId)+'"'+(w.workItemId===optWi?' selected':'')+'>'+esc('#'+w.workItemId+(w.title?' \\u2013 '+w.title:''))+'</option>';
+  })).join('');
+  var ctl='<div class="rng">'+[7,30,90].map(function(d){return'<button class="dtab'+(d===optDays?' active':'')+'" data-action="optDays" data-value="'+d+'">'+d+' days</button>';}).join('')
+    +'<select id="optWi" style="margin-left:8px;background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px">'+wiOpts+'</select>'
+    +'<button class="dtab" data-action="optRefresh" style="margin-left:8px">\\u21bb Refresh</button></div>';
+  var tip='<p style="margin-bottom:16px;font-size:.85em;color:var(--vscode-descriptionForeground)">Based on Copilot debug logs (models, tokens, cache, tools). Savings are list-price <strong>estimates</strong>. Ask Copilot in agent mode, e.g. <em>\\u201cUse the AI Effort Tracker usage insights to tell me how to use fewer credits\\u201d</em> \\u2013 the <strong>AI Effort Tracker usage insights</strong> MCP server gives it this data.</p>';
+  if(!OPT){el.innerHTML=ctl+tip+'<p>'+(optLoading?'Analysing\\u2026':'No data yet.')+'</p>';bindOptWi();return;}
+  if(OPT.error){el.innerHTML=ctl+tip+'<p style="color:var(--deleted)">'+esc(OPT.error)+'</p>';bindOptWi();return;}
+  var o=OPT.overview,t=o.totals,f=OPT.findings;
+  var waste=Object.keys(o.cacheBreaks).reduce(function(n,k){return n+(o.cacheBreaks[k].estimatedWaste||0);},0);
+  var stats='<div class="sg">'+sc('Credits',n2(t.credits),'var(--cost)')+sc('Model calls',t.calls.toLocaleString())+sc('Cache hit',t.cacheHitPct+'%')+sc('Credits / turn',n2(t.creditsPerTurn))
+    +sc('Sessions',String(t.sessions))+sc('Turns',String(t.turns))+sc('Avoidable cache cost',n2(waste),'var(--deleted)')+sc('Subagent credits',n2(o.subagents.credits))+'</div>';
+  var fh=f.length?f.map(function(x){
+    return'<div class="card" style="margin-bottom:12px"><div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline"><strong>'+sevBadge(x.severity)+' '+esc(x.title)+'</strong>'
+      +(x.creditsAtStake!=null?'<span style="white-space:nowrap;color:var(--cost)">\\u2248 '+n2(x.creditsAtStake)+' credits</span>':'')+'</div>'
+      +'<p style="margin-top:8px">'+esc(x.detail)+'</p><p style="margin-top:6px"><strong>Try:</strong> '+esc(x.recommendation)+'</p></div>';
+  }).join(''):'<div class="card" style="margin-bottom:12px">No optimization opportunities detected for this period.</div>';
+  var models=Object.keys(o.byModel).map(function(m){var b=o.byModel[m];return'<tr><td>'+esc(m)+'</td><td>'+b.calls+'</td><td>'+n2(b.credits)+'</td><td>'+n2(b.creditsPerCall)+'</td><td>'+b.cacheHitPct+'%</td></tr>';});
+  var causes={'new-context':'New chat / subagent (expected)','model-switch':'Model switch','idle-expiry':'Pause > 5 min','toolset-change':'Tools changed','other':'Other (summarization, instructions\\u2026)'};
+  var cb=Object.keys(o.cacheBreaks).map(function(k){var b=o.cacheBreaks[k];return'<tr><td>'+esc(causes[k]||k)+'</td><td>'+b.count+'</td><td>'+n2(b.credits)+'</td><td>'+n2(b.estimatedWaste)+'</td></tr>';});
+  var srv=o.tools.servers.map(function(s){return'<tr><td>'+esc(s.server)+'</td><td>'+s.toolsOffered+'</td><td>'+s.offeredInPct+'%</td><td>'+s.usedTools+'</td><td>'+s.calls+'</td><td>'+(s.failed?'<span class="badge bd">'+s.failed+'</span>':'0')+'</td></tr>';});
+  var tools=o.tools.topTools.slice(0,12).map(function(x){return'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.server)+'</td><td>'+x.calls+'</td><td>'+(x.failed||0)+'</td></tr>';});
+  var ses=(OPT.sessions||[]).map(function(s){return'<tr><td title="'+esc(s.sessionId)+'">'+esc(s.end.slice(0,16).replace('T',' '))+'</td><td>'+s.turns+'</td><td>'+n2(s.credits)+'</td><td>'+esc(s.models.join(', '))+'</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>'+s.avoidableCacheBreaks+'</td><td>'+esc((s.workItems.length?'#'+s.workItems.join(', #'):'')||s.branches.join(', '))+'</td></tr>';});
+  el.innerHTML=ctl+tip+stats+'<h3 style="margin:8px 0 12px">Findings</h3>'+fh
+    +'<div class="cr"><div class="card"><h3>By model</h3>'+optTable(['Model','Calls','Credits','Per call','Cache hit'],models,'No calls')+'</div>'
+    +'<div class="card"><h3>Prompt-cache misses</h3>'+optTable(['Cause','Count','Credits','Avoidable \\u2248'],cb,'None')+'</div></div>'
+    +'<div class="cr"><div class="card"><h3>Tool sources (max '+o.tools.maxToolsOffered+' tools offered, '+o.tools.toolSearchCalls+' tool searches)</h3>'+optTable(['Server','Offered','In % of calls','Tools used','Calls','Failed'],srv,'No tool data yet')+'</div>'
+    +'<div class="card"><h3>Most used tools</h3>'+optTable(['Tool','Source','Calls','Failed'],tools,'No tool calls')+'</div></div>'
+    +'<div class="card"><h3>Recent chat sessions</h3>'+optTable(['Last activity','Turns','Credits','Models','Max context','Avoidable cache misses','Work item / branch'],ses,'No sessions')+'</div>'
+    +'<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">'+esc(o.dataCoverage.note)+' Timing captured for '+o.dataCoverage.withTimingPct+'% of calls.</p>';
+  bindOptWi();
+}
+function bindOptWi(){var s=document.getElementById('optWi');if(s)s.addEventListener('change',function(){optWi=this.value;requestOptimize();});}
+
 window.addEventListener('message',function(e){
   var msg=e.data;
+  if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
   if(msg.type==='update'){
     allData=msg.summaries;currentBranch=msg.currentBranch;
     if(msg.ghMetrics!==undefined)ghMetrics=msg.ghMetrics;
@@ -935,6 +982,7 @@ document.getElementById('tab-focus').addEventListener('click',function(){showTab
 document.getElementById('tab-ghview').addEventListener('click',function(){showTab('ghview');});
 document.getElementById('tab-projects').addEventListener('click',function(){showTab('projects');});
 document.getElementById('tab-ledger').addEventListener('click',function(){showTab('ledger');});
+document.getElementById('tab-optimize').addEventListener('click',function(){showTab('optimize');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -947,6 +995,8 @@ document.addEventListener('click',function(e){
   else if(a==='tab')showTab(v);
   else if(a==='ds')showDS(v,t);
   else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
+  else if(a==='optDays'){optDays=parseInt(v,10)||30;requestOptimize();}
+  else if(a==='optRefresh')requestOptimize();
   else if(a==='proj'){selProj=v;selWi=null;projView='project';renderProjectsView();}
   else if(a==='wi'){selWi=v;projView='workitem';renderProjectsView();}
   else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
@@ -987,6 +1037,7 @@ document.addEventListener('click',function(e){
     '  <button class="tab" id="tab-focus">\uD83C\uDFAF Focus</button>',
     '  <button class="tab" id="tab-projects">\uD83D\uDCC1 Projects</button>',
     '  <button class="tab" id="tab-ledger">\uD83E\uDDFE Ledger</button>',
+    '  <button class="tab" id="tab-optimize">\uD83D\uDCA1 Optimize</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
@@ -995,6 +1046,7 @@ document.addEventListener('click',function(e){
     '<div id="focus" class="view"></div>',
     '<div id="projects" class="view"></div>',
     '<div id="ledger" class="view"></div>',
+    '<div id="optimize" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,
