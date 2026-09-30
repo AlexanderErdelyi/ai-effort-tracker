@@ -1010,6 +1010,8 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         item.tooltip = `${r.path}\n${r.reviewed} of ${r.total} changed lines reviewed (${R.coveragePct(r.reviewed, r.total)} %)${r.issueLines ? `\n${plural(r.issueLines, 'flagged line')}` : ''}`
           + `\n${open ? 'Expand for the blocks still to review.' : 'Expand for the reviewed blocks.'} Click to open.`;
         item.resourceUri = vscode.Uri.file(path.join(r.root, r.path));
+        // Expandable rows with a resourceUri get the folder icon unless told they are files.
+        item.iconPath = vscode.ThemeIcon.File;
         item.checkboxState = checkbox(open, open ? `Mark the ${plural(r.total - r.reviewed, 'line')} left as reviewed` : 'Remove the review marks of this file');
         item.contextValue = `aetReviewFile-${node.section}`;
         const first = blocks[0];
