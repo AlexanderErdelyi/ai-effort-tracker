@@ -16,6 +16,8 @@ import {
   type GeneratedValue
 } from '../util/rates';
 import type { TurnAnalysis } from '../util/debugExport';
+import { atomicWrite, readStore, retainPrevious, StoreBusyError, syncDirectory, withStoreLock } from './persistence';
+import { mergeStores } from './mergeStore';
 
 export interface LineStats {
   added: number;
@@ -1649,8 +1651,7 @@ const COST_PER_AI_LINE_USD = 0.00003;
 
 export class Database {
   private filePath: string;
-  private tmpPath: string;
-  private bakPath: string;
+  private baseline: PersistedStore;
   private store: Store;
   private workItems: Record<string, WorkItem>;
   private creditLedger: LedgerEntry[];
@@ -1660,17 +1661,25 @@ export class Database {
   private timeEntries: TimeEntry[];
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
+  private refreshTimer: NodeJS.Timeout | undefined;
   private dirty = false;
-  private writing = false;
+  private saveErrorReported = false;
+  private pendingFlush: Promise<void> | undefined;
 
   constructor(storagePath: string) {
     fs.mkdirSync(storagePath, { recursive: true });
     this.filePath = path.join(storagePath, 'effort-tracker.json');
-    this.tmpPath = this.filePath + '.tmp';
-    this.bakPath = this.filePath + '.bak';
-    // Clean up any stray temp file left behind by a crashed/interrupted write.
-    try { fs.unlinkSync(this.tmpPath); } catch { /* nothing to clean */ }
-    const loaded = this.load();
+    let loaded: PersistedStore;
+    try {
+      loaded = this.load();
+    } catch (error) {
+      console.error('AI Effort Tracker could not load tracking data', error);
+      void vscode.window.showWarningMessage(
+        `AI Effort Tracker could not load tracking data. Tracking has not started with an empty store. ${String(error)}`
+      );
+      throw error;
+    }
+    this.baseline = JSON.parse(JSON.stringify(loaded));
     this.schemaVersion = loaded.schemaVersion;
     this.store = loaded.branches;
     this.workItems = loaded.workItems;
@@ -1679,6 +1688,12 @@ export class Database {
     this.manualEffort = loaded.manualEffort;
     this.reassignments = loaded.reassignments;
     this.timeEntries = loaded.timeEntries;
+    // Idle windows still need current totals for their next dashboard render.
+    // Dirty windows use their normal save, which also rebases from disk.
+    this.refreshTimer = setInterval(() => {
+      if (!this.dirty && fs.existsSync(this.filePath)) void this.flushAsync(true);
+    }, 2000);
+    this.refreshTimer.unref();
   }
 
   /** Build the on-disk envelope from the in-memory state. */
@@ -1696,84 +1711,66 @@ export class Database {
     return JSON.stringify(envelope, null, 2);
   }
 
+  private decode(raw: string): PersistedStore {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Invalid effort store object');
+    }
+    if ('schemaVersion' in parsed && !isEnvelope(parsed)) throw new Error('Invalid effort store envelope');
+    const branches = isEnvelope(parsed) ? parsed.branches : parsed;
+    for (const branch of Object.values(branches)) {
+      if (!branch || typeof branch !== 'object' || !(branch as BranchData).time ||
+          typeof (branch as BranchData).time !== 'object') {
+        throw new Error('Invalid effort branch');
+      }
+    }
+    return migrateStore(parsed);
+  }
+
+  /** Migrations/recovery are serialized too, never writes from an unlocked load. */
   private load(): PersistedStore {
-    let raw: string;
-    try {
-      raw = fs.readFileSync(this.filePath, 'utf8');
-    } catch {
-      // Main file missing (first run, or lost). Recover from backup if present,
-      // otherwise start fresh — no warning needed for a normal first run.
-      return this.loadFromBackup() ?? migrateStore({});
-    }
-    try {
-      // migrateStore upgrades legacy flat files to the current envelope in place.
-      const store = migrateStore(JSON.parse(raw));
-      // Successful load — refresh the known-good backup.
-      this.writeBackup(raw);
-      return store;
-    } catch {
-      return this.recoverFromCorruptMain();
-    }
+    return withStoreLock(this.filePath, 5000, () => {
+      const loaded = this.readLatest();
+      const serialized = JSON.stringify(loaded.value, null, 2);
+      // Persist migrations once, including generated legacy ledger IDs. Reading
+      // an already-current store must not refresh backups or rotate history.
+      if (loaded.raw !== undefined && JSON.stringify(JSON.parse(loaded.raw)) !== JSON.stringify(loaded.value)) {
+        retainPrevious(this.filePath, loaded.raw);
+        atomicWrite(this.filePath, serialized);
+        syncDirectory(path.dirname(this.filePath));
+      }
+      return loaded.value;
+    });
   }
 
-  /** Attempt to read, parse and migrate the backup file. Returns undefined if unusable. */
-  private loadFromBackup(): PersistedStore | undefined {
-    try {
-      return migrateStore(JSON.parse(fs.readFileSync(this.bakPath, 'utf8')));
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * The main file exists but failed to parse. Try to recover from the backup;
-   * if that fails, move the corrupt file aside (never overwrite it) and start
-   * fresh. The user is warned in both cases.
-   */
-  private recoverFromCorruptMain(): PersistedStore {
-    const recovered = this.loadFromBackup();
-    if (recovered) {
-      // Promote the good backup back to the main file so future saves build on it.
+  /** Caller holds the interprocess lock. Fail closed rather than silently reset. */
+  private readLatest() {
+    const loaded = readStore(this.filePath, raw => this.decode(raw), () => migrateStore({}));
+    if (loaded.recoveredFrom) {
+      // Preserve corrupt bytes before promoting recovery. Never copy them into
+      // .bak or overwrite a healthy recovery checkpoint.
       try {
-        fs.copyFileSync(this.bakPath, this.filePath);
-      } catch { /* best effort — an upcoming save will rewrite it */ }
+        const corrupt = fs.readFileSync(this.filePath);
+        atomicWrite(this.filePath + `.corrupt-${Date.now()}-${newLedgerId()}`, corrupt.toString('utf8'));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      atomicWrite(this.filePath, loaded.raw!);
+      syncDirectory(path.dirname(this.filePath));
       void vscode.window.showWarningMessage(
-        'AI Effort Tracker: the data file was corrupt and has been recovered from the last known-good backup.'
+        `AI Effort Tracker: recovered data from "${path.basename(loaded.recoveredFrom)}". Check recent totals; the damaged file was preserved.`
       );
-      return recovered;
     }
-
-    // No usable backup — preserve the corrupt file for manual inspection.
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const corruptPath = this.filePath + '.corrupt-' + stamp;
-    let preserved = false;
-    try {
-      fs.renameSync(this.filePath, corruptPath);
-      preserved = true;
-    } catch { /* fall through to warning */ }
-    void vscode.window.showWarningMessage(
-      preserved
-        ? `AI Effort Tracker: the data file was corrupt and could not be recovered. It was saved as "${path.basename(corruptPath)}" and tracking has started fresh.`
-        : 'AI Effort Tracker: the data file was corrupt and could not be recovered. Tracking has started fresh.'
-    );
-    return migrateStore({});
+    return loaded;
   }
 
-  /** Best-effort write of the known-good backup copy. Never throws. */
-  private writeBackup(data: string): void {
-    try {
-      fs.writeFileSync(this.bakPath, data, 'utf8');
-    } catch { /* backup is best effort */ }
-  }
-
-  /**
-   * Debounced, asynchronous save. Editor events fire extremely frequently
-   * (every keystroke, cursor move, and during language-server symbol loading),
-   * so we must NEVER block the extension host thread with a synchronous write.
-   * Writes are coalesced and flushed at most once every 2s, off the hot path.
-   */
+  /** Editor events only mark dirty. The bounded commit runs once per 2s batch. */
   private save() {
     this.dirty = true;
+    this.scheduleSave();
+  }
+
+  private scheduleSave() {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = undefined;
@@ -1781,57 +1778,95 @@ export class Database {
     }, 2000);
   }
 
-  private async flushAsync(): Promise<void> {
-    if (this.writing || !this.dirty) return;
-    this.writing = true;
-    this.dirty = false;
-    const data = this.serialize();
-    let handle: fs.promises.FileHandle | undefined;
+  private async flushAsync(refresh = false): Promise<void> {
+    if (!this.dirty && !refresh) return;
     try {
-      // Atomic write: write to a temp file, fsync, then rename over the target.
-      handle = await fs.promises.open(this.tmpPath, 'w');
-      await handle.writeFile(data, 'utf8');
-      try { await handle.sync(); } catch { /* fsync unsupported — proceed */ }
-      await handle.close();
-      handle = undefined;
-      await fs.promises.rename(this.tmpPath, this.filePath);
-      // Refresh the known-good backup after a successful save.
-      await fs.promises.writeFile(this.bakPath, data, 'utf8');
-    } catch {
-      this.dirty = true; // retry on next save
-      if (handle) {
-        try { await handle.close(); } catch { /* ignore */ }
-      }
-      // Never leave a partial temp file behind.
-      try { await fs.promises.unlink(this.tmpPath); } catch { /* nothing to clean */ }
-    } finally {
-      this.writing = false;
+      this.commit(0);
+    } catch (error) {
+      this.dirty = true;
+      if (!(error instanceof StoreBusyError)) this.reportSaveError(error);
+      // Retry without requiring another keystroke. Busy windows yield instead
+      // of blocking the extension host while another process commits.
+      this.scheduleSave();
     }
   }
 
-  /** Synchronous flush — only for extension deactivation. */
+  /**
+   * Request an immediate checkpoint without blocking the calling editor event.
+   * Errors are reported/retried internally, so `void db.flush()` is safe. The
+   * Clean windows refresh from disk too. The short commit itself is synchronous;
+   * no stale snapshot or I/O continuation can overtake flushSync if shutdown
+   * happens before this callback runs.
+   */
+  flush(): Promise<void> {
+    if (this.pendingFlush) return this.pendingFlush;
+    this.pendingFlush = new Promise(resolve => {
+      setImmediate(() => {
+        this.pendingFlush = undefined;
+        if (this.saveTimer) clearTimeout(this.saveTimer);
+        this.saveTimer = undefined;
+        void this.flushAsync(!!this.refreshTimer).then(resolve);
+      });
+    });
+    return this.pendingFlush;
+  }
+
+  private reportSaveError(error: unknown): void {
+    console.error('AI Effort Tracker save failed; unsaved changes retained for retry', error);
+    if (!this.saveErrorReported) {
+      this.saveErrorReported = true;
+      void vscode.window.showWarningMessage(
+        `AI Effort Tracker could not save tracking data. Changes remain in this window and will be retried. ${String(error)}`
+      );
+    }
+  }
+
+  /**
+   * No awaited I/O between snapshot and commit: an older asynchronous rename
+   * can never overtake shutdown. Advance the baseline only AFTER atomic rename;
+   * a failed save retries the same delta, not a stale whole-store replacement.
+   */
+  private commit(waitMs: number): void {
+    withStoreLock(this.filePath, waitMs, () => {
+      const latest = this.readLatest();
+      const merged = migrateStore(mergeStores(this.baseline, JSON.parse(this.serialize()), latest.value));
+      const data = JSON.stringify(merged, null, 2);
+      if (latest.raw !== data) {
+        if (latest.raw !== undefined) retainPrevious(this.filePath, latest.raw);
+        atomicWrite(this.filePath, data);
+      }
+      this.baseline = JSON.parse(data);
+      this.schemaVersion = merged.schemaVersion;
+      this.store = merged.branches;
+      this.workItems = merged.workItems;
+      this.creditLedger = merged.creditLedger;
+      this.projects = merged.projects;
+      this.manualEffort = merged.manualEffort;
+      this.reassignments = merged.reassignments;
+      this.timeEntries = merged.timeEntries;
+      this.dirty = false;
+      this.saveErrorReported = false;
+      syncDirectory(path.dirname(this.filePath));
+    });
+  }
+
+  /** Shutdown flush. On failure callers receive an error and dirty data survives. */
   flushSync(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = undefined;
     }
     if (!this.dirty) return;
-    this.dirty = false;
-    const data = this.serialize();
     try {
-      // Atomic write: write to a temp file, fsync, then rename over the target.
-      const fd = fs.openSync(this.tmpPath, 'w');
-      try {
-        fs.writeFileSync(fd, data, 'utf8');
-        try { fs.fsyncSync(fd); } catch { /* fsync unsupported — proceed */ }
-      } finally {
-        fs.closeSync(fd);
-      }
-      fs.renameSync(this.tmpPath, this.filePath);
-      this.writeBackup(data);
-    } catch {
-      this.dirty = true; // retry on next save
-      try { fs.unlinkSync(this.tmpPath); } catch { /* nothing to clean */ }
+      this.commit(5000);
+    } catch (error) {
+      this.dirty = true;
+      this.reportSaveError(error);
+      throw error;
     }
   }
 

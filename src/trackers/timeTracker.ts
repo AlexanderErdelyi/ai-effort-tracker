@@ -124,6 +124,11 @@ export class TimeTracker implements vscode.Disposable {
   }
 
   setBranch(branch: string) {
+    if (branch === this.currentBranch) return;
+    // Settle elapsed time and the focus streak against the branch being left.
+    this.tick();
+    this.endFocusSession();
+    void this.db.flush();
     this.currentBranch = branch;
   }
 
