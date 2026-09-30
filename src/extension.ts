@@ -20,6 +20,8 @@ import type { TrackingMode } from './trackers/timeTracker';
 import { StatusBarManager } from './ui/statusBar';
 import { renderDashboardHtml } from './ui/dashboard';
 import { GitHubService, BillingUsage } from './services/githubService';
+import { registerUsageInsightsMcp } from './mcp/provider';
+import { listSessions, optimizationFindings, usageOverview, type InsightFilter } from './analysis/usageInsights';
 
 let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
@@ -365,6 +367,9 @@ export function activate(context: vscode.ExtensionContext) {
     chatUsageTracker.start(context);
   }
   context.subscriptions.push(debugLogUsageTracker, creditImportTracker);
+  try { registerUsageInsightsMcp(context); } catch (error) {
+    console.error('AI Effort Tracker: MCP server registration failed', error);
+  }
 }
 
 export function deactivate() {
@@ -395,6 +400,10 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), db.getAllWorkItemSummaries(), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
+    if (m?.type === 'optimize') {
+      dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId) });
+      return;
+    }
     if (m?.type === 'cmd' && m.value) {
       await vscode.commands.executeCommand('aiEffortTracker.' + m.value, m.arg);
       refreshDashboard();
@@ -2226,6 +2235,24 @@ async function assignWorkItemToProject() {
   const name = sel ? (db.getProject(sel)?.name ?? sel) : 'no project';
   vscode.window.showInformationMessage(`Work item #${wi} assigned to ${name}.`);
   refreshDashboard();
+}
+
+/** Usage-optimization data for the dashboard's Optimize tab (same engine as the MCP server). */
+function optimizePayload(days: unknown, workItemId: unknown) {
+  try {
+    const filter: InsightFilter = {
+      days: typeof days === 'number' && days > 0 ? Math.min(days, 365) : 30,
+      ...(typeof workItemId === 'string' && workItemId ? { workItemId } : {})
+    };
+    const data = db.getUsageData();
+    return {
+      overview: usageOverview(data, filter),
+      findings: optimizationFindings(data, filter),
+      sessions: listSessions(data, filter, 15)
+    };
+  } catch (error) {
+    return { error: `Cannot analyse usage: ${String(error)}` };
+  }
 }
 
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */

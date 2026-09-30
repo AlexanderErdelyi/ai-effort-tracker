@@ -3,6 +3,7 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import { Database, normalizeRepoId, extractWorkItemId } from '../store/database';
 import { TimeTracker } from './timeTracker';
+import { BranchSwitch, parseReflog } from '../util/reflog';
 
 /** Real net line change of a branch vs its base (issue: churn vs net). */
 export interface NetLineChange {
@@ -61,6 +62,14 @@ export class GitTracker implements vscode.Disposable {
         resolve(err ? undefined : stdout.trim());
       });
     });
+  }
+
+  /** HEAD branch switches from the reflog (oldest first); empty when unavailable. */
+  static async getBranchSwitches(): Promise<BranchSwitch[]> {
+    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!wsFolder) return [];
+    const out = await GitTracker.exec('git reflog show --date=unix --format=%gd%x09%gs -n 5000 HEAD', wsFolder);
+    return out ? parseReflog(out) : [];
   }
 
   static extractWorkItemId(branch: string): string | undefined {

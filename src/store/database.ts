@@ -17,7 +17,8 @@ import {
 } from '../util/rates';
 import type { TurnAnalysis } from '../util/debugExport';
 import { atomicWrite, readStore, retainPrevious, StoreBusyError, syncDirectory, withStoreLock } from './persistence';
-import { mergeStores } from './mergeStore';
+import { isLegacyOverwrite, mergeStores, STORE_WRITER } from './mergeStore';
+import { MAX_TOOLSETS, type ModelPrice, type ToolsetInfo } from '../util/modelCatalog';
 
 export interface LineStats {
   added: number;
@@ -176,6 +177,26 @@ export interface DebugCreditRequest {
   inputTokens: number;
   outputTokens: number;
   cachedTokens?: number;
+  /** Optimization telemetry (optional; absent on rows captured before 0.22). */
+  ts?: number;
+  durationMs?: number;
+  ttftMs?: number;
+  agent?: string;
+  effort?: string;
+  maxTokens?: number;
+  /** {@link ToolsetInfo} id offered to this call. */
+  toolset?: string;
+  subagent?: boolean;
+}
+
+/** Read-only inputs for the usage-insights analysis. */
+export interface UsageData {
+  creditLedger: LedgerEntry[];
+  toolsets: Record<string, ToolsetInfo>;
+  modelPrices: Record<string, ModelPrice>;
+  branches: Store;
+  workItems: Record<string, WorkItem>;
+  projects: Record<string, Project>;
 }
 
 /**
@@ -693,6 +714,12 @@ export interface PersistedStore {
    * schema v10.
    */
   timeEntries: TimeEntry[];
+  /** Content-free fingerprints of tool sets offered to Copilot, keyed by hash (usage insights). */
+  toolsets: Record<string, ToolsetInfo>;
+  /** Latest captured Copilot token prices per model (usage insights; estimates only). */
+  modelPrices: Record<string, ModelPrice>;
+  /** Merging-writer stamp; its absence after we wrote it reveals an older window's overwrite. */
+  writer?: string;
 }
 
 /** Aggregated effort for a single work item, rolled up across all its branches. */
@@ -1151,7 +1178,12 @@ export function migrateStore(parsed: unknown): PersistedStore {
   let manualEffort: ManualEffortEntry[];
   let reassignments: ReassignmentRecord[];
   let timeEntries: TimeEntry[];
+  let toolsets: Record<string, ToolsetInfo> = {};
+  let modelPrices: Record<string, ModelPrice> = {};
   if (isEnvelope(parsed)) {
+    const plain = (v: unknown) => v && typeof v === 'object' && !Array.isArray(v);
+    if (plain((parsed as PersistedStore).toolsets)) toolsets = (parsed as PersistedStore).toolsets;
+    if (plain((parsed as PersistedStore).modelPrices)) modelPrices = (parsed as PersistedStore).modelPrices;
     branches = (parsed.branches ?? {}) as Store;
     workItems = (parsed.workItems ?? {}) as Record<string, WorkItem>;
     const existing = (parsed as PersistedStore).creditLedger;
@@ -1187,6 +1219,8 @@ export function migrateStore(parsed: unknown): PersistedStore {
   // their legacy credit log is attributed to the resolved/holding work item.
   assignUnmappedBranches(branches, workItems, extractWorkItemId);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
+  const writer = isEnvelope(parsed) && typeof (parsed as PersistedStore).writer === 'string'
+    ? (parsed as PersistedStore).writer : undefined;
   return {
     schemaVersion: CURRENT_SCHEMA_VERSION,
     branches,
@@ -1195,7 +1229,10 @@ export function migrateStore(parsed: unknown): PersistedStore {
     projects,
     manualEffort,
     reassignments,
-    timeEntries
+    timeEntries,
+    toolsets,
+    modelPrices,
+    ...(writer ? { writer } : {})
   };
 }
 
@@ -1659,6 +1696,8 @@ export class Database {
   private manualEffort: ManualEffortEntry[];
   private reassignments: ReassignmentRecord[];
   private timeEntries: TimeEntry[];
+  private toolsets: Record<string, ToolsetInfo>;
+  private modelPrices: Record<string, ModelPrice>;
   private schemaVersion: number;
   private saveTimer: NodeJS.Timeout | undefined;
   private refreshTimer: NodeJS.Timeout | undefined;
@@ -1688,6 +1727,8 @@ export class Database {
     this.manualEffort = loaded.manualEffort;
     this.reassignments = loaded.reassignments;
     this.timeEntries = loaded.timeEntries;
+    this.toolsets = loaded.toolsets;
+    this.modelPrices = loaded.modelPrices;
     // Idle windows still need current totals for their next dashboard render.
     // Dirty windows use their normal save, which also rebases from disk.
     this.refreshTimer = setInterval(() => {
@@ -1706,7 +1747,10 @@ export class Database {
       projects: this.projects,
       manualEffort: this.manualEffort,
       reassignments: this.reassignments,
-      timeEntries: this.timeEntries
+      timeEntries: this.timeEntries,
+      toolsets: this.toolsets,
+      modelPrices: this.modelPrices,
+      writer: STORE_WRITER
     };
     return JSON.stringify(envelope, null, 2);
   }
@@ -1811,6 +1855,18 @@ export class Database {
     return this.pendingFlush;
   }
 
+  private legacyWriterReported = false;
+
+  private reportLegacyWriter(): void {
+    console.warn('AI Effort Tracker: an older extension version overwrote the store; restored dropped data');
+    if (this.legacyWriterReported) return;
+    this.legacyWriterReported = true;
+    void vscode.window.showWarningMessage(
+      'AI Effort Tracker: another VS Code window runs an older version of this extension and overwrote tracking data. ' +
+      'The dropped data was restored, but please reload every VS Code window (Developer: Reload Window) so all use the current version.'
+    );
+  }
+
   private reportSaveError(error: unknown): void {
     console.error('AI Effort Tracker save failed; unsaved changes retained for retry', error);
     if (!this.saveErrorReported) {
@@ -1829,12 +1885,15 @@ export class Database {
   private commit(waitMs: number): void {
     withStoreLock(this.filePath, waitMs, () => {
       const latest = this.readLatest();
+      const legacy = isLegacyOverwrite(this.baseline, latest.value);
       const merged = migrateStore(mergeStores(this.baseline, JSON.parse(this.serialize()), latest.value));
+      merged.writer = STORE_WRITER;
       const data = JSON.stringify(merged, null, 2);
       if (latest.raw !== data) {
         if (latest.raw !== undefined) retainPrevious(this.filePath, latest.raw);
         atomicWrite(this.filePath, data);
       }
+      if (legacy) this.reportLegacyWriter();
       this.baseline = JSON.parse(data);
       this.schemaVersion = merged.schemaVersion;
       this.store = merged.branches;
@@ -1844,6 +1903,8 @@ export class Database {
       this.manualEffort = merged.manualEffort;
       this.reassignments = merged.reassignments;
       this.timeEntries = merged.timeEntries;
+      this.toolsets = merged.toolsets;
+      this.modelPrices = merged.modelPrices;
       this.dirty = false;
       this.saveErrorReported = false;
       syncDirectory(path.dirname(this.filePath));
@@ -2315,6 +2376,43 @@ export class Database {
   hasDebugTurn(sessionId: string, turnId: string): boolean {
     return this.creditLedger.some(e => e.debugUsage?.sessionId === sessionId &&
       e.debugUsage.turnId === turnId);
+  }
+
+  /** Register a tool-set fingerprint; bounded to the most recently seen {@link MAX_TOOLSETS}. */
+  recordToolset(info: ToolsetInfo): void {
+    const existing = this.toolsets[info.id];
+    if (existing) {
+      if (info.lastSeen <= existing.lastSeen && info.firstSeen >= existing.firstSeen) return;
+      existing.firstSeen = Math.min(existing.firstSeen, info.firstSeen);
+      existing.lastSeen = Math.max(existing.lastSeen, info.lastSeen);
+    } else {
+      this.toolsets[info.id] = info;
+      const ids = Object.keys(this.toolsets).sort((a, b) => this.toolsets[b].lastSeen - this.toolsets[a].lastSeen);
+      for (const id of ids.slice(MAX_TOOLSETS)) delete this.toolsets[id];
+    }
+    this.save();
+  }
+
+  /** Replace per-model prices with a newer capture; older captures never overwrite newer ones. */
+  recordModelPrices(prices: Record<string, ModelPrice>): void {
+    let changed = false;
+    for (const [id, price] of Object.entries(prices)) {
+      const prior = this.modelPrices[id];
+      if (prior && prior.capturedAt >= price.capturedAt) continue;
+      if (prior && JSON.stringify({ ...prior, capturedAt: 0 }) === JSON.stringify({ ...price, capturedAt: 0 })) {
+        // Unchanged prices: avoid rewriting the store for a timestamp only.
+        continue;
+      }
+      this.modelPrices[id] = price;
+      changed = true;
+    }
+    if (changed) this.save();
+  }
+
+  /** Read-only snapshot for usage analysis. */
+  getUsageData(): UsageData {
+    return { creditLedger: this.creditLedger, toolsets: this.toolsets, modelPrices: this.modelPrices,
+      branches: this.store, workItems: this.workItems, projects: this.projects };
   }
 
   /**

@@ -140,8 +140,64 @@ function alignCredits(base: PersistedStore, local: PersistedStore, disk: Persist
   }
 }
 
+/**
+ * Stamp written by every merging writer. Versions before 0.21.1 replaced the
+ * whole file from a stale in-memory copy and 0.21.1 dropped unknown top-level
+ * keys, so a missing stamp after we wrote one means an older window overwrote
+ * the store.
+ */
+export const STORE_WRITER = 'ai-effort-tracker/merge-v2';
+
+export function isLegacyOverwrite(baseline: PersistedStore, latest: PersistedStore): boolean {
+  return baseline.writer === STORE_WRITER && latest.writer !== STORE_WRITER;
+}
+
+/**
+ * Undo a stale whole-file overwrite: restore entities, rows, files and keys the
+ * older writer dropped, keep the larger automatic counter, and prefer our last
+ * committed scalars (the older writer mostly rewrote stale values). Anything the
+ * older window genuinely added is kept. Its deletions are not trusted.
+ */
+export function healLegacyOverwrite(base: PersistedStore, disk: PersistedStore): PersistedStore {
+  return heal(base, disk, []);
+}
+
+function heal(base: any, disk: any, keys: string[]): any {
+  if (base === undefined) return disk;
+  if (disk === undefined || disk === null) return copy(base);
+  if (typeof base === 'number' && typeof disk === 'number') return additive(keys) ? Math.max(base, disk) : base;
+  if (Array.isArray(base) && Array.isArray(disk)) {
+    if (keys[0] === 'branches' && keys[2] === 'daily') {
+      return Array.from({ length: Math.max(base.length, disk.length) }, (_, i) => heal(base[i], disk[i], [...keys, String(i)]));
+    }
+    const idKey = keys.length === 1 && rowArrays.has(keys[0]) ? 'id'
+      : keys[keys.length - 1] === 'requests' && keys.includes('debugUsage') ? 'spanId' : undefined;
+    if (idKey) {
+      const before = new Map(base.map((row: any) => [row?.[idKey], row]));
+      const seen = new Set<string>();
+      const rows = disk.map((row: any) => {
+        seen.add(row?.[idKey]);
+        return heal(before.get(row?.[idKey]), row, [...keys, String(row?.[idKey])]);
+      });
+      return [...rows, ...base.filter((row: any) => !seen.has(row?.[idKey])).map(copy)];
+    }
+    const missing = base.filter(v => !disk.some(d => isDeepStrictEqual(d, v)));
+    const merged = [...disk, ...missing.map(copy)];
+    return keys[keys.length - 1] === 'focusSessions' ? merged.slice(-500) : merged;
+  }
+  if (object(base) && object(disk)) {
+    for (const key of Object.keys(base)) {
+      const value = heal(base[key], disk[key], [...keys, key]);
+      if (value !== undefined) Object.defineProperty(disk, key, { value, enumerable: true, writable: true, configurable: true });
+    }
+    return disk;
+  }
+  return copy(base);
+}
+
 export function mergeStores(baseline: PersistedStore, snapshot: PersistedStore, latest: PersistedStore): PersistedStore {
-  const base = copy(baseline), local = copy(snapshot), disk = copy(latest);
+  const base = copy(baseline), local = copy(snapshot);
+  const disk = isLegacyOverwrite(baseline, latest) ? healLegacyOverwrite(base, copy(latest)) : copy(latest);
   alignCredits(base, local, disk);
   const result: PersistedStore = merge(base, local, disk);
   const diskCredits = new Map(disk.creditLedger.map(e => [e.id, e]));

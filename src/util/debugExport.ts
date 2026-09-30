@@ -43,7 +43,12 @@ export interface FileEditStat {
 /** How many times a given tool was invoked in the turn. */
 export interface ToolStat {
   name: string;
+  /** Successful calls. */
   count: number;
+  /** Failed or error-valued calls (debug-log capture only). */
+  failed?: number;
+  /** Summed tool execution time in ms (debug-log capture only). */
+  durationMs?: number;
 }
 
 /** Exact cost + token profile of a single internal model request. */
@@ -74,6 +79,8 @@ export interface TurnAnalysis {
   tools: ToolStat[];
   /** Total tool invocations in the turn. */
   toolCalls: number;
+  /** Failed tool invocations (not included in toolCalls). */
+  failedToolCalls?: number;
   /** Per-request cost/token profile (for token-efficiency insight). */
   requestsDetail: RequestStat[];
   /** Turn-summed token counts per tier. */

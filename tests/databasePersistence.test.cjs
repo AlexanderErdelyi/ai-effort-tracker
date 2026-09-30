@@ -578,3 +578,45 @@ test('a process dying while holding its ticket is recovered safely on next acqui
   assert.equal(read().branches.branch.time.humanCoding, 100);
   assert.equal(fs.readdirSync(file + '.locks').length, 0);
 });
+
+test('an older window overwriting the whole file cannot drop newer data (legacy writer heal)', t => {
+  const { open, read, file } = fixture(t);
+  const seed = open();
+  seed.recordTime('shared', 'humanCoding', 60000);
+  seed.flushSync();
+  // The legacy window loaded here and keeps a stale in-memory copy.
+  const stale = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete stale.writer;
+  const current = open();
+  current.recordTime('shared', 'humanCoding', 30000);
+  current.recordTime('new-branch', 'reviewing', 5000);
+  current.setWorkItemForBranch('new-branch', 'WI-9');
+  current.flushSync();
+  assert.equal(read().writer, 'ai-effort-tracker/merge-v2');
+  // Older version: whole-file replacement with its own delta and no stamp.
+  stale.branches.shared.time.humanCoding += 1000;
+  stale.branches['legacy-branch'] = JSON.parse(JSON.stringify(stale.branches.shared));
+  fs.writeFileSync(file, JSON.stringify(stale));
+  warnings.length = 0;
+  current.recordTime('new-branch', 'reviewing', 1000);
+  current.flushSync();
+  const store = read();
+  assert.equal(store.writer, 'ai-effort-tracker/merge-v2');
+  assert.ok(store.branches['new-branch'], 'branch created by the newer window survives');
+  assert.equal(store.branches['new-branch'].time.reviewing, 6000);
+  assert.equal(store.branches['new-branch'].workItemId, 'WI-9');
+  assert.equal(store.branches.shared.time.humanCoding, 90000, 'counter never regresses to the stale value');
+  assert.ok(store.branches['legacy-branch'], 'data added by the older window is kept');
+  assert.ok(warnings.some(w => /older version/.test(w)), 'user is told to reload windows');
+});
+
+test('a merging writer without the stamp heals only once the stamp exists', t => {
+  const { open, read } = fixture(t);
+  const a = open();
+  a.recordTime('x', 'humanCoding', 1000);
+  a.flushSync();
+  const b = open();
+  b.recordTime('x', 'humanCoding', 1000);
+  b.flushSync();
+  assert.equal(read().branches.x.time.humanCoding, 2000);
+});
