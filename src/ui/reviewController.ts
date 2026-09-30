@@ -35,22 +35,30 @@ interface DocEval {
   review: R.FileReview;
 }
 
-interface FileRow extends R.FileCoverage { root: string; firstTodo?: number }
+interface Block { start: number; end: number; lines: number; at?: number; context: string }
+
+interface FileRow extends R.FileCoverage { root: string; firstTodo?: number; todo: Block[]; ok: Block[] }
 
 interface Snapshot { ctx: RepoCtx; cov: R.BranchCoverage; rows: FileRow[] }
+
+type Section = 'open' | 'done';
 
 type Node =
   | { kind: 'summary' }
   | { kind: 'issues' }
   | { kind: 'issue'; issue: R.OpenIssue }
-  | { kind: 'file'; row: FileRow; showDir?: boolean }
-  | { kind: 'group'; group: T.ReviewTreeGroup<FileRow>; section: 'open' | 'done' }
-  | { kind: 'done' };
+  | { kind: 'resolvedGroup' }
+  | { kind: 'resolved'; issue: R.ResolvedIssue }
+  | { kind: 'section'; section: Section }
+  | { kind: 'file'; row: FileRow; section: Section; showDir?: boolean }
+  | { kind: 'block'; row: FileRow; block: Block; section: Section }
+  | { kind: 'group'; group: T.ReviewTreeGroup<FileRow>; section: Section };
 
 const CTX_TTL_MS = 20_000;
 const MAX_DOC_LINES = 60_000;
 const MAX_FILES = 2000;
 const MAX_FILE_BYTES = 1_500_000;
+const MAX_BLOCKS = 200;
 const BASE_KEY = 'aet.review.baseOverrides';
 
 const cfg = () => vscode.workspace.getConfiguration('aiEffortTracker.review');
@@ -71,6 +79,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
   readonly onDidChangeCodeLenses = this.lensEmitter.event;
   readonly onDidChangeTreeData = this.treeEmitter.event;
   private readonly okType: vscode.TextEditorDecorationType;
+  private readonly okBgType: vscode.TextEditorDecorationType;
   private readonly issueType: vscode.TextEditorDecorationType;
   private readonly todoType: vscode.TextEditorDecorationType;
   private readonly statusItem: vscode.StatusBarItem;
@@ -84,6 +93,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
   private storeErrorShown = false;
   private exclude: (rel: string) => boolean = () => false;
   private tick: NodeJS.Timeout | undefined;
+  private watchTimer: NodeJS.Timeout | undefined;
   private disposed = false;
 
   constructor(private readonly context: vscode.ExtensionContext, storageDir: string) {
@@ -92,6 +102,9 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     this.okType = vscode.window.createTextEditorDecorationType({
       gutterIconPath: icon('review-ok.svg'), gutterIconSize: '70%',
       overviewRulerColor: 'rgba(46,160,67,0.7)', overviewRulerLane: vscode.OverviewRulerLane.Left
+    });
+    this.okBgType = vscode.window.createTextEditorDecorationType({
+      isWholeLine: true, backgroundColor: new vscode.ThemeColor('aiEffortTracker.review.reviewedLineBackground')
     });
     this.issueType = vscode.window.createTextEditorDecorationType({
       gutterIconPath: icon('review-issue.svg'), gutterIconSize: '80%', isWholeLine: true,
@@ -107,9 +120,13 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     this.statusItem.command = 'aiEffortTracker.review.showProgress';
     this.readConfig();
 
-    const view = vscode.window.createTreeView('aiEffortTracker.reviewView', { treeDataProvider: this, showCollapseAll: false });
+    const view = vscode.window.createTreeView('aiEffortTracker.reviewView', { treeDataProvider: this, showCollapseAll: true, manageCheckboxStateManually: true });
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(path.dirname(this.store.file)), path.basename(this.store.file)));
+    const external = () => { clearTimeout(this.watchTimer); this.watchTimer = setTimeout(() => void this.poll(), 400); };
     this.disposables.push(
-      view, this.okType, this.issueType, this.todoType, this.statusItem, this.lensEmitter, this.treeEmitter,
+      view, watcher, watcher.onDidChange(external), watcher.onDidCreate(external),
+      view.onDidChangeCheckboxState(e => void this.onCheckbox(e)),
+      this.okType, this.okBgType, this.issueType, this.todoType, this.statusItem, this.lensEmitter, this.treeEmitter,
       vscode.languages.registerCodeLensProvider({ scheme: 'file' }, this),
       vscode.window.onDidChangeActiveTextEditor(e => { if (e) this.queueDoc(e.document, 50, true); }),
       vscode.window.onDidChangeVisibleTextEditors(eds => { for (const e of eds) this.queueDoc(e.document, 50); }),
@@ -123,7 +140,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       vscode.window.onDidChangeWindowState(s => { if (s.focused) void this.poll(); }),
       vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration('aiEffortTracker.review.groupBy') || e.affectsConfiguration('aiEffortTracker.categoryRules')) this.treeEmitter.fire();
-        const keys = ['enabled', 'showDecorations', 'codeLens', 'showStatusBar', 'exclude', 'baseRef'];
+        const keys = ['enabled', 'showDecorations', 'highlightReviewedLines', 'codeLens', 'showStatusBar', 'exclude', 'baseRef'];
         if (!keys.some(k => e.affectsConfiguration('aiEffortTracker.review.' + k))) return;
         this.readConfig();
         this.invalidateCtx();
@@ -260,13 +277,24 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
   private decorate(doc: vscode.TextDocument) {
     const ev = this.evals.get(doc.uri.toString());
     const show = this.enabled() && (cfg().get<boolean>('showDecorations') ?? true);
-    const ok: vscode.Range[] = [], todo: vscode.Range[] = [];
+    const background = show && (cfg().get<boolean>('highlightReviewedLines') ?? true);
+    const ok: vscode.DecorationOptions[] = [], todo: vscode.Range[] = [];
     const issues: vscode.DecorationOptions[] = [];
     if (ev && show) {
       const s = ev.review.status;
-      for (let i = 0; i < s.length && i < doc.lineCount; i++) {
-        if (s[i] === 'ok') ok.push(doc.lineAt(i).range);
-        else if (s[i] === 'todo') todo.push(doc.lineAt(i).range);
+      for (let i = 0; i < s.length && i < doc.lineCount; i++) if (s[i] === 'todo') todo.push(doc.lineAt(i).range);
+      const file = JSON.stringify(doc.uri.fsPath);
+      for (const b of ev.review.reviewedBlocks) {
+        const args = encodeURIComponent(`[${file},${b.start},${b.end}]`);
+        const md = new vscode.MarkdownString(`$(pass-filled) **Reviewed** · ${plural(b.lines, 'line')} · ${new Date(b.at).toLocaleString()}\n\n`
+          + `[$(close) Remove mark](command:aiEffortTracker.review.clearMark?${args} "Back to unreviewed") · [$(warning) Flag issue](command:aiEffortTracker.review.flagIssue?${args})`, true);
+        md.isTrusted = { enabledCommands: ['aiEffortTracker.review.clearMark', 'aiEffortTracker.review.flagIssue'] };
+        let first = true;
+        for (let i = b.start; i <= b.end && i < doc.lineCount; i++) {
+          if (s[i] !== 'ok') continue;
+          ok.push(first ? { range: doc.lineAt(i).range, hoverMessage: md } : { range: doc.lineAt(i).range });
+          first = false;
+        }
       }
       for (const issue of ev.review.issues) {
         const md = new vscode.MarkdownString(`**⚑ Review issue** · ${new Date(issue.at).toLocaleString()}\n\n${issue.note ? escapeMd(issue.note) : '_no note_'}`);
@@ -276,6 +304,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     for (const editor of vscode.window.visibleTextEditors) {
       if (editor.document !== doc) continue;
       editor.setDecorations(this.okType, ok);
+      editor.setDecorations(this.okBgType, background ? ok.map(o => o.range) : []);
       editor.setDecorations(this.todoType, todo);
       editor.setDecorations(this.issueType, issues);
     }
@@ -292,7 +321,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const ev = this.evals.get(doc.uri.toString());
     if (!ev || ev.version !== doc.version) return [];
     const r = ev.review;
-    if (!r.total && !r.issues.length) return [];
+    if (!r.total && !r.issues.length && !r.fixed.length) return [];
     const uri = doc.uri;
     const at = (line: number) => new vscode.Range(line, 0, line, 0);
     const lenses: vscode.CodeLens[] = [];
@@ -326,6 +355,20 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         tooltip: 'Open a new chat with a prompt to fix this issue'
       }));
     }
+    if (r.fixed.length) {
+      const byId = new Map(this.marksFor(ev.ctx.repoId, ev.rel).map(m => [m.id, m]));
+      for (const f of r.fixed.slice(0, 100)) {
+        const m = byId.get(f.markId);
+        if (!m?.fixed) continue;
+        const note = (m.note || 'Issue').replace(/\s+/g, ' ');
+        lenses.push(new vscode.CodeLens(at(f.line), {
+          title: `$(verified) ${m.fixed.by === 'ai' ? 'Fixed by Copilot' : 'Fixed'}: ${note.length > 60 ? note.slice(0, 59) + '…' : note}`,
+          command: 'aiEffortTracker.review.acceptFix', arguments: [uri, f.markId],
+          tooltip: `${m.fixed.note ? m.fixed.note + '\n\n' : ''}Click to accept the fix and remove the flag.`
+        }));
+        lenses.push(new vscode.CodeLens(at(f.line), { title: '↺ Reopen', command: 'aiEffortTracker.review.reopenIssue', arguments: [uri, f.markId] }));
+      }
+    }
     return lenses;
   }
 
@@ -338,9 +381,9 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       }
     });
     return [
-      reg('markReviewed', (uri?: vscode.Uri, s?: number, e?: number) => this.markCommand('ok', uri, s, e)),
-      reg('flagIssue', (uri?: vscode.Uri, s?: number, e?: number) => this.markCommand('issue', uri, s, e)),
-      reg('clearMark', (uri?: vscode.Uri, s?: number, e?: number) => this.markCommand('clear', uri, s, e)),
+      reg('markReviewed', (uri?: vscode.Uri | string, s?: number, e?: number) => this.markCommand('ok', uri, s, e)),
+      reg('flagIssue', (uri?: vscode.Uri | string, s?: number, e?: number) => this.markCommand('issue', uri, s, e)),
+      reg('clearMark', (uri?: vscode.Uri | string, s?: number, e?: number) => this.markCommand('clear', uri, s, e)),
       reg('markFileReviewed', (uri?: vscode.Uri) => this.markFile(uri)),
       reg('nextUnreviewed', () => this.nextUnreviewed()),
       reg('issueActions', (uri: vscode.Uri, line: number) => this.issueActions(uri, line)),
@@ -349,6 +392,17 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         await cfg().update('showDecorations', !cur, vscode.ConfigurationTarget.Global);
         void vscode.window.setStatusBarMessage(`AI Effort Tracker: review highlights ${cur ? 'hidden' : 'shown'}`, 2500);
       }),
+      reg('toggleReviewedBackground', async () => {
+        const cur = cfg().get<boolean>('highlightReviewedLines') ?? true;
+        await cfg().update('highlightReviewedLines', !cur, vscode.ConfigurationTarget.Global);
+        void vscode.window.setStatusBarMessage(`AI Effort Tracker: reviewed lines ${cur ? 'show only the ✓ in the gutter' : 'are highlighted green'}`, 2500);
+      }),
+      reg('treeMarkReviewed', (node?: Node) => this.treeAction(node, 'ok')),
+      reg('treeRemoveMarks', (node?: Node) => this.treeAction(node, 'clear')),
+      reg('acceptFix', (target?: Node | vscode.Uri, markId?: string) => this.resolvedAction(target, 'accept', markId)),
+      reg('reopenIssue', (target?: Node | vscode.Uri, markId?: string) => this.resolvedAction(target, 'reopen', markId)),
+      reg('markIssueFixed', (target?: Node | vscode.Uri, markId?: string) => this.resolvedAction(target, 'fixed', markId)),
+      reg('openRange', (root: string, rel: string, start: number, end: number) => this.openAt(path.join(root, rel), start, end)),
       reg('setBaseline', () => this.setBaseline()),
       reg('refresh', () => { this.invalidateCtx(); this.refreshAll(); this.scheduleCoverage(50); }),
       reg('openFile', (root: string, rel: string, line?: number) => this.openAt(path.join(root, rel), line)),
@@ -366,8 +420,9 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     ];
   }
 
-  private async docFor(uri?: vscode.Uri): Promise<vscode.TextDocument | undefined> {
+  private async docFor(uri?: vscode.Uri | string): Promise<vscode.TextDocument | undefined> {
     if (uri instanceof vscode.Uri) return vscode.workspace.openTextDocument(uri);
+    if (typeof uri === 'string' && uri) return vscode.workspace.openTextDocument(vscode.Uri.file(uri));
     return vscode.window.activeTextEditor?.document;
   }
 
@@ -397,7 +452,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     });
   }
 
-  private async markCommand(status: R.MarkStatus, uri?: vscode.Uri, start?: number, end?: number) {
+  private async markCommand(status: R.MarkStatus, uri?: vscode.Uri | string, start?: number, end?: number) {
     const doc = await this.docFor(uri);
     if (!doc) throw new Error('Open a file first.');
     const ev = await this.ensureEval(doc);
@@ -422,7 +477,8 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     }
     const keys = R.keysForLines(lines, idx);
     if (!keys.length) { void vscode.window.setStatusBarMessage('AI Effort Tracker: only blank lines selected', 2500); return; }
-    this.writeMarks(ev.ctx, ev.rel, marks => R.applyMark(marks, keys, status, Date.now(), randomUUID(), note));
+    const where = status === 'issue' ? { branch: ev.ctx.branch, line: Math.min(...idx) + 1 } : undefined;
+    this.writeMarks(ev.ctx, ev.rel, marks => R.applyMark(marks, keys, status, Date.now(), randomUUID(), note, where));
     await this.afterMark(doc);
     const verb = status === 'ok' ? 'reviewed' : status === 'issue' ? 'flagged' : 'cleared';
     void vscode.window.setStatusBarMessage(`AI Effort Tracker: ${plural(keys.length, 'line')} ${verb}`, 2500);
@@ -471,6 +527,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const items = [
       { label: '$(sparkle) Ask Copilot to fix it', id: 'fix' },
       { label: '$(check) Resolved — mark reviewed', id: 'ok' },
+      { label: '$(verified) Fixed — verify later', id: 'fixed', description: 'moves it to "Fixed — to verify"' },
       { label: '$(edit) Edit note', id: 'edit' },
       { label: '$(close) Remove flag (back to unreviewed)', id: 'clear' },
       { label: '$(copy) Copy note', id: 'copy' }
@@ -482,6 +539,11 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       await this.fixWithCopilot({ path: ev.rel, line: issue.line + 1, lines: issue.lines, note: issue.note, at: issue.at, markId: issue.markId }, ev.ctx.branch);
       return;
     }
+    if (pick.id === 'fixed') {
+      this.writeMarks(ev.ctx, ev.rel, marks => R.setIssueFix(marks, issue.markId, { at: Date.now(), by: 'user' }) ?? marks);
+      await this.afterMark(doc);
+      return;
+    }
     const keys = R.keysForLines(R.splitLines(doc.getText()), issue.indices);
     let note: string | undefined;
     if (pick.id === 'edit') {
@@ -489,7 +551,8 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       if (note === undefined) return;
     }
     const status: R.MarkStatus = pick.id === 'edit' ? 'issue' : pick.id as R.MarkStatus;
-    this.writeMarks(ev.ctx, ev.rel, marks => R.applyMark(marks, keys, status, Date.now(), randomUUID(), note));
+    this.writeMarks(ev.ctx, ev.rel, marks => R.applyMark(marks, keys, status, Date.now(), randomUUID(), note,
+      status === 'issue' ? { branch: ev.ctx.branch, line: issue.line + 1 } : undefined));
     await this.afterMark(doc);
   }
 
@@ -520,7 +583,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     }
   }
 
-  private async openAt(file: string, line?: number) {
+  private async openAt(file: string, line?: number, end?: number) {
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
     const editor = await vscode.window.showTextDocument(doc, { preview: false });
     let target = line;
@@ -528,9 +591,135 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       const ev = await this.evaluate(doc);
       target = ev?.review.todoBlocks[0]?.start ?? ev?.review.issues[0]?.line ?? 0;
     }
-    const pos = new vscode.Position(Math.min(target, doc.lineCount - 1), 0);
+    const first = Math.min(target, doc.lineCount - 1);
+    const pos = new vscode.Position(first, 0);
+    if (typeof end === 'number' && end > first) {
+      const last = doc.lineAt(Math.min(end, doc.lineCount - 1));
+      editor.selection = new vscode.Selection(last.range.end, pos);
+      editor.revealRange(new vscode.Range(pos, last.range.end), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+      return;
+    }
     editor.selection = new vscode.Selection(pos, pos);
     editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+  }
+
+  /** Current review state of a file (open editor text or disk), for bulk actions from the view. */
+  private async evalFile(ctx: RepoCtx, rel: string): Promise<{ lines: string[]; review: R.FileReview } | undefined> {
+    const abs = path.join(ctx.root, rel);
+    const doc = vscode.workspace.textDocuments.find(d => d.uri.scheme === 'file' && same(d.uri.fsPath, abs));
+    let text = doc?.getText();
+    if (text === undefined) {
+      try { const buf = fs.readFileSync(abs); if (buf.includes(0)) return undefined; text = buf.toString('utf8'); } catch { return undefined; }
+    }
+    const lines = R.splitLines(text);
+    const changed = await this.changedFor(ctx, rel, lines, !!doc?.isDirty);
+    return { lines, review: R.evaluateFile(lines, changed, this.marksFor(ctx.repoId, rel)) };
+  }
+
+  /** Inline actions of the Review view: mark a range / file / group reviewed, or remove its review marks. */
+  private async treeAction(node: Node | undefined, status: 'ok' | 'clear'): Promise<boolean> {
+    if (!node || (node.kind !== 'block' && node.kind !== 'file' && node.kind !== 'group')) return false;
+    const snap = this.snapshot;
+    if (!snap) return false;
+    const rows = node.kind === 'group' ? collectRows(node.group) : [node.row];
+    const ctx = await this.ctx(rows[0]?.root ?? snap.ctx.root);
+    if (!ctx) throw new Error('Could not read the git repository.');
+    const want: R.LineStatus = status === 'ok' ? 'todo' : 'ok';
+    const lineCount = node.kind === 'block' ? node.block.lines : rows.reduce((s, r) => s + (status === 'ok' ? r.total - r.reviewed : r.reviewed), 0);
+    if (node.kind !== 'block' && (rows.length > 1 || status === 'clear')) {
+      const what = rows.length === 1 ? path.posix.basename(rows[0].path) : plural(rows.length, 'file');
+      const verb = status === 'ok' ? `Mark ${plural(lineCount, 'line')} in ${what} as reviewed?` : `Remove the review marks from ${plural(lineCount, 'line')} in ${what}?`;
+      const go = await vscode.window.showWarningMessage(verb, { modal: true, detail: status === 'clear' ? 'The lines go back to "to review". Flagged issues stay.' : undefined }, status === 'ok' ? 'Mark Reviewed' : 'Remove Marks');
+      if (!go) return false;
+    }
+    const plan: { rel: string; keys: string[] }[] = [];
+    for (const row of rows) {
+      const ev = await this.evalFile(ctx, row.path);
+      if (!ev) continue;
+      let idx = ev.review.status.flatMap((s, i) => s === want ? [i] : []);
+      if (node.kind === 'block') idx = idx.filter(i => i >= node.block.start && i <= node.block.end);
+      const keys = R.keysForLines(ev.lines, idx);
+      if (keys.length) plan.push({ rel: row.path, keys });
+    }
+    if (!plan.length) { this.scheduleCoverage(50); throw new Error('Those lines changed in the meantime. The view is refreshed; try again.'); }
+    const before = new Map<string, R.ReviewMark[] | undefined>();
+    const now = Date.now();
+    this.store.updateRepo(ctx.repoId, repo => {
+      const files = { ...repo.files };
+      for (const p of plan) {
+        before.set(p.rel, files[p.rel]);
+        const next = R.applyMark(files[p.rel] ?? [], p.keys, status, now, randomUUID());
+        if (next.length) files[p.rel] = next; else delete files[p.rel];
+      }
+      return R.withRoot({ ...repo, files }, ctx.root);
+    });
+    await this.afterMark();
+    const n = plan.reduce((s, p) => s + p.keys.length, 0);
+    const msg = `${status === 'ok' ? 'Marked' : 'Removed review marks from'} ${plural(n, 'line')}${plan.length > 1 ? ` in ${plural(plan.length, 'file')}` : ` in ${path.posix.basename(plan[0].rel)}`}${status === 'ok' ? ' as reviewed' : ''}.`;
+    if (node.kind === 'block') { void vscode.window.setStatusBarMessage(`AI Effort Tracker: ${msg}`, 3000); return true; }
+    void vscode.window.showInformationMessage(msg, 'Undo').then(async pick => {
+      if (pick !== 'Undo') return;
+      this.store.updateRepo(ctx.repoId, repo => {
+        const files = { ...repo.files };
+        for (const [rel, marks] of before) if (marks?.length) files[rel] = marks; else delete files[rel];
+        return { ...repo, files };
+      });
+      await this.afterMark();
+    });
+    return true;
+  }
+
+  /** Checkbox in the Review view: check = mark reviewed, uncheck = remove the review marks. */
+  private async onCheckbox(e: vscode.TreeCheckboxChangeEvent<Node>) {
+    const [node, state] = e.items[0] ?? [];
+    if (!node || (node.kind !== 'block' && node.kind !== 'file' && node.kind !== 'group')) return;
+    const want = state === vscode.TreeItemCheckboxState.Checked ? 'ok' : 'clear';
+    if ((want === 'ok') !== (node.section === 'open')) return;
+    let done = false;
+    try { done = await this.treeAction(node, want); } catch (error) {
+      void vscode.window.showErrorMessage(`AI Effort Tracker: ${(error as Error).message}`);
+    }
+    if (!done) this.treeEmitter.fire();
+  }
+
+  /** Fixed / changed issues: accept the fix (drop the flag), open it again, or report an open issue fixed. */
+  private async resolvedAction(target: Node | vscode.Uri | undefined, action: 'accept' | 'reopen' | 'fixed', id?: string) {
+    let repoId: string, rel: string, markId: string | undefined;
+    if (target instanceof vscode.Uri) {
+      const ev = await this.ensureEval(await vscode.workspace.openTextDocument(target));
+      repoId = ev.ctx.repoId; rel = ev.rel; markId = id;
+    } else {
+      const snap = this.snapshot;
+      if (!snap || !target || (target.kind !== 'resolved' && target.kind !== 'issue')) return;
+      repoId = snap.ctx.repoId; rel = target.issue.path; markId = target.issue.markId;
+    }
+    if (!markId) throw new Error('This issue was flagged by an older version; use its CodeLens in the editor instead.');
+    const mid = markId;
+    const change = (marks: R.ReviewMark[]) => action === 'accept' ? R.dropMark(marks, mid)
+      : R.setIssueFix(marks, mid, action === 'fixed' ? { at: Date.now(), by: 'user' } : null);
+    let before: R.ReviewMark[] | undefined;
+    let missing = false;
+    this.store.updateRepo(repoId, repo => {
+      before = repo.files[rel];
+      const next = change(before ?? []);
+      if (!next) { missing = true; return repo; }
+      const files = { ...repo.files };
+      if (next.length) files[rel] = next; else delete files[rel];
+      return { ...repo, files };
+    });
+    await this.afterMark();
+    if (missing) throw new Error('This issue no longer exists. The view is refreshed.');
+    const msg = action === 'accept' ? 'Fix accepted, the flag is removed.' : action === 'reopen' ? 'The issue is open again.' : 'Moved to "Fixed — to verify".';
+    if (action !== 'accept') { void vscode.window.setStatusBarMessage(`AI Effort Tracker: ${msg}`, 3000); return; }
+    void vscode.window.showInformationMessage(msg, 'Undo').then(async pick => {
+      if (pick !== 'Undo') return;
+      this.store.updateRepo(repoId, repo => {
+        const files = { ...repo.files };
+        if (before?.length) files[rel] = before; else delete files[rel];
+        return { ...repo, files };
+      });
+      await this.afterMark();
+    });
   }
 
   private async nextUnreviewed() {
@@ -641,6 +830,8 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       for (const d of vscode.workspace.textDocuments) if (d.uri.scheme === 'file') open.set(process.platform === 'win32' ? d.uri.fsPath.toLowerCase() : d.uri.fsPath, d);
       const rows: FileRow[] = [];
       const issues: R.OpenIssue[] = [];
+      const resolved: R.ResolvedIssue[] = [];
+      const gone = (rel: string) => { const marks = repo.files[rel]; if (marks) resolved.push(...R.resolvedIssuesOf(rel, marks, null, ctx.branch, ctx.changed.has(rel))); };
       let n = 0;
       for (const rel of [...files].sort()) {
         if (this.disposed) return undefined;
@@ -656,21 +847,31 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
             const buf = fs.readFileSync(abs);
             if (buf.includes(0)) continue;
             text = buf.toString('utf8');
-          } catch { continue; }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') gone(rel);
+            continue;
+          }
         }
         const lines = R.splitLines(text);
         if (lines.length > MAX_DOC_LINES) continue;
         const changed = await this.changedFor(ctx, rel, lines, !!doc?.isDirty);
         const ev = R.evaluateFile(lines, changed, repo.files[rel] ?? []);
+        if (repo.files[rel]) resolved.push(...R.resolvedIssuesOf(rel, repo.files[rel], ev, ctx.branch, ctx.changed.has(rel)));
         if (!ev.total && !ev.issues.length) continue;
-        rows.push({ path: rel, total: ev.total, reviewed: ev.reviewed, issueLines: ev.issueLines, root, firstTodo: ev.todoBlocks[0]?.start });
+        const todoB = ev.todoBlocks.slice(0, MAX_BLOCKS), okB = ev.reviewedBlocks.slice(0, MAX_BLOCKS);
+        const names = R.blockContexts(lines, [...todoB, ...okB], rel);
+        rows.push({
+          path: rel, total: ev.total, reviewed: ev.reviewed, issueLines: ev.issueLines, root, firstTodo: ev.todoBlocks[0]?.start,
+          todo: todoB.map((b, k) => ({ ...b, context: names[k] })), ok: okB.map((b, k) => ({ ...b, context: names[todoB.length + k] }))
+        });
         for (const i of ev.issues) issues.push({ path: rel, line: i.line + 1, lines: i.lines, note: i.note, at: i.at, markId: i.markId });
       }
       const sum = (k: 'total' | 'reviewed' | 'issueLines') => rows.reduce((s, r) => s + r[k], 0);
       const cov: R.BranchCoverage = {
         at: Date.now(), base: ctx.base ?? '', total: sum('total'), reviewed: sum('reviewed'), issueLines: sum('issueLines'),
         files: rows.map(({ path: p, total, reviewed, issueLines }) => ({ path: p, total, reviewed, issueLines })),
-        issues: issues.sort((a, b) => b.at - a.at)
+        issues: issues.sort((a, b) => b.at - a.at),
+        ...(resolved.length ? { resolved: resolved.sort((a, b) => (b.fixedAt ?? b.at) - (a.fixedAt ?? a.at)) } : {})
       };
       this.snapshot = { ctx, cov, rows };
       this.persist(ctx, cov);
@@ -691,7 +892,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const stale = !prev || Date.now() - prev.at > 6 * 3600_000;
     const rootKnown = (() => { try { return (this.store.repo(ctx.repoId).roots ?? []).includes(ctx.root); } catch { return true; } })();
     if (sig === this.lastPersisted && !stale && rootKnown) return;
-    if (!cov.total && !cov.issues.length && !prev) { this.lastPersisted = sig; return; }
+    if (!cov.total && !cov.issues.length && !cov.resolved?.length && !prev) { this.lastPersisted = sig; return; }
     try {
       this.store.updateRepo(ctx.repoId, repo => R.withRoot(R.withCoverage(repo, ctx.branch, cov), ctx.root));
       this.lastPersisted = sig;
@@ -752,58 +953,129 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         item.command = { command: 'aiEffortTracker.review.openFile', title: 'Open', arguments: [snap.ctx.root, i.path, i.line - 1] };
         return item;
       }
+      case 'resolvedGroup': {
+        const list = snap.cov.resolved ?? [];
+        const item = new vscode.TreeItem(`Fixed — to verify (${list.length})`, vscode.TreeItemCollapsibleState.Expanded);
+        item.id = 'review:resolved';
+        item.tooltip = 'Flagged issues that Copilot or you reported fixed, or whose flagged lines were all edited. '
+          + 'Check each fix, then accept it (✓) to remove the flag, or reopen it.';
+        item.iconPath = new vscode.ThemeIcon('verified', new vscode.ThemeColor('charts.blue'));
+        item.contextValue = 'aetReviewResolvedGroup';
+        return item;
+      }
+      case 'resolved': {
+        const i = node.issue;
+        const item = new vscode.TreeItem(i.note || 'Issue');
+        item.id = `review:resolved:${i.markId}`;
+        const who = i.by === 'ai' ? 'fixed by Copilot' : i.by === 'user' ? 'fixed by you' : 'flagged lines changed';
+        item.description = `${who} · ${i.path}:${i.line}`;
+        const md = new vscode.MarkdownString(undefined, true);
+        md.appendMarkdown(`**⚑ ${escapeMd(i.note || 'Issue')}**\n\n`);
+        md.appendMarkdown(`${escapeMd(i.path)}:${i.line} · flagged ${new Date(i.at).toLocaleString()}\n\n`);
+        if (i.by === 'changed') md.appendMarkdown('All flagged lines were edited or removed, so the issue is probably fixed.\n\n');
+        else md.appendMarkdown(`$(verified) ${i.by === 'ai' ? 'Copilot' : 'You'} reported it fixed${i.fixedAt ? ' · ' + new Date(i.fixedAt).toLocaleString() : ''}\n\n`);
+        if (i.fixNote) md.appendMarkdown(`> ${escapeMd(i.fixNote)}\n\n`);
+        md.appendMarkdown(i.lines ? `${plural(i.lines, 'flagged line')} still in the file.` : 'The flagged lines are gone.');
+        item.tooltip = md;
+        item.iconPath = i.by === 'ai' ? new vscode.ThemeIcon('sparkle', new vscode.ThemeColor('charts.purple'))
+          : i.by === 'user' ? new vscode.ThemeIcon('verified', new vscode.ThemeColor('charts.blue'))
+            : new vscode.ThemeIcon('diff-modified', new vscode.ThemeColor('charts.yellow'));
+        item.contextValue = `aetReviewResolved-${i.by === 'changed' ? 'changed' : 'fixed'}`;
+        item.command = { command: 'aiEffortTracker.review.openFile', title: 'Open', arguments: [snap.ctx.root, i.path, Math.max(0, i.line - 1)] };
+        return item;
+      }
+      case 'section': {
+        const open = node.section === 'open';
+        const rows = open ? this.openRows(snap) : this.doneRows(snap);
+        const lines = open ? snap.cov.total - snap.cov.reviewed : snap.cov.reviewed;
+        const item = new vscode.TreeItem(open ? 'To review' : 'Reviewed', vscode.TreeItemCollapsibleState.Expanded);
+        item.id = `review:section:${node.section}`;
+        item.description = `${plural(lines, 'line')} · ${plural(rows.length, 'file')}`;
+        item.tooltip = open ? 'Changed lines nobody has marked as reviewed yet. Expand a file to see its unreviewed blocks.'
+          : 'Everything marked as reviewed on this branch. Expand a file to see which lines, click to jump there.';
+        item.iconPath = open ? new vscode.ThemeIcon('circle-large-outline') : new vscode.ThemeIcon('pass', new vscode.ThemeColor('testing.iconPassed'));
+        item.contextValue = `aetReviewSection-${node.section}`;
+        return item;
+      }
       case 'file': {
         const r = node.row;
-        const item = new vscode.TreeItem(path.posix.basename(r.path));
+        const open = node.section === 'open';
+        const blocks = open ? r.todo : r.ok;
+        const item = new vscode.TreeItem(path.posix.basename(r.path), blocks.length ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+        item.id = `review:file:${node.section}:${r.path}`;
         const dir = path.posix.dirname(r.path);
         const done = r.reviewed >= r.total;
-        item.description = `${node.showDir && dir !== '.' ? dir + ' · ' : ''}${r.reviewed}/${r.total}${r.issueLines ? ' · ⚑' : ''}`;
-        item.tooltip = `${r.path}\n${r.reviewed} of ${r.total} changed lines reviewed (${R.coveragePct(r.reviewed, r.total)} %)${r.issueLines ? `\n${plural(r.issueLines, 'flagged line')}` : ''}`;
+        const counts = open ? `${r.reviewed}/${r.total}` : `${plural(r.reviewed, 'line')}${done ? '' : ` of ${r.total}`}`;
+        item.description = `${node.showDir && dir !== '.' ? dir + ' · ' : ''}${counts}${r.issueLines ? ' · ⚑' : ''}`;
+        item.tooltip = `${r.path}\n${r.reviewed} of ${r.total} changed lines reviewed (${R.coveragePct(r.reviewed, r.total)} %)${r.issueLines ? `\n${plural(r.issueLines, 'flagged line')}` : ''}`
+          + `\n${open ? 'Expand for the blocks still to review.' : 'Expand for the reviewed blocks.'} Click to open.`;
         item.resourceUri = vscode.Uri.file(path.join(r.root, r.path));
-        item.iconPath = new vscode.ThemeIcon(done ? 'pass' : r.reviewed ? 'circle-large' : 'circle-large-outline',
-          done ? new vscode.ThemeColor('testing.iconPassed') : undefined);
-        item.command = { command: 'aiEffortTracker.review.openFile', title: 'Open', arguments: [r.root, r.path, done ? undefined : r.firstTodo] };
+        item.checkboxState = checkbox(open, open ? `Mark the ${plural(r.total - r.reviewed, 'line')} left as reviewed` : 'Remove the review marks of this file');
+        item.contextValue = `aetReviewFile-${node.section}`;
+        const first = blocks[0];
+        item.command = open || !first
+          ? { command: 'aiEffortTracker.review.openFile', title: 'Open', arguments: [r.root, r.path, done ? undefined : r.firstTodo] }
+          : { command: 'aiEffortTracker.review.openRange', title: 'Open', arguments: [r.root, r.path, first.start, first.end] };
+        return item;
+      }
+      case 'block': {
+        const { row, block: b } = node;
+        const open = node.section === 'open';
+        const range = b.start === b.end ? `line ${b.start + 1}` : `lines ${b.start + 1}–${b.end + 1}`;
+        const item = new vscode.TreeItem(b.context || range);
+        item.id = `review:block:${node.section}:${row.path}:${b.start}`;
+        item.description = `${b.context ? range + ' · ' : ''}${plural(b.lines, 'line')}`;
+        item.tooltip = `${row.path}, ${range}\n${plural(b.lines, 'line')} ${open ? 'to review' : `reviewed${b.at ? ' · ' + new Date(b.at).toLocaleString() : ''}`}\nClick to select the lines in the editor.`;
+        item.checkboxState = checkbox(open, open ? 'Mark these lines as reviewed' : 'Remove the review marks of these lines');
+        item.contextValue = `aetReviewBlock-${node.section}`;
+        item.command = { command: 'aiEffortTracker.review.openRange', title: 'Open', arguments: [row.root, row.path, b.start, b.end] };
         return item;
       }
       case 'group': {
         const g = node.group;
         const done = g.reviewed >= g.total && !g.issueLines;
-        const item = new vscode.TreeItem(g.label, node.section === 'open' ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed);
+        const item = new vscode.TreeItem(g.label, vscode.TreeItemCollapsibleState.Expanded);
         item.id = `review:${g.id}`;
-        const counts = `${g.reviewed}/${g.total}${g.issueLines ? ' · ⚑' : ''}`;
+        const counts = node.section === 'open' ? `${g.reviewed}/${g.total}${g.issueLines ? ' · ⚑' : ''}` : plural(g.reviewed, 'line');
         item.description = g.type === 'category' && g.commonPath ? `${counts} · ${g.commonPath}` : counts;
         item.tooltip = `${g.type === 'folder' ? g.key : g.label.replace(/^\P{L}+/u, '')}${g.commonPath ? `\n${g.commonPath}` : ''}\n${plural(g.files, 'file')}, ${g.reviewed} of ${g.total} changed lines reviewed (${R.coveragePct(g.reviewed, g.total)} %)${g.issueLines ? `\n${plural(g.issueLines, 'flagged line')}` : ''}`;
         if (g.type === 'folder') {
           item.resourceUri = vscode.Uri.file(path.join(snap.ctx.root, g.key));
           item.iconPath = vscode.ThemeIcon.Folder;
         } else item.iconPath = new vscode.ThemeIcon(done ? 'pass' : 'symbol-folder', done ? new vscode.ThemeColor('testing.iconPassed') : undefined);
-        return item;
-      }
-      case 'done': {
-        const n = snap.rows.filter(r => r.total && r.reviewed >= r.total).length;
-        const item = new vscode.TreeItem(`Fully reviewed (${n})`, vscode.TreeItemCollapsibleState.Collapsed);
-        item.iconPath = new vscode.ThemeIcon('pass', new vscode.ThemeColor('testing.iconPassed'));
+        const open = node.section === 'open';
+        item.checkboxState = checkbox(open, open ? `Mark everything in ${plural(g.files, 'file')} as reviewed` : `Remove the review marks of ${plural(g.files, 'file')}`);
+        item.contextValue = `aetReviewGroup-${node.section}`;
         return item;
       }
     }
   }
 
+  private openRows(snap: Snapshot): FileRow[] {
+    return snap.rows.filter(r => r.total > r.reviewed || (r.issueLines && !r.total))
+      .sort((a, b) => (b.total - b.reviewed) - (a.total - a.reviewed) || a.path.localeCompare(b.path));
+  }
+
+  private doneRows(snap: Snapshot): FileRow[] {
+    return snap.rows.filter(r => r.reviewed > 0).sort((a, b) => a.path.localeCompare(b.path));
+  }
+
   getChildren(node?: Node): Node[] {
     const snap = this.snapshot;
-    if (!snap || (!snap.cov.total && !snap.cov.issues.length)) return [];
-    const open = snap.rows.filter(r => r.total > r.reviewed || (r.issueLines && !r.total))
-      .sort((a, b) => (b.total - b.reviewed) - (a.total - a.reviewed) || a.path.localeCompare(b.path));
-    const done = snap.rows.filter(r => r.total && r.reviewed >= r.total).sort((a, b) => a.path.localeCompare(b.path));
+    if (!snap || (!snap.cov.total && !snap.cov.issues.length && !snap.cov.resolved?.length)) return [];
     if (!node) {
       const out: Node[] = [{ kind: 'summary' }];
       if (snap.cov.issues.length) out.push({ kind: 'issues' });
-      out.push(...this.fileNodes(open, 'open'));
-      if (done.length) out.push({ kind: 'done' });
+      if (snap.cov.resolved?.length) out.push({ kind: 'resolvedGroup' });
+      if (this.openRows(snap).length) out.push({ kind: 'section', section: 'open' });
+      if (this.doneRows(snap).length) out.push({ kind: 'section', section: 'done' });
       return out;
     }
     if (node.kind === 'issues') return [...snap.cov.issues].sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line).map(issue => ({ kind: 'issue', issue }));
-    if (node.kind === 'done') return this.fileNodes(done, 'done');
+    if (node.kind === 'resolvedGroup') return (snap.cov.resolved ?? []).map(issue => ({ kind: 'resolved', issue }));
+    if (node.kind === 'section') return this.fileNodes(node.section === 'open' ? this.openRows(snap) : this.doneRows(snap), node.section);
     if (node.kind === 'group') return node.group.children.map(n => this.toNode(n, node.section));
+    if (node.kind === 'file') return (node.section === 'open' ? node.row.todo : node.row.ok).map(block => ({ kind: 'block', row: node.row, block, section: node.section }));
     return [];
   }
 
@@ -813,16 +1085,16 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
   }
 
   /** Files of one section (open / fully reviewed), grouped as configured. */
-  private fileNodes(rows: FileRow[], section: 'open' | 'done'): Node[] {
+  private fileNodes(rows: FileRow[], section: Section): Node[] {
     const groupBy = this.groupBy();
-    if (groupBy === 'none') return rows.map(row => ({ kind: 'file', row, showDir: true }));
+    if (groupBy === 'none') return rows.map(row => ({ kind: 'file', row, section, showDir: true }));
     const rules = readUserRules();
     const tree = T.buildReviewTree(rows, groupBy, p => categorizeWith(p, rules), c => CATEGORY_LABELS[c as FileCategory] ?? c, ALL_CATEGORIES, section);
     return tree.map(n => this.toNode(n, section));
   }
 
-  private toNode(n: T.ReviewTreeNode<FileRow>, section: 'open' | 'done'): Node {
-    return n.kind === 'file' ? { kind: 'file', row: n.row } : { kind: 'group', group: n, section };
+  private toNode(n: T.ReviewTreeNode<FileRow>, section: Section): Node {
+    return n.kind === 'file' ? { kind: 'file', row: n.row, section } : { kind: 'group', group: n, section };
   }
 
   private async chooseGrouping() {
@@ -841,9 +1113,19 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     this.disposed = true;
     clearInterval(this.tick);
     clearTimeout(this.coverageTimer);
+    clearTimeout(this.watchTimer);
     for (const t of this.docTimers.values()) clearTimeout(t);
     for (const d of this.disposables) d.dispose();
   }
+}
+
+/** Checkbox of a Review view row: open rows are unchecked (check = mark reviewed), reviewed rows checked (uncheck = remove marks). */
+function checkbox(open: boolean, tooltip: string): vscode.TreeItemCheckboxState | { state: vscode.TreeItemCheckboxState; tooltip: string } {
+  return { state: open ? vscode.TreeItemCheckboxState.Unchecked : vscode.TreeItemCheckboxState.Checked, tooltip };
+}
+
+function collectRows(g: T.ReviewTreeGroup<FileRow>): FileRow[] {
+  return g.children.flatMap(c => c.kind === 'file' ? [c.row] : collectRows(c));
 }
 
 function escapeMd(s: string): string {

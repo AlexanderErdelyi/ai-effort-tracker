@@ -38,7 +38,7 @@
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
-| `aiEffortTracker.mcpServer.enabled` | `true` | Offer the read-only usage-insights MCP server to Copilot |
+| `aiEffortTracker.mcpServer.enabled` | `true` | Offer the usage-insights MCP server to Copilot (read-only except the review-mark tools) |
 | `aiEffortTracker.sessions.showTitles` | `true` | Show chat titles in the Sessions tab |
 | `aiEffortTracker.budget.*` | | Budget alerts, status bar, thresholds, credits per estimated hour (see [Work item budgets](#work-item-budgets)) |
 | `aiEffortTracker.nudges.*` | | Live nudges and running chat cost (see [Live nudges](#live-nudges-while-you-chat)) |
@@ -207,10 +207,11 @@ while the log still exists).
 
 ### Ask an AI (MCP)
 
-The extension registers the read-only MCP server **AI Effort Tracker usage insights**
+The extension registers the MCP server **AI Effort Tracker usage insights**
 (VS Code 1.101+). In Copilot agent mode, enable it in the tool picker and ask, e.g.
 *"Use the AI Effort Tracker usage insights to tell me how I can use fewer credits"*
-or *"Analyse my usage for work item 1987"*. Tools:
+or *"Analyse my usage for work item 1987"*. All tools are read-only except
+`review_mark` and `review_resolve_issue`, which only write review marks. Tools:
 
 | Tool | Returns |
 |------|---------|
@@ -226,6 +227,8 @@ or *"Analyse my usage for work item 1987"*. Tools:
 | `data_health` | The data health report (see below) |
 | `review_status` | Code review coverage per work item and branch, files left and open review issues |
 | `review_issues` | Open review issues read live from disk: file, current lines, your note and the flagged code, so Copilot can fix them |
+| `review_mark` | Marks changed code reviewed, removes marks or flags lines, by path, glob or category, only when you ask (writes review marks only) |
+| `review_resolve_issue` | Reports a flagged issue as fixed by Copilot (with a note of what changed) so it waits in **Fixed — to verify**; can reopen it, or remove the flag when you ask |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -351,13 +354,22 @@ merge-base with `origin/HEAD` (or `main`/`master`), plus untracked files and uns
 edits.
 
 - **In the editor:** unreviewed changed lines get an amber gutter mark, reviewed
-  lines a green one, flagged lines a red one with your note on hover. CodeLens above
+  lines a green ✓ and a light green background, flagged lines a red one with your
+  note on hover. Hover the first line of a reviewed block for **Remove mark** or
+  **Flag issue**. To keep only the ✓, use **Toggle Green Background on Reviewed
+  Lines** in the Review view's `…` menu (`aiEffortTracker.review.highlightReviewedLines`;
+  the color is the theme color `aiEffortTracker.review.reviewedLineBackground`). CodeLens above
   each unreviewed block offers **✓ Mark reviewed** and **⚑ Flag issue**; the file
   header shows progress and **Mark file reviewed** (with Undo). The editor context
   menu has the same actions for a selection, plus **Clear review mark**.
 - **Next unreviewed** jumps to the next open block across the branch's changed files.
-- **AI Effort: Review** (Explorer) lists open issues, files with review left and a
-  collapsed list of fully reviewed files. Files are grouped by effort category (your
+- **AI Effort: Review** (Explorer) lists open issues, fixes to verify, then **To
+  review** and **Reviewed**. Expand a file to see its blocks, named after the enclosing
+  procedure, trigger, field, object or Markdown heading (e.g. `procedure SyncJob ·
+  lines 12–18`); click one to select those lines in the editor. Tick the checkbox of a
+  block, file or group to mark it reviewed, untick it in **Reviewed** to remove the
+  marks; the same actions are inline (✓ / ✕) and in the right-click menu. Actions on
+  several files ask first, file and group actions offer Undo. Files are grouped by effort category (your
   `aiEffortTracker.categoryRules`), then by folder with single-folder chains compacted;
   switch to a plain folder tree or a flat list with the **Group Files By…** button
   (`aiEffortTracker.review.groupBy`). The status bar shows `Review NN%` and the
@@ -368,6 +380,14 @@ edits.
   branches, files left and open issues. A file changed on several branches counts
   once. The health check warns when a work item marked done is not fully reviewed,
   and Copilot can read coverage through the MCP tool `review_status`.
+- **Ask Copilot to mark code:** "mark the specs as reviewed", "mark NOBJQMSyncMgt
+  reviewed", "remove my review marks from the page files". The MCP tool `review_mark`
+  selects files by path, folder, name fragment, glob (`app/specs/**`, `*.Table.al`)
+  or effort category and marks only the changed lines still to review (`clear`
+  removes reviewed marks and keeps flagged issues). With a line range it marks or
+  flags exact lines. It works on the files checked out now, can do a dry run, and is
+  the only MCP tool that writes: its description tells Copilot to use it only when
+  you ask. VS Code shows the new marks within a second.
 
 ### Let Copilot fix flagged issues
 
@@ -380,8 +400,17 @@ Copilot reads the issues through the MCP tool `review_issues`: file, current lin
 numbers (read live from disk, so they are right even after edits), your note and a
 numbered code excerpt, optionally filtered by `workItemId`, `branch` or `path`.
 Issues that only exist on another branch are listed separately with a hint to check
-that branch out. When Copilot changes a flagged line the flag clears by itself and the
-new code shows up as "to review", so you check the fix like any other change.
+that branch out. When Copilot changes a flagged line the flag clears from that line and
+the new code shows up as "to review", so you check the fix like any other change.
+
+After fixing an issue Copilot calls the MCP tool `review_resolve_issue` with a note of
+what it changed. The issue then moves from **Issues** to **Fixed — to verify** in the
+Review view (✨ fixed by Copilot, with its note on hover), and a CodeLens on the code
+shows it too. Issues whose flagged lines were all edited or deleted appear there as
+well ("flagged lines changed"), but only on the branch they were flagged on. Click one
+to jump to the code, then **✓ Accept fix** (removes the flag, with Undo) or **↺
+Reopen**. You can also move an issue there yourself with **Fixed — verify later** in
+its actions or the right-click menu.
 Marks are anchored to the line's content and its neighbours, not to line numbers,
 so they survive edits elsewhere, rebases and branch switches, and a moved block
 keeps its marks. Editing a reviewed line makes it (and its direct neighbours)
@@ -390,7 +419,7 @@ tracker's store, with the same locking, `.bak` and history as the main store, so
 several windows can review at once.
 
 Settings: `aiEffortTracker.review.enabled`, `review.showDecorations`,
-`review.codeLens`, `review.showStatusBar`, `review.groupBy`, `review.exclude` (globs, default lock
+`review.highlightReviewedLines`, `review.codeLens`, `review.showStatusBar`, `review.groupBy`, `review.exclude` (globs, default lock
 files, build output, minified files, source maps and generated `*.g.xlf`) and `review.baseRef` (default baseline for
 all branches).
 

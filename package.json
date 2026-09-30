@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.27.0",
+  "version": "0.28.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -284,6 +284,47 @@
         "title": "Review: Group Files By…",
         "category": "AI Effort Tracker",
         "icon": "$(list-tree)"
+      },
+      {
+        "command": "aiEffortTracker.review.toggleReviewedBackground",
+        "title": "Review: Toggle Green Background on Reviewed Lines",
+        "category": "AI Effort Tracker",
+        "icon": "$(symbol-color)"
+      },
+      {
+        "command": "aiEffortTracker.review.treeMarkReviewed",
+        "title": "Mark Reviewed",
+        "category": "AI Effort Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "aiEffortTracker.review.treeRemoveMarks",
+        "title": "Remove Review Marks",
+        "category": "AI Effort Tracker",
+        "icon": "$(close)"
+      },
+      {
+        "command": "aiEffortTracker.review.acceptFix",
+        "title": "Accept Fix (Remove Flag)",
+        "category": "AI Effort Tracker",
+        "icon": "$(check)"
+      },
+      {
+        "command": "aiEffortTracker.review.reopenIssue",
+        "title": "Reopen Issue",
+        "category": "AI Effort Tracker",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "aiEffortTracker.review.markIssueFixed",
+        "title": "Mark Fixed (Verify Later)",
+        "category": "AI Effort Tracker",
+        "icon": "$(verified)"
+      },
+      {
+        "command": "aiEffortTracker.review.openRange",
+        "title": "Review: Open Lines",
+        "category": "AI Effort Tracker"
       }
     ],
     "mcpServerDefinitionProviders": [
@@ -298,7 +339,7 @@
         "aiEffortTracker.mcpServer.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Offer the read-only 'AI Effort Tracker usage insights' MCP server to Copilot agent mode, so you can ask an AI how to optimize your credit usage. It reads the tracker's local data and, only when asked, short prompt excerpts from Copilot's local debug logs."
+          "description": "Offer the 'AI Effort Tracker usage insights' MCP server to Copilot agent mode, so you can ask an AI how to optimize your credit usage. It reads the tracker's local data and, only when asked, short prompt excerpts from Copilot's local debug logs. Only review_mark and review_resolve_issue write, and only review marks (e.g. code you ask it to mark reviewed, issues Copilot fixed)."
         },
         "aiEffortTracker.sessions.showTitles": {
           "type": "boolean",
@@ -659,6 +700,11 @@
           "default": true,
           "description": "Show review marks in the gutter and overview ruler: reviewed (green), issue (red), changed but not reviewed yet (amber)."
         },
+        "aiEffortTracker.review.highlightReviewedLines": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Give reviewed lines a light green background (like the red background of flagged issues). Off: only the ✓ in the gutter. Toggle it from the Review view's `…` menu. The color is the theme color `aiEffortTracker.review.reviewedLineBackground`."
+        },
         "aiEffortTracker.review.codeLens": {
           "type": "boolean",
           "default": true,
@@ -773,6 +819,11 @@
           "command": "aiEffortTracker.review.refresh",
           "when": "view == aiEffortTracker.reviewView",
           "group": "navigation@5"
+        },
+        {
+          "command": "aiEffortTracker.review.toggleReviewedBackground",
+          "when": "view == aiEffortTracker.reviewView",
+          "group": "2_display@1"
         }
       ],
       "commandPalette": [
@@ -782,6 +833,30 @@
         },
         {
           "command": "aiEffortTracker.review.openFile",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.treeMarkReviewed",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.treeRemoveMarks",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.openRange",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.acceptFix",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.reopenIssue",
+          "when": "false"
+        },
+        {
+          "command": "aiEffortTracker.review.markIssueFixed",
           "when": "false"
         }
       ],
@@ -795,9 +870,71 @@
           "command": "aiEffortTracker.review.fixWithCopilot",
           "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewIssue",
           "group": "inline"
+        },
+        {
+          "command": "aiEffortTracker.review.treeMarkReviewed",
+          "when": "view == aiEffortTracker.reviewView && viewItem =~ /^aetReview(Block|File|Group)-open$/",
+          "group": "inline"
+        },
+        {
+          "command": "aiEffortTracker.review.treeRemoveMarks",
+          "when": "view == aiEffortTracker.reviewView && viewItem =~ /^aetReview(Block|File|Group)-done$/",
+          "group": "inline"
+        },
+        {
+          "command": "aiEffortTracker.review.treeMarkReviewed",
+          "when": "view == aiEffortTracker.reviewView && viewItem =~ /^aetReview(Block|File|Group)-open$/",
+          "group": "1_review@1"
+        },
+        {
+          "command": "aiEffortTracker.review.treeRemoveMarks",
+          "when": "view == aiEffortTracker.reviewView && viewItem =~ /^aetReview(Block|File|Group)-done$/",
+          "group": "1_review@2"
+        },
+        {
+          "command": "aiEffortTracker.review.acceptFix",
+          "when": "view == aiEffortTracker.reviewView && viewItem =~ /^aetReviewResolved-/",
+          "group": "inline@1"
+        },
+        {
+          "command": "aiEffortTracker.review.reopenIssue",
+          "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewResolved-fixed",
+          "group": "inline@2"
+        },
+        {
+          "command": "aiEffortTracker.review.acceptFix",
+          "when": "view == aiEffortTracker.reviewView && viewItem =~ /^aetReviewResolved-/",
+          "group": "1_review@1"
+        },
+        {
+          "command": "aiEffortTracker.review.reopenIssue",
+          "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewResolved-fixed",
+          "group": "1_review@2"
+        },
+        {
+          "command": "aiEffortTracker.review.fixWithCopilot",
+          "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewIssue",
+          "group": "1_review@1"
+        },
+        {
+          "command": "aiEffortTracker.review.markIssueFixed",
+          "when": "view == aiEffortTracker.reviewView && viewItem == aetReviewIssue",
+          "group": "1_review@2"
         }
       ]
-    }
+    },
+    "colors": [
+      {
+        "id": "aiEffortTracker.review.reviewedLineBackground",
+        "description": "Background of lines marked as reviewed (AI Effort Tracker code review).",
+        "defaults": {
+          "dark": "#2ea04314",
+          "light": "#2ea0431a",
+          "highContrast": "#2ea04326",
+          "highContrastLight": "#2ea04326"
+        }
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
