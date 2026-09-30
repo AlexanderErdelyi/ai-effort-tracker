@@ -695,7 +695,7 @@ function renderWorkItemDetail(){
   });
   if(!branchRows.length)branchRows=['<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No branches roll up into this work item yet.</td></tr>'];
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
-    +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+'</div></div>'
+    +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
     +'<div class="st"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
     +'<div class="st"><div class="lbl">Actual</div><div class="val">'+fmt(activeMsOf(w))+'</div></div>'
     +'<div class="st"><div class="lbl">Net ROI / AI gain</div><div class="val" style="color:'+moneyColor(I.netGain)+'">'+fmtMoney(I.netGain,I.currency)+'</div></div></div>'
@@ -715,7 +715,7 @@ function renderWorkItemDetail(){
     +manualSplitHtml(w)
     +budgetCardHtml(w,I.currency)
     +translationSummaryHtml(w)
-    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="cmd" data-value="setWorkItemEstimate">\\uD83D\\uDCCF Set Estimate</button><button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button>'+(genH==null?'':'<button class="dtab" data-action="bhUse" data-id="'+esc(w.workItemId)+'" data-hours="'+esc(genH)+'" title="Prefill billable hours with the generated-lines equivalent (\\u2248 '+genH+'h)">\\u26A1 Use as Billable Hours</button>')+'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button><button class="dtab" data-action="wiDel" data-id="'+esc(w.workItemId)+'" title="Delete this work item \\u2014 its branches, credits and effort move to Unassigned (nothing is deleted)">\\uD83D\\uDDD1 Delete Work Item</button></div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:14px 0"><button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCCF Set Estimate</button>'+(w.status==='done'?'<button class="dtab" data-action="wiReopen" data-id="'+esc(w.workItemId)+'" title="Reopen: count this work item as in progress again">\\u21BA Reopen</button>':'<button class="dtab" data-action="wiDone" data-id="'+esc(w.workItemId)+'" title="Mark done: it then counts toward estimate accuracy and suggestions">\\u2713 Mark Done</button>')+'<button class="dtab" data-action="bhSet" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDCB5 Set Billable Hours</button>'+(genH==null?'':'<button class="dtab" data-action="bhUse" data-id="'+esc(w.workItemId)+'" data-hours="'+esc(genH)+'" title="Prefill billable hours with the generated-lines equivalent (\\u2248 '+genH+'h)">\\u26A1 Use as Billable Hours</button>')+'<button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign to Project</button><button class="dtab" data-action="reassignBulk" data-id="'+esc(w.workItemId)+'">\\uD83D\\uDD00 Reassign Branches\\u2026</button><button class="dtab" data-action="meAdd" data-id="'+esc(w.workItemId)+'">\\uFF0B Add Effort</button><button class="dtab" data-action="wiDel" data-id="'+esc(w.workItemId)+'" title="Delete this work item \\u2014 its branches, credits and effort move to Unassigned (nothing is deleted)">\\uD83D\\uDDD1 Delete Work Item</button></div>'
     +'<div class="card"><h3>Branches</h3><table style="margin-top:8px"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="card" style="margin-top:12px"><h3>Manual Effort</h3><table style="margin-top:8px"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
     +timeLogCardHtml(w.timeEntries||[],'data-id="'+esc(w.workItemId)+'"')
@@ -958,11 +958,14 @@ function showTab(name){
   else if(name==='ledger'){document.getElementById('tab-ledger').classList.add('active');renderLedger();}
   else if(name==='optimize'){document.getElementById('tab-optimize').classList.add('active');requestOptimize();}
   else if(name==='sessions'){document.getElementById('tab-sessions').classList.add('active');requestSessions();}
+  else if(name==='estimates'){document.getElementById('tab-estimates').classList.add('active');requestEstimates();}
+  else if(name==='timesheet'){document.getElementById('tab-timesheet').classList.add('active');requestTimesheet();}
+  else if(name==='health'){document.getElementById('tab-health').classList.add('active');requestHealth();}
   else{document.getElementById('dtab').classList.add('active');}
 }
 
-var OPT=null,optDays=30,optWi='',optLoading=false;
-function requestOptimize(){optLoading=true;renderOptimize();vscode.postMessage({type:'optimize',days:optDays,workItemId:optWi||undefined});}
+var OPT=null,optDays=30,optWi='',optProj='',optLoading=false;
+function requestOptimize(){optLoading=true;renderOptimize();vscode.postMessage({type:'optimize',days:optDays,workItemId:optWi||undefined,projectId:optProj||undefined});}
 function n2(v){return(Math.round((v||0)*100)/100).toLocaleString();}
 function sevBadge(s){var c=s==='high'?'bd':s==='medium'?'ba':'bh';return'<span class="badge '+c+'">'+esc(s)+'</span>';}
 function optTable(head,rows,empty){
@@ -975,6 +978,7 @@ function renderOptimize(){
     return'<option value="'+esc(w.workItemId)+'"'+(w.workItemId===optWi?' selected':'')+'>'+esc('#'+w.workItemId+(w.title?' \\u2013 '+w.title:''))+'</option>';
   })).join('');
   var ctl='<div class="rng">'+[7,30,90].map(function(d){return'<button class="dtab'+(d===optDays?' active':'')+'" data-action="optDays" data-value="'+d+'">'+d+' days</button>';}).join('')
+    +'<select id="optProj" style="margin-left:8px;background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px">'+['<option value="">All projects</option>'].concat((PROJ||[]).map(function(p){return'<option value="'+esc(p.projectId)+'"'+(p.projectId===optProj?' selected':'')+'>'+esc(p.name)+'</option>';})).join('')+'</select>'
     +'<select id="optWi" style="margin-left:8px;background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px">'+wiOpts+'</select>'
     +'<button class="dtab" data-action="optRefresh" style="margin-left:8px">\\u21bb Refresh</button></div>';
   var tip='<p style="margin-bottom:16px;font-size:.85em;color:var(--vscode-descriptionForeground)">Based on Copilot debug logs (models, tokens, cache, tools). Savings are list-price <strong>estimates</strong>. Ask Copilot in agent mode, e.g. <em>\\u201cUse the AI Effort Tracker usage insights to tell me how to use fewer credits\\u201d</em> \\u2013 the <strong>AI Effort Tracker usage insights</strong> MCP server gives it this data.</p>';
@@ -1000,11 +1004,157 @@ function renderOptimize(){
     +'<div class="card"><h3>Prompt-cache misses</h3>'+optTable(['Cause','Count','Credits','Avoidable \\u2248'],cb,'None')+'</div></div>'
     +'<div class="cr"><div class="card"><h3>Tool sources (max '+o.tools.maxToolsOffered+' tools offered, '+o.tools.toolSearchCalls+' tool searches)</h3>'+optTable(['Server','Offered','In % of calls','Tools used','Calls','Failed'],srv,'No tool data yet')+'</div>'
     +'<div class="card"><h3>Most used tools</h3>'+optTable(['Tool','Source','Calls','Failed'],tools,'No tool calls')+'</div></div>'
+    +renderEfficiency(OPT.efficiency)+renderToolProfile(OPT.toolProfile)
     +'<div class="card"><h3>Recent chat sessions</h3>'+optTable(['Last activity','Turns','Credits','Models','Max context','Avoidable cache misses','Work item / branch'],ses,'No sessions')+'</div>'
     +'<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">'+esc(o.dataCoverage.note)+' Timing captured for '+o.dataCoverage.withTimingPct+'% of calls.</p>';
   bindOptWi();
 }
-function bindOptWi(){var s=document.getElementById('optWi');if(s)s.addEventListener('change',function(){optWi=this.value;requestOptimize();});}
+function bindOptWi(){
+  var s=document.getElementById('optWi');if(s)s.addEventListener('change',function(){optWi=this.value;requestOptimize();});
+  var p=document.getElementById('optProj');if(p)p.addEventListener('change',function(){optProj=this.value;requestOptimize();});
+}
+// #99 Model efficiency per task type: heat map (green = cheapest in the row).
+function renderEfficiency(ef){
+  if(!ef||!ef.tasks||!ef.tasks.length)return'<div class="card"><h3>Model efficiency by task type</h3><p>No turns with debug-log data in this period.</p></div>';
+  var head=['Task type'].concat(ef.models).concat(['Recommendation']);
+  var cellMap={};ef.cells.forEach(function(c){cellMap[c.model+'|'+c.task]=c;});
+  var rows=ef.tasks.map(function(task){
+    var rec=(ef.recommendations||[]).filter(function(r){return r.task===task;})[0];
+    var metric=task===ef.qaTask?'creditsPerTurn':'creditsPer100Lines';
+    var vals=ef.models.map(function(m){var c=cellMap[m+'|'+task];return c&&!c.smallSample&&c[metric]!=null?c[metric]:null;}).filter(function(v){return v!=null;});
+    var lo=vals.length?Math.min.apply(null,vals):0,hi=vals.length?Math.max.apply(null,vals):0;
+    var cells=ef.models.map(function(m){
+      var c=cellMap[m+'|'+task];if(!c)return'<td style="color:var(--vscode-descriptionForeground)">\u2013</td>';
+      var v=c[metric];
+      var t=(v==null||hi===lo||c.smallSample)?null:(v-lo)/(hi-lo);
+      var bg=t==null?'':'background:rgba('+Math.round(60+160*t)+','+Math.round(170-110*t)+',80,.28);';
+      return'<td style="'+bg+(c.smallSample?'opacity:.55;':'')+'" title="'+esc(c.turns+' turns \u00b7 '+n2(c.credits)+' credits \u00b7 '+n2(c.creditsPerTurn)+' / turn'+(c.creditsPer100Lines!=null?' \u00b7 '+n2(c.creditsPer100Lines)+' / 100 lines':'')+' \u00b7 cache '+c.cacheHitPct+'%'+(c.smallSample?' \u00b7 small sample':''))+'">'
+        +(v==null?'\u2013':n2(v))+'<div style="font-size:.75em;color:var(--vscode-descriptionForeground)">'+c.turns+' turns</div></td>';
+    }).join('');
+    return'<tr><td><strong>'+esc(ef.taskLabels[task]||task)+'</strong><div style="font-size:.75em;color:var(--vscode-descriptionForeground)">'+(metric==='creditsPerTurn'?'credits / turn':'credits / 100 lines')+'</div></td>'+cells
+      +'<td style="font-size:.85em">'+(rec?esc(rec.note)+(rec.potentialSavings>0?' <span style="color:var(--cost);white-space:nowrap">\u2248 '+n2(rec.potentialSavings)+' credits</span>':''):'')+'</td></tr>';
+  });
+  return'<div class="card"><h3>Model efficiency by task type</h3><p style="font-size:.82em;color:var(--vscode-descriptionForeground);margin-bottom:8px">Task type = file category with the most changed lines in the turn (no edits \u2192 Q&amp;A / read-only). Green = cheapest in the row; faded = fewer than '+ef.minSamples+' turns. Savings assume the cheaper model does the same work \u2013 check quality before switching.</p>'
+    +'<div style="overflow-x:auto">'+optTable(head,rows,'No data')+'</div></div>';
+}
+// #102 Tool-set profile: which MCP servers to keep for this project / work item.
+function renderToolProfile(tp){
+  if(!tp||!tp.servers||!tp.servers.length)return'<div class="card"><h3>Tool-set profile</h3><p>No tool-set data captured yet (needs Copilot debug logs with tools_*.json).</p></div>';
+  var badge={keep:'<span class="badge bh">keep</span>',disable:'<span class="badge bd">disable</span>',review:'<span class="badge ba">review</span>'};
+  var rows=tp.servers.map(function(s){
+    return'<tr><td>'+esc(s.server)+'</td><td title="'+esc(s.reason)+'">'+badge[s.recommendation]+'</td><td>'+s.toolsOffered+'</td><td>'+s.offeredInPct+'%</td><td title="'+esc(s.usedTools.join(', '))+'">'+s.usedTools.length+'</td><td>'+s.calls+(s.failed?' <span class="badge bd">'+s.failed+' failed</span>':'')+'</td><td>'+(s.approxTokens/1000).toFixed(1)+'K</td><td>'+esc(s.lastUsed?s.lastUsed.slice(0,10):'never')+'</td></tr>';
+  });
+  var kpi='<div class="sg">'+sc('Keep',String(tp.keep.length),'var(--added)')+sc('Disable',String(tp.disable.length),'var(--deleted)')+sc('Tokens saved / request','\u2248 '+(tp.tokensSavedPerRequest/1000).toFixed(1)+'K')+sc('Credits saved','\u2248 '+n2(tp.estimatedCreditsSaved),'var(--cost)')+'</div>';
+  return'<div class="card"><h3>Tool-set profile'+(optProj||optWi?' (filtered)':'')+'</h3><p style="font-size:.82em;color:var(--vscode-descriptionForeground);margin-bottom:8px">Tool definitions are sent with every request. Servers that were offered but never called in this scope are candidates to switch off in the chat \u201cConfigure Tools\u201d picker (or a tool set / per-workspace mcp.json). Credits saved = same requests without those definitions (list-price estimate).</p>'
+    +kpi+optTable(['Server','Recommendation','Tools','Offered in','Tools used','Calls','Definitions','Last used'],rows,'No servers')
+    +(tp.disable.length?'<p style="margin-top:8px;font-size:.85em"><strong>Minimal set:</strong> '+esc(tp.keep.join(', '))+'</p>':'')+'</div>';
+}
+
+// #101 Timesheet tab: hours per work item and day for one week.
+var TS=null,tsLoading=false,tsWeek='',tsRound='';
+function requestTimesheet(){tsLoading=true;if(!TS)renderTimesheet();vscode.postMessage({type:'timesheet',weekStart:tsWeek||undefined,rounding:tsRound||undefined});}
+function fmtH(h){return h>0?(Math.round(h*100)/100).toFixed(2):'';}
+function renderTimesheet(){
+  var el=document.getElementById('timesheet');if(!el)return;
+  if(!TS){el.innerHTML='<p>'+(tsLoading?'Loading\u2026':'No data yet.')+'</p>';return;}
+  if(TS.error){el.innerHTML='<p style="color:var(--deleted)">'+esc(TS.error)+'</p>';return;}
+  var s=TS.sheet;tsWeek=s.weekStart;tsRound=s.rounding;
+  var names=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  var projName=function(id){if(!id)return'';var p=(PROJ||[]).find(function(x){return x.projectId===id||x.id===id;});return p?(p.name||id):id;};
+  var ro=[['none','Exact'],['0.25','\u00bc h'],['0.5','\u00bd h']].map(function(o){return'<button class="dtab'+(s.rounding===o[0]?' active':'')+'" data-action="tsRound" data-value="'+o[0]+'">'+o[1]+'</button>';}).join('');
+  var ctl='<div class="rng"><button class="dtab" data-action="tsWeek" data-value="-1">\u25c0 Prev</button>'
+    +'<button class="dtab'+(s.weekStart===TS.currentWeek?' active':'')+'" data-action="tsWeek" data-value="0">This week</button>'
+    +'<button class="dtab" data-action="tsWeek" data-value="1">Next \u25b6</button>'
+    +'<span style="margin:0 10px;opacity:.8">Week of '+esc(s.days[0])+' \u2013 '+esc(s.days[6])+'</span>'
+    +'<span style="margin-right:6px;opacity:.8">Rounding:</span>'+ro
+    +'<button class="dtab" style="margin-left:10px" data-action="tsCsv">\u2b07 CSV</button></div>';
+  var head='<tr><th style="text-align:left">Work item</th>'+s.days.map(function(d,i){return'<th style="text-align:right'+(d===TS.today?';color:var(--vscode-textLink-foreground)':'')+'">'+names[i]+'<br><span style="font-weight:normal;opacity:.7">'+esc(d.slice(5))+'</span></th>';}).join('')+'<th style="text-align:right">Total</th></tr>';
+  var body=s.rows.map(function(r){
+    var un=r.workItemId==='__unassigned__';
+    var label=un?'<em>'+esc(r.title||'Unassigned')+'</em>':'<a href="#" data-action="wiOpen" data-id="'+esc(r.workItemId)+'">#'+esc(r.workItemId)+'</a> '+esc(r.title||'')+(r.externalRef?' <span style="opacity:.7">('+esc(r.externalRef)+')</span>':'')+(r.projectId?'<br><span style="opacity:.6;font-size:.85em">'+esc(projName(r.projectId))+'</span>':'');
+    return'<tr><td>'+label+'</td>'+r.cells.map(function(h,i){return'<td style="text-align:right;cursor:pointer" title="Add time for '+esc(s.days[i])+'" data-action="tsAdd" data-id="'+esc(r.workItemId)+'" data-day="'+esc(s.days[i])+'">'+(fmtH(h)||'<span style="opacity:.25">+</span>')+'</td>';}).join('')+'<td style="text-align:right;font-weight:600">'+fmtH(r.total)+'</td></tr>';
+  }).join('');
+  if(!s.rows.length)body='<tr><td colspan="9" style="opacity:.7">No tracked time this week. Use <strong>+ Add time</strong> to log work done outside VS Code.</td></tr>';
+  var foot='<tr style="font-weight:600;border-top:2px solid var(--vscode-panel-border)"><td>Total</td>'+s.dayTotals.map(function(h){return'<td style="text-align:right">'+fmtH(h)+'</td>';}).join('')+'<td style="text-align:right">'+fmtH(s.total)+'</td></tr>';
+  var note=s.rounding!=='none'&&Math.abs(s.total-s.rawTotal)>=0.01?'<p style="font-size:.85em;opacity:.8">Rounded total '+fmtH(s.total)+' h vs. exact '+fmtH(s.rawTotal)+' h.</p>':'';
+  el.innerHTML=ctl+'<p style="margin-bottom:10px;font-size:.85em;color:var(--vscode-descriptionForeground)">Active hours (human, AI and review time plus manual entries) \u2013 the same numbers as the work item totals. Click a cell to add time for that day. <button class="dtab" style="padding:1px 8px" data-action="tsAdd" data-id="__unassigned__" data-day="'+esc(TS.today)+'">+ Add time</button></p>'
+    +'<table style="width:100%"><thead>'+head+'</thead><tbody>'+body+foot+'</tbody></table>'+note;
+}
+
+// #104 Health tab: problems with the tracked data, each with a fix.
+var HEALTH=null,healthLoading=false;
+function requestHealth(){healthLoading=true;renderHealth();vscode.postMessage({type:'health'});}
+function renderHealth(){
+  var el=document.getElementById('health');if(!el)return;
+  var ctl='<div class="rng"><button class="dtab" data-action="healthRefresh">\u21bb Re-check</button></div>';
+  if(!HEALTH){el.innerHTML=ctl+'<p>'+(healthLoading?'Checking\u2026':'No data yet.')+'</p>';return;}
+  var r=HEALTH,sevC={error:'var(--deleted)',warning:'var(--cost)',info:'var(--vscode-descriptionForeground)'};
+  var sevB={error:'<span class="badge bd">error</span>',warning:'<span class="badge ba">warning</span>',info:'<span class="badge bh">hint</span>'};
+  var scoreC=r.score>=90?'var(--added)':r.score>=60?'var(--cost)':'var(--deleted)';
+  var st=r.stats;
+  var kpi='<div class="sg">'+sc('Health score',r.score+' / 100',scoreC)+sc('Errors',String(r.counts.error),r.counts.error?'var(--deleted)':undefined)+sc('Warnings',String(r.counts.warning))+sc('Hints',String(r.counts.info))
+    +sc('Credit rows',st.ledgerEntries.toLocaleString())+sc('Branches',String(st.branches))+sc('Work items',String(st.workItems))
+    +sc('Data file',st.storeBytes==null?'\u2013':(st.storeBytes/1048576).toFixed(1)+' MB'+(st.backups!=null?' \u00b7 '+st.backups+' backups':''))+'</div>';
+  var cards=r.checks.map(function(c){
+    var ex=c.examples.length?'<ul style="margin:8px 0 0 18px">'+c.examples.map(function(x){
+      return'<li style="margin:3px 0">'+esc(x.label)+(x.action?' <button class="dtab" style="padding:1px 8px;margin-left:6px" data-action="healthCmd" data-cmd="'+esc(x.action.command)+'" data-arg="'+esc(x.action.arg||'')+'">'+esc(x.action.label)+'</button>':'')+'</li>';
+    }).join('')+(c.count>c.examples.length?'<li style="color:var(--vscode-descriptionForeground)">\u2026 and '+(c.count-c.examples.length)+' more</li>':'')+'</ul>':'';
+    var fix=c.fix?'<button class="dtab active" data-action="healthCmd" data-cmd="'+esc(c.fix.command)+'" data-arg="'+esc(c.fix.arg||'')+'">\uD83D\uDD27 '+esc(c.fix.label)+'</button>':'';
+    return'<div class="card" style="margin-bottom:12px;border-left:3px solid '+sevC[c.severity]+'"><div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline"><strong>'+sevB[c.severity]+' '+esc(c.title)+' \u2013 '+c.count+'</strong>'+fix+'</div>'
+      +'<p style="margin-top:6px">'+esc(c.detail)+'</p>'+ex+'</div>';
+  }).join('');
+  var ok=r.passed.length?'<div class="card"><h3>\u2705 Passed ('+r.passed.length+')</h3><ul style="margin-left:18px">'+r.passed.map(function(p){return'<li>'+esc(p)+'</li>';}).join('')+'</ul></div>':'';
+  el.innerHTML=ctl+'<p style="margin-bottom:12px;font-size:.85em;color:var(--vscode-descriptionForeground)">Checked '+esc(r.checkedAt.slice(0,16).replace('T',' '))+' UTC. Copilot can read the same report through the <strong>data_health</strong> MCP tool.</p>'
+    +kpi+(r.checks.length?cards:'<div class="card" style="margin-bottom:12px">\u2705 No problems found.</div>')+ok;
+}
+
+// #97/#98 Estimates tab: accuracy of finished work items + suggestions for open ones.
+var EST=null,estLoading=false,estProj='';
+function requestEstimates(){estLoading=true;renderEstimates();vscode.postMessage({type:'estimates',projectId:estProj||undefined});}
+function estFactor(f){if(f==null)return'\\u2014';var c=Math.abs(f-1)<=0.2?'var(--added)':f>1?'var(--deleted)':'var(--review)';return'<span style="color:'+c+'">'+f.toFixed(2)+'\\u00d7</span>';}
+function estRange(r){return r?(r.median+' h <span style="font-size:.8em;color:var(--vscode-descriptionForeground)">('+r.low+'\\u2013'+r.high+')</span>'):'\\u2014';}
+function estGroupRows(list,label){return list.map(function(g){return'<tr><td>'+esc(label?label(g.key):g.key)+'</td><td>'+g.count+'</td><td>'+estFactor(g.medianFactor)+'</td><td>'+g.withinPct+'%</td><td>'+g.overPct+'%</td><td>'+g.underPct+'%</td><td>'+g.meanAbsErrorPct+'%</td></tr>';});}
+function renderEstimates(){
+  var el=document.getElementById('estimates');
+  var projOpts=['<option value="">All projects</option>'].concat((PROJ||[]).map(function(p){return'<option value="'+esc(p.projectId)+'"'+(p.projectId===estProj?' selected':'')+'>'+esc(p.name)+'</option>';})).join('');
+  var ctl='<div class="rng"><select id="estProj" class="sesin">'+projOpts+'</select><button class="dtab" data-action="estRefresh" style="margin-left:8px">\\u21bb Refresh</button></div>';
+  var info='<p style="margin:10px 0;font-size:.85em;color:var(--vscode-descriptionForeground)">A work item counts as <strong>finished</strong> when you mark it done (\\u2713 on the work item) or when it has had no tracked time or credits for 14 days. <strong>Factor</strong> = actual \\u00f7 estimate: 1.00\\u00d7 is spot on, 1.40\\u00d7 took 40% longer. Actual = active tracked time (coding + AI + review, incl. manual entries). Suggestions come from finished items with similar titles or the same project.</p>';
+  if(!EST){el.innerHTML=ctl+info+'<p>'+(estLoading?'Analysing\\u2026':'No data yet.')+'</p>';bindEst();return;}
+  if(EST.error){el.innerHTML=ctl+info+'<p style="color:var(--deleted)">'+esc(EST.error)+'</p>';bindEst();return;}
+  var A=EST.accuracy,O=A.overall;
+  var projName=function(id){var p=(PROJ||[]).find(function(x){return x.projectId===id;});return p?p.name:id;};
+  var stats='<div class="sg">'+sc('Finished items',String(A.finished))+sc('With hour estimate',String(A.rows.length))
+    +sc('Median factor',O?estFactor(O.medianFactor):'\\u2014')+sc('Within \\u00b120%',O?O.withinPct+'%':'\\u2014','var(--added)')
+    +sc('Over / under',O?O.overPct+'% / '+O.underPct+'%':'\\u2014')+sc('Mean abs. error',O?O.meanAbsErrorPct+'%':'\\u2014')+'</div>';
+  var sizeL={small:'< 4 h',medium:'4\\u201316 h',large:'> 16 h'};
+  var gh=['Group','Items','Median factor','Within \\u00b120%','Over','Under','Mean abs. error'];
+  var groups=O?'<div class="cr"><div class="card"><h3>By size</h3>'+optTable(gh,estGroupRows(A.bySize,function(k){return sizeL[k]||k;}),'\\u2014')+'</div>'
+    +'<div class="card"><h3>By project</h3>'+optTable(gh,estGroupRows(A.byProject,projName),'\\u2014')+'</div></div>'
+    +'<div class="cr"><div class="card"><h3>Trend by month</h3><div style="height:200px"><canvas id="estChart"></canvas></div></div>'
+    +'<div class="card"><h3>By category (breakdown estimates)</h3>'+optTable(['Category','Items','Estimated','Actual','Factor'],A.byCategory.map(function(c){return'<tr><td>'+esc(c.category)+'</td><td>'+c.count+'</td><td>'+c.estimateHours+' h</td><td>'+c.actualHours+' h</td><td>'+estFactor(c.factor)+'</td></tr>';}),'No per-category estimates on finished items')+'</div></div>'
+    :'<div class="card" style="margin-bottom:12px">No finished work items with an hour estimate yet'+(A.unestimated?' ('+A.unestimated+' finished without an hour estimate'+(A.points?', '+A.points+' in story points':'')+')':'')+'. Mark work items done to start measuring accuracy.</div>';
+  var fin=A.rows.map(function(r){return'<tr data-action="wiOpen" data-id="'+esc(r.id)+'" style="cursor:pointer"><td>#'+esc(r.id)+(r.title?' \\u2013 '+esc(r.title):'')+'</td><td>'+esc(r.projectId?projName(r.projectId):'')+'</td><td>'+esc(r.month||'')+'</td><td>'+r.estimate+' h</td><td>'+r.actual+' h</td><td>'+estFactor(r.factor)+'</td><td>'+n2(r.credits)+'</td></tr>';});
+  var open=(EST.open||[]).map(function(o){
+    var est=o.estimateHours!=null?o.estimateHours+' h':o.estimatePoints!=null?o.estimatePoints+' pts':'<span class="badge" style="opacity:.75">none</span>';
+    var pct=o.estimateHours?Math.round(o.actualHours/o.estimateHours*100)+'%':'\\u2014';
+    var adj=o.adjusted!=null&&o.biasFactor!=null&&Math.abs(o.biasFactor-1)>0.2?o.adjusted+' h':'\\u2014';
+    var basis={similar:'similar titles',project:'same project',all:'all finished',none:''}[o.basis]||'';
+    return'<tr><td><a href="#" data-action="wiOpen" data-id="'+esc(o.id)+'">#'+esc(o.id)+'</a>'+(o.title?' \\u2013 '+esc(o.title):'')+(o.status==='active'?' <span class="badge bh">active</span>':'')+'</td><td>'+est+'</td><td>'+o.actualHours+' h ('+pct+')</td><td>'+estRange(o.suggestion)+(basis?'<div style="font-size:.75em;color:var(--vscode-descriptionForeground)">'+esc(basis)+'</div>':'')+'</td><td>'+adj+'</td>'
+      +'<td style="white-space:nowrap"><button class="dtab" data-action="estSet" data-id="'+esc(o.id)+'">\\uD83D\\uDCCF Estimate</button> <button class="dtab" data-action="wiDone" data-id="'+esc(o.id)+'">\\u2713 Done</button></td></tr>';
+  });
+  el.innerHTML=ctl+info+stats+groups
+    +'<div class="card"><h3>Open work items</h3>'+optTable(['Work item','Estimate','Actual (used)','Suggested','Bias-adjusted','' ],open,'No open work items')+'</div>'
+    +'<div class="card" style="margin-top:12px"><h3>Finished work items</h3>'+optTable(['Work item','Project','Finished','Estimate','Actual','Factor','Credits'],fin,'None yet')+'</div>';
+  bindEst();
+  if(O&&typeof Chart!=='undefined'){
+    var cv=document.getElementById('estChart');
+    if(cv){dc('est');charts.est=new Chart(cv,{type:'line',data:{labels:A.byMonth.map(function(g){return g.key;}),datasets:[
+      {label:'Median factor',data:A.byMonth.map(function(g){return g.medianFactor;}),borderColor:'#c586c0',yAxisID:'y',tension:.25},
+      {label:'Within \\u00b120% (%)',data:A.byMonth.map(function(g){return g.withinPct;}),borderColor:'#4ec9b0',yAxisID:'y1',tension:.25}]},
+      options:{responsive:true,maintainAspectRatio:false,scales:{y:{position:'left',title:{display:true,text:'factor'}},y1:{position:'right',min:0,max:100,grid:{drawOnChartArea:false}}}}});}
+  }
+}
+function bindEst(){var s=document.getElementById('estProj');if(s)s.addEventListener('change',function(){estProj=this.value;requestEstimates();});}
 
 // #95 Sessions tab: all chat sessions with titles, filters, sorting, paging, CSV.
 var SES=null,sesLoading=false,sesOpen={},sesDet={};
@@ -1027,7 +1177,7 @@ function sesDetailHtml(id){
     var p=P[t.turnId];
     return'<tr><td style="white-space:nowrap">'+sesWhen(t.at)+'</td><td style="max-width:320px">'+(p?esc(p):'<span style="color:var(--vscode-descriptionForeground)">\\u2014</span>')+'</td><td>'+esc((t.models||[]).join(', '))+'</td><td>'+t.calls+'</td><td>'+n2(t.credits)+'</td><td>'+t.cacheHitPct+'%</td><td>'+(tools||'\\u2014')+'</td><td>+'+add+' / \\u2212'+rem+'</td><td>'+(cb||'\\u2014')+'</td><td>'+esc(t.workItemId?('#'+t.workItemId):(t.branch||''))+'</td><td><button class="dtab" data-action="ledEdit" data-id="'+esc(t.entryId||'')+'" title="Edit / reassign this turn\\u2019s credits to another work item">\\u270E</button></td></tr>';
   });
-  return'<div style="padding:6px 0"><div style="font-size:.8em;color:var(--vscode-descriptionForeground);margin-bottom:6px">Session '+esc(id)+'</div>'
+  return'<div style="padding:6px 0"><div style="font-size:.8em;color:var(--vscode-descriptionForeground);margin-bottom:6px">Session '+esc(id)+' <button class="dtab" style="padding:1px 8px;margin-left:8px" data-action="handoff" data-id="'+esc(id)+'" title="Open a new chat pre-filled with a summary of this one (work item, branch, files, commits)">\u21aa New chat with handoff</button></div>'
     +optTable(['Turn','Prompt','Models','Calls','Credits','Cache hit','Top tools','Lines','Cache misses','Work item','' ],rows,'No turns')+'</div>';
 }
 function renderSessions(){
@@ -1088,7 +1238,10 @@ window.addEventListener('message',function(e){
   if(msg.type==='sessionsData'){sesLoading=false;SES=msg;var sv=document.querySelector('.view.active');if(sv&&sv.id==='sessions')renderSessions();return;}
   if(msg.type==='sessionDetailData'){sesDet[msg.sessionId]=msg;var dv=document.querySelector('.view.active');if(dv&&dv.id==='sessions')renderSessions();return;}
   if(msg.type==='openWorkItem'&&msg.id){selWi=String(msg.id);projView='workitem';showTab('projects');return;}
-  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
+  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions','estimates','timesheet','health'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
+  if(msg.type==='timesheetData'){tsLoading=false;TS=msg;var tv=document.querySelector('.view.active');if(tv&&tv.id==='timesheet')renderTimesheet();return;}
+  if(msg.type==='healthData'){healthLoading=false;HEALTH=msg.report;var hv=document.querySelector('.view.active');if(hv&&hv.id==='health')renderHealth();return;}
+  if(msg.type==='estimatesData'){estLoading=false;EST=msg;var ev=document.querySelector('.view.active');if(ev&&ev.id==='estimates')renderEstimates();return;}
   if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
   if(msg.type==='update'){
     allData=msg.summaries;currentBranch=msg.currentBranch;
@@ -1109,6 +1262,7 @@ window.addEventListener('message',function(e){
     else if(av&&av.id==='ghview')renderGhMetrics();
     else if(av&&av.id==='projects')renderProjectsView();
     else if(av&&av.id==='ledger')renderLedger();
+    else if(av&&av.id==='timesheet')requestTimesheet();
     else if(av&&av.id==='detail'){var dt=document.getElementById('dtab');if(dt&&dt.dataset.branch)showDetail(dt.dataset.branch);}
   }
 });
@@ -1123,6 +1277,9 @@ document.getElementById('tab-projects').addEventListener('click',function(){show
 document.getElementById('tab-ledger').addEventListener('click',function(){showTab('ledger');});
 document.getElementById('tab-optimize').addEventListener('click',function(){showTab('optimize');});
 document.getElementById('tab-sessions').addEventListener('click',function(){showTab('sessions');});
+document.getElementById('tab-estimates').addEventListener('click',function(){showTab('estimates');});
+document.getElementById('tab-timesheet').addEventListener('click',function(){showTab('timesheet');});
+document.getElementById('tab-health').addEventListener('click',function(){showTab('health');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -1165,6 +1322,17 @@ document.addEventListener('click',function(e){
   else if(a==='tadjReset')vscode.postMessage({type:'cmd',value:'resetTrackedTime',arg:t.dataset.id});
   else if(a==='estSet')vscode.postMessage({type:'cmd',value:'setWorkItemEstimate',arg:t.dataset.id});
   else if(a==='budSet')vscode.postMessage({type:'cmd',value:'setWorkItemBudget',arg:t.dataset.id});
+  else if(a==='wiDone')vscode.postMessage({type:'cmd',value:'markWorkItemDone',arg:t.dataset.id});
+  else if(a==='wiReopen')vscode.postMessage({type:'cmd',value:'reopenWorkItem',arg:t.dataset.id});
+  else if(a==='wiOpen'){e.preventDefault();selWi=t.dataset.id;projView='workitem';showTab('projects');}
+  else if(a==='estRefresh')requestEstimates();
+  else if(a==='healthRefresh')requestHealth();
+  else if(a==='handoff'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'newChatWithHandoff',arg:t.dataset.id});}
+  else if(a==='tsWeek'){var dv=parseInt(v,10)||0;if(dv===0||!tsWeek){tsWeek='';}else{var p=tsWeek.split('-').map(Number);var nd=new Date(p[0],p[1]-1,p[2]+7*dv);tsWeek=nd.getFullYear()+'-'+String(nd.getMonth()+1).padStart(2,'0')+'-'+String(nd.getDate()).padStart(2,'0');}requestTimesheet();}
+  else if(a==='tsRound'){tsRound=v;requestTimesheet();}
+  else if(a==='tsCsv')vscode.postMessage({type:'cmd',value:'exportTimesheetCsv',arg:(tsWeek||'')+'\\u0000'+(tsRound||'')});
+  else if(a==='tsAdd'){e.preventDefault();vscode.postMessage({type:'cmd',value:'timesheetAddEntry',arg:(t.dataset.id||'')+'\\u0000'+(t.dataset.day||'')});}
+  else if(a==='healthCmd'){vscode.postMessage({type:'cmd',value:t.dataset.cmd,arg:t.dataset.arg||undefined});setTimeout(requestHealth,1500);}
   else if(a==='ratesSet')vscode.postMessage({type:'cmd',value:'setProjectRates',arg:t.dataset.id});
 });
 vscode.postMessage({type:'ready'});`;
@@ -1187,6 +1355,9 @@ vscode.postMessage({type:'ready'});`;
     '  <button class="tab" id="tab-ledger">\uD83E\uDDFE Ledger</button>',
     '  <button class="tab" id="tab-optimize">\uD83D\uDCA1 Optimize</button>',
     '  <button class="tab" id="tab-sessions">\uD83D\uDCAC Sessions</button>',
+    '  <button class="tab" id="tab-estimates">\uD83D\uDCD0 Estimates</button>',
+    '  <button class="tab" id="tab-timesheet">\uD83D\uDDD3 Timesheet</button>',
+    '  <button class="tab" id="tab-health">\uD83E\uDE7A Health</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
@@ -1197,6 +1368,9 @@ vscode.postMessage({type:'ready'});`;
     '<div id="ledger" class="view"></div>',
     '<div id="optimize" class="view"></div>',
     '<div id="sessions" class="view"></div>',
+    '<div id="estimates" class="view"></div>',
+    '<div id="timesheet" class="view"></div>',
+    '<div id="health" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,

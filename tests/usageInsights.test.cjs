@@ -223,7 +223,7 @@ test('JSON-RPC handler negotiates protocol and rejects unknown input', () => {
   assert.equal(handle({ jsonrpc: '2.0', id: 3, method: 'nope' }).error.code, -32601);
   assert.equal(handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'nope' } }).error.code, -32602);
   const tools = handle({ jsonrpc: '2.0', id: 5, method: 'tools/list' }).result.tools;
-  assert.deepEqual(tools.map(x => x.name), ['usage_overview', 'optimization_findings', 'list_work_items', 'list_sessions', 'session_detail']);
+  assert.deepEqual(tools.map(x => x.name), ['usage_overview', 'optimization_findings', 'list_work_items', 'list_sessions', 'session_detail', 'model_efficiency', 'tool_profile', 'suggest_estimate', 'estimate_accuracy', 'data_health']);
   assert.ok(tools.every(x => x.annotations.readOnlyHint));
 });
 

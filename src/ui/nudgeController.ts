@@ -18,6 +18,7 @@ const LIVE_WINDOW_MS = 30 * 60_000;
 const DONT_SHOW = "Don't show again for this chat";
 const MUTE = 'Mute this nudge';
 const OPEN = 'Open Optimize';
+const HANDOFF = 'New chat with handoff';
 
 const TYPE_SETTING: Record<NudgeType, string> = {
   'model-switch': 'nudges.modelSwitch',
@@ -102,7 +103,8 @@ export class NudgeController implements vscode.Disposable {
   }
 
   private async show(n: Nudge): Promise<void> {
-    const pick = await vscode.window.showInformationMessage(`\u{1F4A1} ${n.title}. ${n.message}`, DONT_SHOW, MUTE, OPEN);
+    const actions = n.type === 'context-growth' ? [HANDOFF, DONT_SHOW, MUTE] : [DONT_SHOW, MUTE, OPEN];
+    const pick = await vscode.window.showInformationMessage(`\u{1F4A1} ${n.title}. ${n.message}`, ...actions);
     if (pick === DONT_SHOW || pick === MUTE) {
       const state = this.state();
       if (pick === DONT_SHOW && !state.mutedSessions.includes(n.sessionId)) state.mutedSessions.push(n.sessionId);
@@ -111,6 +113,8 @@ export class NudgeController implements vscode.Disposable {
       if (pick === MUTE) {
         vscode.window.showInformationMessage(`Nudge muted. Re-enable it with "AI Effort Tracker: Reset Nudge Mutes" or the aiEffortTracker.${TYPE_SETTING[n.type]} setting.`);
       }
+    } else if (pick === HANDOFF) {
+      await vscode.commands.executeCommand('aiEffortTracker.newChatWithHandoff', n.sessionId);
     } else if (pick === OPEN) {
       await vscode.commands.executeCommand('aiEffortTracker.openDashboardTab', 'optimize');
     }

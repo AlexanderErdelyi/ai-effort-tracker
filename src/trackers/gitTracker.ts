@@ -72,6 +72,15 @@ export class GitTracker implements vscode.Disposable {
     return out ? parseReflog(out) : [];
   }
 
+  /** Recent commits on HEAD as "abc1234 subject", newest first; empty when unavailable. */
+  static async getRecentCommits(count = 5): Promise<string[]> {
+    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!wsFolder) return [];
+    const n = Math.max(1, Math.min(20, Math.round(count)));
+    const out = await GitTracker.exec(`git log -n ${n} --format=%h%x20%s`, wsFolder);
+    return out ? out.split(/\r?\n/).map(l => l.trim()).filter(Boolean) : [];
+  }
+
   static extractWorkItemId(branch: string): string | undefined {
     // Single source of truth: the regex lives in the store module so migration
     // ({@link assignUnmappedBranches}) and live tracking share one implementation.

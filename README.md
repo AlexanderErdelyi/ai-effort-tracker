@@ -182,6 +182,11 @@ review before importing overlapping history.
 The dashboard's **💡 Optimize** tab and the built-in MCP server analyse the recorded
 debug-log usage to show where credits go and how to use fewer of them:
 
+- a **model efficiency** heat map: credits per turn and per changed line for each
+  model × task type (Q&A, programming, docs, spec, …), with a cheaper model
+  suggested where one did the same kind of work for less;
+- a **tool-set profile**: tools offered per request vs. tools used, and which MCP
+  servers to keep, disable or review, with a minimal set and the tokens saved;
 - credits, calls, tokens and prompt-cache hit rate by model, agent, reasoning
   effort and subagents; recent chat sessions with their context size;
 - prompt-cache misses by cause — new chat/subagent (expected), **model switch**
@@ -214,6 +219,11 @@ or *"Analyse my usage for work item 1987"*. Tools:
 | `list_work_items` | Credits per work item plus budget status (used %, projection, warning/over), to choose a scope |
 | `list_sessions` | Recent chat sessions with models, context size, avoidable cache misses; `includeTitles` adds chat titles |
 | `session_detail` | Per-turn breakdown of one chat; `includePrompts` adds short prompt excerpts |
+| `model_efficiency` | Credits per turn and per changed line for each model × task type, with cheaper-model recommendations |
+| `tool_profile` | Enabled tool sources vs. tools actually used; which MCP servers to keep, disable or review, and the tokens it would save |
+| `suggest_estimate` | Hours and credits for a new work item from similar finished ones, corrected by your estimation bias |
+| `estimate_accuracy` | Estimated vs. actual hours of finished work items, bias by category and over time |
+| `data_health` | The data health report (see below) |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -268,12 +278,68 @@ tip with the credits at stake:
 
 Any two nudges are at least 10 minutes apart and cache nudges ignore breaks that
 wasted under 2 credits. Each notification offers **Don't show again for this chat**,
-**Mute this nudge** and **Open Optimize**; **AI Effort Tracker: Reset Nudge Mutes**
+**Mute this nudge** and **Open Optimize** (the context-growth nudge offers
+**New chat with handoff** instead of Open Optimize); **AI Effort Tracker: Reset Nudge Mutes**
 undoes the mutes. Nudges use only recorded token and credit metadata, never prompt
 content, and never fire for history imported from older logs. Turn them off with
 `aiEffortTracker.nudges.enabled`, per type with `aiEffortTracker.nudges.modelSwitch`,
 `idleCache`, `contextGrowth`, `lightTurns` and `toolBloat`, and hide the running
 cost with `aiEffortTracker.nudges.showLiveChatCost`.
+
+## Chat handoff
+
+When a chat gets large, **AI Effort Tracker: New Chat with Handoff** (also on the
+context-growth nudge and on each chat in the Sessions tab) opens a new chat with a
+summary pre-filled but not sent: work item, branch, files changed in the chat,
+recent commits, the chat title and its first and last prompt. Finish the last line
+and send it. The prompt is also copied to the clipboard. Prompt excerpts are read
+from Copilot's local debug log on demand and never stored; leave them out with
+`aiEffortTracker.handoff.includePrompts`.
+
+## Estimates
+
+The **📐 Estimates** tab compares estimated and actual hours of finished work items
+(mark them with **Mark Work Item Done**): your bias overall, per category and over
+time. For open work items it suggests hours and credits from similar finished
+items (title words, project) and shows your estimate corrected by your bias. New
+work items get the suggestion as the default estimate.
+
+## Model efficiency and tool profiles
+
+See the Optimize tab above: it answers "which model is cheapest for this kind of
+task" from your own history and "which tools can I switch off". Both are also
+available to Copilot through the MCP tools `model_efficiency` and `tool_profile`.
+
+## Timesheet
+
+The **🗓 Timesheet** tab shows one week of active hours per work item and day
+(tracked time plus manual entries, the same numbers as the work item totals), with
+day and week totals and a row for branches without a work item. Click a cell to
+add time for that work item and day; entries appear in the work item's time log.
+Round to exact, ¼ or ½ hours (default `aiEffortTracker.timesheet.rounding`) and
+export the week as CSV (work item, external ref, title, day, hours).
+
+## Away detection
+
+When you come back to VS Code after being away (idle, another app, a meeting,
+sleep) for at least `aiEffortTracker.away.minMinutes` (15) and at most
+`away.maxMinutes` (240), the tracker asks how to count the time: **Meeting**,
+**Review / thinking**, **Other work…** (pick a work item and category) or
+**Don't count**. The answer is logged as a time entry on the current branch's work
+item. Time during which another VS Code window was active is not asked about
+(windows share a small activity file). Turn the prompt off with
+`aiEffortTracker.away.prompt`.
+
+## Data health
+
+**AI Effort Tracker: Check Data Health** and the **🩺 Health** tab check the store
+for problems and show a score: save errors, missing backups, schema, store size,
+invalid numbers, duplicate ledger rows, orphaned references, branches and credits
+without a work item, stale credit attribution, work items without a project or
+estimate, projects without rates, unpriced requests and models without prices,
+future timestamps and implausible days. Most findings have a one-click fix or a
+button that opens the right command. Copilot can read the report through the MCP
+tool `data_health`.
 
 ## Development
 

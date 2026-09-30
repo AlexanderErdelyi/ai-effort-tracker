@@ -12,6 +12,9 @@ import {
   type BudgetDimension,
   type BudgetStatus
 } from '../analysis/budget';
+import { CATEGORY_RULES_SNAPSHOT_FILE } from '../analysis/efficiency';
+import { readUserRules } from '../util/fileTypes';
+import { ESTIMATION_SNAPSHOT_FILE, toEstimationItem, type EstimationItem } from '../analysis/estimation';
 
 const CHECK_MS = 60_000;
 const DIM_LABEL: Record<BudgetDimension, string> = { time: 'time', credits: 'credit', cost: 'money' };
@@ -29,9 +32,14 @@ export class BudgetMonitor implements vscode.Disposable {
   private readonly sub: vscode.Disposable;
   private running = false;
 
-  private lastSnapshot = '';
+  private readonly lastWritten = new Map<string, string>();
 
-  constructor(private readonly db: Database, private readonly storageDir?: string) {
+  constructor(
+    private readonly db: Database,
+    private readonly storageDir?: string,
+    /** Extra per-machine snapshots for the MCP server (file name \u2192 payload), e.g. data health. */
+    private readonly extraSnapshots?: () => Record<string, Record<string, unknown>>
+  ) {
     this.timer = setInterval(() => void this.refresh(), CHECK_MS);
     this.first = setTimeout(() => void this.refresh(), 5_000);
     this.sub = vscode.workspace.onDidChangeConfiguration(e => {
@@ -83,9 +91,11 @@ export class BudgetMonitor implements vscode.Disposable {
   /** Alert on newly crossed thresholds (focused window only) and refresh the MCP snapshot. */
   private checkAll(alerts: boolean): void {
     const snapshot: Record<string, BudgetSnapshotItem> = {};
+    const estimation: EstimationItem[] = [];
     for (const wi of this.db.getAllWorkItems()) {
       if (wi.id === UNASSIGNED_WORK_ITEM_ID) continue;
       const summary = this.db.getWorkItemSummary(wi.id);
+      if (wi.id !== 'unknown') estimation.push(toEstimationItem(summary));
       const b = summary.budget;
       if (!b) continue;
       snapshot[wi.id] = snapshotOf(b, summary.roi?.currency);
@@ -97,7 +107,16 @@ export class BudgetMonitor implements vscode.Disposable {
       // the user with alerts for old, finished work.
       if (fire.length && budgetIsActive(b)) void notify(wi.id, summary.title, b, Math.max(...fire), summary.roi?.currency);
     }
-    this.writeSnapshot(snapshot);
+    this.writeSnapshot(BUDGET_SNAPSHOT_FILE, { workItems: snapshot });
+    // #97/#98: finished-item history for the MCP estimation tools.
+    this.writeSnapshot(ESTIMATION_SNAPSHOT_FILE, { items: estimation });
+    // #99: the MCP server classifies older turns with the user's category rules.
+    this.writeSnapshot(CATEGORY_RULES_SNAPSHOT_FILE, { rules: readUserRules() });
+    try {
+      for (const [file, payload] of Object.entries(this.extraSnapshots?.() ?? {})) this.writeSnapshot(file, payload);
+    } catch (error) {
+      console.error('AI Effort Tracker: snapshot failed', error);
+    }
   }
 
   /**
@@ -105,15 +124,15 @@ export class BudgetMonitor implements vscode.Disposable {
    * VS Code settings. Per machine, outside the synced store; rewritten only
    * when it changes.
    */
-  private writeSnapshot(workItems: Record<string, BudgetSnapshotItem>): void {
+  private writeSnapshot(file: string, payload: Record<string, unknown>): void {
     if (!this.storageDir) return;
-    const body = JSON.stringify(workItems);
-    if (body === this.lastSnapshot) return;
+    const body = JSON.stringify(payload);
+    if (body === this.lastWritten.get(file)) return;
     try {
-      atomicWrite(path.join(this.storageDir, BUDGET_SNAPSHOT_FILE), JSON.stringify({ generatedAt: new Date().toISOString(), workItems }));
-      this.lastSnapshot = body;
+      atomicWrite(path.join(this.storageDir, file), JSON.stringify({ generatedAt: new Date().toISOString(), ...payload }));
+      this.lastWritten.set(file, body);
     } catch (error) {
-      console.error('AI Effort Tracker: budget snapshot write failed', error);
+      console.error(`AI Effort Tracker: ${file} write failed`, error);
     }
   }
 

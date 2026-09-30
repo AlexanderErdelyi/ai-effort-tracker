@@ -187,3 +187,28 @@ test('branch refresh does not overlap asynchronous git lookups or apply after di
   await second;
   assert.equal(branch, 'feature/123-work');
 });
+
+test('#103 onAwayEnded fires once with the idle stretch, including sleep gaps', t => {
+  const { tracker, advance } = fixture(t);
+  const events = [];
+  tracker.onAwayEnded((s, e) => events.push([s, e]));
+  tracker.setBranch('branch-a');
+  tracker.startTracking();
+  tracker.markEdit('human');
+  advance(1000); tracker.tick();
+  const t0 = Date.now();
+  for (let i = 0; i < 200; i++) { advance(1000); tracker.tick(); }
+  assert.equal(tracker.getMode(), 'idle');
+  assert.equal(events.length, 0);
+  const idleAt = t0 + 120000;
+  advance(30 * 60000); tracker.tick();
+  tracker.markEdit('human');
+  advance(1000); tracker.tick();
+  assert.equal(events.length, 1);
+  assert.ok(Math.abs(events[0][0] - idleAt) <= 2000, 'away starts when the tracker went idle');
+  assert.equal(events[0][1], Date.now());
+  const sleepStart = Date.now();
+  advance(40 * 60000); tracker.markEdit('human'); tracker.tick();
+  assert.equal(events.length, 2);
+  assert.equal(events[1][0], sleepStart);
+});

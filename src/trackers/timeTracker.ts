@@ -38,6 +38,9 @@ export class TimeTracker implements vscode.Disposable {
   private focusHumanMs = 0;
   private focusAiMs = 0;
   private statusTick = 0;
+  // #103: when this window stopped being active (idle, unfocused or asleep).
+  private awaySince: number | null = null;
+  private awayListeners: ((start: number, end: number) => void)[] = [];
 
   constructor(private db: Database, private statusBar: StatusBarManager) {}
 
@@ -132,6 +135,12 @@ export class TimeTracker implements vscode.Disposable {
     this.currentBranch = branch;
   }
 
+  /** #103: called with [start, end] when the user comes back after an idle/away stretch. */
+  onAwayEnded(listener: (start: number, end: number) => void): vscode.Disposable {
+    this.awayListeners.push(listener);
+    return { dispose: () => { this.awayListeners = this.awayListeners.filter(l => l !== listener); } };
+  }
+
   getMode(): TrackingMode { return this.mode; }
   getBranch(): string { return this.currentBranch; }
 
@@ -139,6 +148,8 @@ export class TimeTracker implements vscode.Disposable {
     if (!this.isTracking) return;
     const now = Date.now();
     const delta = now - this.lastTickAt;
+    // Sleep / stall: the away stretch began at the last tick.
+    if (delta > MAX_TICK_GAP_MS && this.awaySince === null) this.awaySince = this.lastTickAt;
     this.lastTickAt = now;
     if (delta > 0 && delta <= MAX_TICK_GAP_MS) {
       this.db.recordTime(this.currentBranch, this.mode, delta);
@@ -147,7 +158,17 @@ export class TimeTracker implements vscode.Disposable {
       // A long gap (sleep / stall) breaks the current focus streak.
       this.endFocusSession();
     }
-    this.setMode(this.computeMode(now));
+    const next = this.computeMode(now);
+    if (next === 'idle') {
+      if (this.awaySince === null) this.awaySince = now;
+    } else if (this.awaySince !== null) {
+      const start = this.awaySince;
+      this.awaySince = null;
+      for (const l of this.awayListeners) {
+        try { l(start, now); } catch (error) { console.error('AI Effort Tracker: away listener failed', error); }
+      }
+    }
+    this.setMode(next);
 
     // Refresh the "today / goal" status bar item every ~5s (cheap aggregation).
     if (++this.statusTick % 5 === 0) {
