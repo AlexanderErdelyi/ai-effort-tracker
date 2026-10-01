@@ -1001,14 +1001,16 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         const r = node.row;
         const open = node.section === 'open';
         const blocks = open ? r.todo : r.ok;
-        const item = new vscode.TreeItem(path.posix.basename(r.path), blocks.length ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
+        // A single block is the file itself (e.g. a new AL object), so only several blocks get a drill-down.
+        const item = new vscode.TreeItem(path.posix.basename(r.path), blocks.length > 1 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
         item.id = `review:file:${node.section}:${r.path}`;
         const dir = path.posix.dirname(r.path);
         const done = r.reviewed >= r.total;
         const counts = open ? `${r.reviewed}/${r.total}` : `${plural(r.reviewed, 'line')}${done ? '' : ` of ${r.total}`}`;
         item.description = `${node.showDir && dir !== '.' ? dir + ' · ' : ''}${counts}${r.issueLines ? ' · ⚑' : ''}`;
         item.tooltip = `${r.path}\n${r.reviewed} of ${r.total} changed lines reviewed (${R.coveragePct(r.reviewed, r.total)} %)${r.issueLines ? `\n${plural(r.issueLines, 'flagged line')}` : ''}`
-          + `\n${open ? 'Expand for the blocks still to review.' : 'Expand for the reviewed blocks.'} Click to open.`;
+          + (blocks.length === 1 ? `\n${blockLabel(blocks[0])}` : '')
+          + `\n${blocks.length > 1 ? (open ? 'Expand for the blocks still to review. ' : 'Expand for the reviewed blocks. ') : ''}Click to open.`;
         item.resourceUri = vscode.Uri.file(path.join(r.root, r.path));
         // Expandable rows with a resourceUri get the folder icon unless told they are files.
         item.iconPath = vscode.ThemeIcon.File;
@@ -1023,7 +1025,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       case 'block': {
         const { row, block: b } = node;
         const open = node.section === 'open';
-        const range = b.start === b.end ? `line ${b.start + 1}` : `lines ${b.start + 1}–${b.end + 1}`;
+        const range = blockRange(b);
         const item = new vscode.TreeItem(b.context || range);
         item.id = `review:block:${node.section}:${row.path}:${b.start}`;
         item.description = `${b.context ? range + ' · ' : ''}${plural(b.lines, 'line')}`;
@@ -1077,7 +1079,10 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     if (node.kind === 'resolvedGroup') return (snap.cov.resolved ?? []).map(issue => ({ kind: 'resolved', issue }));
     if (node.kind === 'section') return this.fileNodes(node.section === 'open' ? this.openRows(snap) : this.doneRows(snap), node.section);
     if (node.kind === 'group') return node.group.children.map(n => this.toNode(n, node.section));
-    if (node.kind === 'file') return (node.section === 'open' ? node.row.todo : node.row.ok).map(block => ({ kind: 'block', row: node.row, block, section: node.section }));
+    if (node.kind === 'file') {
+      const blocks = node.section === 'open' ? node.row.todo : node.row.ok;
+      return blocks.length > 1 ? blocks.map(block => ({ kind: 'block', row: node.row, block, section: node.section })) : [];
+    }
     return [];
   }
 
@@ -1124,6 +1129,14 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
 /** Checkbox of a Review view row: open rows are unchecked (check = mark reviewed), reviewed rows checked (uncheck = remove marks). */
 function checkbox(open: boolean, tooltip: string): vscode.TreeItemCheckboxState | { state: vscode.TreeItemCheckboxState; tooltip: string } {
   return { state: open ? vscode.TreeItemCheckboxState.Unchecked : vscode.TreeItemCheckboxState.Checked, tooltip };
+}
+
+function blockRange(b: Block): string {
+  return b.start === b.end ? `line ${b.start + 1}` : `lines ${b.start + 1}–${b.end + 1}`;
+}
+
+function blockLabel(b: Block): string {
+  return `${b.context ? b.context + ' · ' : ''}${blockRange(b)}`;
 }
 
 function collectRows(g: T.ReviewTreeGroup<FileRow>): FileRow[] {
