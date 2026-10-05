@@ -278,6 +278,9 @@ Work Item Budget** or the **💰 Set Budget** button on the work item's budget c
 - The work item detail shows used %, a linear end-of-work projection, and a
   burn-down chart of hours and credits against the budget lines, plus the split
   by category and branch.
+- Hover any KPI card or budget row marked ⓘ (work item and branch detail) to see
+  what the value means and how it was calculated from your own numbers and rates
+  (e.g. `Budget = 6h × €44.00/h = €264.00`).
 - Project work item lists get a budget column and are sorted by risk.
 - A status bar item shows the current branch's work item (e.g. `WI 1761: 64% · 3.2h left`),
   turning yellow at the warning threshold and red when over.
