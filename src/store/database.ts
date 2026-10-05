@@ -817,6 +817,8 @@ export interface WorkItemSummary {
    * source as {@link roi} so they can never disagree. Display-only / derived.
    */
   generated: GeneratedValue;
+  /** Where {@link RoiFigures.chargeableHours} comes from: Set Billable Hours, the hour estimate, or the actual hours. */
+  billableSource?: 'set' | 'estimate' | 'actual';
   /**
    * The itemised time-log entries that roll up into THIS work item (issue #60),
    * newest first — branch-scoped entries on the work item's mapped branches plus
@@ -3181,6 +3183,13 @@ export class Database {
    * A 'points' estimate never counts (it is not a duration). Always returns a
    * finite, non-negative number. Pure over its inputs.
    */
+  private billableSourceOf(wi: WorkItem): 'set' | 'estimate' | 'actual' {
+    const o = wi.billableHours;
+    if (typeof o === 'number' && Number.isFinite(o) && o >= 0) return 'set';
+    const est = (wi.estimateUnit ?? 'hours') === 'hours' ? workItemTotalEstimate(wi) : null;
+    return est !== null && Number.isFinite(est) && est >= 0 ? 'estimate' : 'actual';
+  }
+
   private effectiveBillableHours(wi: WorkItem, actualHours: number): number {
     const override = wi.billableHours;
     if (typeof override === 'number' && Number.isFinite(override) && override >= 0) {
@@ -3364,6 +3373,7 @@ export class Database {
       manual,
       roi,
       generated,
+      billableSource: this.billableSourceOf(wi),
       timeEntries: this.timeEntriesForWorkItem(workItemId),
       budget: this.budgetFor(wi, actualHours, credits.credits, roi, rollup.effectiveByCategory, branchSummaries, daily),
       activity: activityOf(daily),

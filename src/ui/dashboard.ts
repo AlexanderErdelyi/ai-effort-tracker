@@ -88,6 +88,8 @@ export function renderDashboardHtml(
   .sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px;}
   .st{background:var(--vscode-editor-inactiveSelectionBackground);border:1px solid var(--vscode-panel-border);border-radius:8px;padding:12px 16px;}
   .st .lbl{font-size:.75em;color:var(--vscode-descriptionForeground);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;}
+  .st.tip{cursor:help;}
+  .st .lbl .ti{opacity:.55;text-transform:none;}
   .st .val{font-size:1.4em;font-weight:700;letter-spacing:-.02em;}
   .ovh{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px;}
   .ovt{font-size:1.25em;font-weight:600;}
@@ -215,7 +217,64 @@ function insights(d){
   return {activeMin:activeMin,totalNet:totalNet,aiNet:aiNet,humanNet:humanNet,aiShare:aiShare,velocity:velocity,manualEquivMin:manualEquivMin,timeSavedMin:timeSavedMin,credits:credits,aiCost:aiCost,savedValue:savedValue,roi:roi,currency:currency,actualHours:actualHours,billableHours:billableHours,invoiceValue:invoiceValue,netGain:netGain,profit:profit,chatTurns:d.chatTurnsHuman||0,chatChars:d.chatCharsHuman||0};
 }
 function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
-function sc(lbl,val,color){return'<div class="st"><div class="lbl">'+lbl+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
+function sc(lbl,val,color,tip){return'<div class="st'+(tip?' tip':'')+'"'+(tip?' title="'+esc(tip)+'"':'')+'><div class="lbl">'+lbl+(tip?' <span class="ti">\\u24D8</span>':'')+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
+function tH(x){return x==null?'\\u2014':(Math.round(x*100)/100)+'h';}
+function tR(v,cur){return v==null?'not set':fmtMoney(v,cur)+'/h';}
+var RATES_HINT='Rates come from the project (\\u270E Edit Rates).';
+function aiSpendTip(R,credits,cur){
+  if(R.creditCost==null)return'Money spent on Copilot credits. Needs a credit price: set it with Edit Rates on the project.';
+  var derived=R.creditCostPerUnit!=null&&Math.abs(credits*R.creditCostPerUnit-R.creditCost)<0.005;
+  return'Money spent on Copilot credits.\\n'+(derived
+    ?'= '+credits.toFixed(1)+' credits \\u00d7 '+fmtMoney(R.creditCostPerUnit,cur,4)+' per credit = '+fmtMoney(R.creditCost,cur)
+    :'= the cost recorded on the credit ledger entries: '+fmtMoney(R.creditCost,cur));
+}
+function wiTips(w,I){
+  var R=roiOf(w),cur=I.currency,m=function(v){return fmtMoney(v,cur);};
+  var G=w.generated||{},A=R.actualHours,B=R.chargeableHours,sell=R.hourlySellRate,cost=R.hourlyCostRate,credit=R.creditCost||0;
+  var lines=I.totalNet,base=CFG.baselineLocPerMinute>0?CFG.baselineLocPerMinute:5;
+  var gen=(typeof G.equivalentHours==='number')?G.equivalentHours:null;
+  var man=w.manual||{};var manMs=(man.humanCodingMs||0)+(man.aiGeneratingMs||0)+(man.reviewingMs||0);
+  var genLine=lines+' effective changed lines \\u00f7 '+base+' lines/min \\u00f7 60 = '+tH(gen);
+  var src=w.billableSource==='set'?'You set them with \\uD83D\\uDCB5 Set Billable Hours.'
+    :w.billableSource==='estimate'?'Taken from the estimate, because no billable hours are set. Change them with \\uD83D\\uDCB5 Set Billable Hours, or use \\u26A1 Use as Billable Hours to take the generated hours.'
+    :'Taken from the actual hours, because there is no hour estimate and no billable hours are set.';
+  return{
+    estimate:'Your estimate for this work item (the sum of its category breakdown when you split it). Click \\u270E to change it.',
+    actual:'Active time on all branches of this work item: coding, Copilot generating and reviewing, plus manual effort and time-log entries. Idle time does not count.\\nAuto-tracked '+fmt(Math.max(0,activeMsOf(w)-manMs))+' + manual '+fmt(manMs)+'.',
+    netGain:sell==null?'What AI earned you. Needs the project\\u2019s sell rate. '+RATES_HINT
+      :'What AI earned you: what you can bill, minus what the hours you really worked are worth, minus the AI cost.\\n= invoice '+m(I.invoiceValue)+' \\u2212 '+tH(A)+' \\u00d7 '+tR(sell,cur)+' \\u2212 AI '+m(credit)+'\\n= '+m(I.netGain)+'\\nPositive means you deliver more than the time you spent.',
+    invoice:sell==null?'Billable hours \\u00d7 sell rate. Needs the project\\u2019s sell rate. '+RATES_HINT
+      :'What you can bill: billable hours \\u00d7 sell rate.\\n= '+tH(B)+' \\u00d7 '+tR(sell,cur)+' = '+m(I.invoiceValue),
+    profit:(sell==null||cost==null)?'Invoice value minus your internal cost. Needs the project\\u2019s sell rate and hourly cost rate. '+RATES_HINT
+      :'Invoice value minus your internal cost (your hours at the cost rate, plus AI).\\n= '+m(I.invoiceValue)+' \\u2212 '+tH(A)+' \\u00d7 '+tR(cost,cur)+' \\u2212 AI '+m(credit)+'\\n= '+m(I.profit),
+    actualHrs:'Hours you actually worked (same as Actual): '+tH(A)+'.'+(gen==null?'':'\\n\\u2248 '+tH(gen)+' generated: how long the same output would take by hand.\\n'+genLine+' (setting aiEffortTracker.baselineLocPerMinute).'),
+    billable:'Hours you can bill for this work item: '+tH(B)+'.\\n'+src+'\\nThey drive Invoice value, Net ROI and Profit.',
+    generated:G.generatedValue==null?'Generated hours \\u00d7 sell rate. Needs the project\\u2019s sell rate. '+RATES_HINT
+      :'What the produced lines are worth: generated hours \\u00d7 sell rate.\\n'+genLine+'\\n= '+tH(gen)+' \\u00d7 '+tR(sell,cur)+' = '+m(G.generatedValue)+'\\nCompare it with Invoice value to see if your estimate covers what was produced.',
+    aiShare:'Share of effective changed lines written by Copilot.\\n= '+I.aiNet+' AI \\u00f7 '+lines+' total. Human: '+I.humanNet+'.',
+    credits:'Copilot credits (premium requests) used for this work item, summed over all its branches and the entries you logged.',
+    aiSpend:aiSpendTip(R,I.credits,cur),
+    timeSaved:'Generated hours minus actual hours: how much longer the same output would take by hand.\\n= '+fmtMin(I.manualEquivMin)+' \\u2212 '+fmtMin(I.activeMin)+' = '+fmtMin(I.timeSavedMin)+'\\nBased on '+base+' lines/min (aiEffortTracker.baselineLocPerMinute).',
+    auto:'Time recorded automatically while you coded, Copilot generated code, or you reviewed.',
+    manual:'Time you added yourself with \\uFF0B Add Effort.',
+    manLines:'Lines you added yourself with \\uFF0B Add Effort (human and AI).',
+    manEntries:'Number of \\uFF0B Add Effort entries.'
+  };
+}
+function budgetTip(k,d,b,R,cur){
+  var m=function(v){return fmtMoney(v,cur);};
+  var head=budVal(k,d.used,cur)+' used of '+budVal(k,d.budget,cur)+' = '+d.pct+'%.\\n';
+  if(k==='time')return head+'Actual hours on all branches, manual effort and time-log entries, against the hour estimate.';
+  if(k==='credits')return head+'Credits used, against '+(d.source==='explicit'?'the credit budget you set with Set Budget.':'estimate \\u00d7 credits per estimated hour (project setting or aiEffortTracker.budget.creditsPerEstimatedHour).');
+  var used='Used = your hours \\u00d7 cost rate + AI spend\\n= '+tH(R.actualHours)+' \\u00d7 '+tR(R.hourlyCostRate,cur)+(R.laborCost!=null?' ('+m(R.laborCost)+')':'')+' + AI '+m(R.creditCost||0)+' = '+m(d.used);
+  if(d.source==='explicit')return head+'Budget: the money budget you set with Set Budget.\\n'+used;
+  var est=b.dims.time?b.dims.time.budget:null;
+  var cb=b.dims.credits;
+  var budget='Budget = estimate \\u00d7 cost rate'+(cb&&R.creditCostPerUnit?' + credit budget \\u00d7 credit price':'')+'\\n= '+tH(est)+' \\u00d7 '+tR(R.hourlyCostRate,cur)
+    +(cb&&R.creditCostPerUnit?' + '+budVal('credits',cb.budget)+' \\u00d7 '+fmtMoney(R.creditCostPerUnit,cur,4):'')+' = '+m(d.budget);
+  var note=(cb&&R.creditCostPerUnit)?'':'\\nAI credits are not part of this budget because there is no credit budget, but AI spend counts as used. Set a credit or money budget with Set Budget to plan for AI.';
+  return head+budget+'\\n'+used+note;
+}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function activeMsOf(x){return(x.humanCodingMs||0)+(x.aiGeneratingMs||0)+(x.reviewingMs||0);}
 function reviewCardHtml(w){
@@ -703,9 +762,10 @@ function budgetCardHtml(w,cur){
     return'<div class="card" style="margin-top:12px">'+head+'<p style="color:var(--vscode-descriptionForeground);margin-top:6px">This work item has no hour estimate and no credit or money budget, so it cannot be tracked against one. Used so far: '+budVal('time',b.used.hours)+' \\u00b7 '+budVal('credits',b.used.credits)+'.</p></div>';
   }
   var src={explicit:'set explicitly',estimate:'from the estimate',project:'estimate \\u00d7 project credits/hour'};
+  var R=roiOf(w);
   var rows=['time','credits','cost'].filter(function(k){return b.dims[k];}).map(function(k){
     var d=b.dims[k];var st=d.pct>=100?'over':(b.crossed.length&&d.pct>=Math.min.apply(null,b.crossed))?'warning':'ok';
-    return'<tr><td style="white-space:nowrap"><strong>'+esc(BUD_DIM[k])+'</strong><div style="font-size:.75em;color:var(--vscode-descriptionForeground)">'+esc(src[d.source]||d.source)+'</div></td>'
+    return'<tr title="'+esc(budgetTip(k,d,b,R,cur))+'" style="cursor:help"><td style="white-space:nowrap"><strong>'+esc(BUD_DIM[k])+'</strong> <span style="opacity:.55">\\u24D8</span><div style="font-size:.75em;color:var(--vscode-descriptionForeground)">'+esc(src[d.source]||d.source)+'</div></td>'
       +'<td style="width:40%"><div class="bud"><div class="budf" style="width:'+Math.min(100,d.pct)+'%;background:'+BUD_COL[st]+'"></div></div></td>'
       +'<td style="white-space:nowrap;color:'+BUD_COL[st]+'">'+d.pct+'%</td>'
       +'<td style="white-space:nowrap">'+budVal(k,d.used,cur)+' / '+budVal(k,d.budget,cur)+'</td>'
@@ -720,7 +780,7 @@ function budgetCardHtml(w,cur){
   var brHtml=br.length>1?'<table style="margin-top:10px"><thead><tr><th>Branch</th><th>Hours</th><th>Credits</th></tr></thead><tbody>'+br.map(function(x){return'<tr><td>'+esc(x.branch)+'</td><td>'+budVal('time',x.hours)+' ('+x.hoursPct+'%)</td><td>'+budVal('credits',x.credits)+' ('+x.creditsPct+'%)</td></tr>';}).join('')+'</tbody></table>':'';
   return'<div class="card" style="margin-top:12px">'+head
     +'<table style="margin-top:8px"><tbody>'+rows+'</tbody></table>'
-    +'<p style="margin-top:8px;font-size:.85em">'+pace+proj+'</p>'
+    +'<p style="margin-top:8px;font-size:.85em;cursor:help" title="'+esc('Average per day over the last '+bn.days+' days, counting days without work too.'+(bn.costPerDay!=null?'\\nCost/day = hours/day \\u00d7 cost rate + credits/day \\u00d7 credit price.':'')+'\\nRun-out = what is left of a budget \\u00f7 its daily pace; the budget that runs out first is shown.')+'">'+pace+proj+'</p>'
     +'<div class="cw" style="height:200px;margin-top:10px"><canvas id="cBudget"></canvas></div>'
     +catHtml+brHtml
     +'<p style="margin-top:8px;font-size:.8em;color:var(--vscode-descriptionForeground)">Consumption across all branches, manual effort and the credit ledger. Alerts fire once per threshold crossing (settings: aiEffortTracker.budget.*).</p></div>';
@@ -770,16 +830,17 @@ function renderProjectDetail(){
 }
 function meModeLabel(m){return {humanCoding:'Human coding',aiGenerating:'AI generating',reviewing:'Reviewing',idle:'Idle'}[m]||m;}
 function meFor(wid){return (ME||[]).filter(function(e){return e.workItemId===wid;});}
-function manualSplitHtml(w){
+function manualSplitHtml(w,T){
+  T=T||{};
   var man=w.manual||{humanCodingMs:0,aiGeneratingMs:0,reviewingMs:0,linesHumanAdded:0,linesAiAdded:0,entries:0};
   var manAct=(man.humanCodingMs||0)+(man.aiGeneratingMs||0)+(man.reviewingMs||0);
   var autoAct=Math.max(0,activeMsOf(w)-manAct);
   var manLines=(man.linesHumanAdded||0)+(man.linesAiAdded||0);
   return'<div class="sg" style="margin-top:4px">'
-    +sc('Auto-tracked',fmt(autoAct),'var(--human)')
-    +sc('Manual',fmt(manAct),'var(--review)')
-    +sc('Manual +Lines','+'+manLines,'var(--ai)')
-    +sc('Manual Entries',String(man.entries||0),'var(--cost)')
+    +sc('Auto-tracked',fmt(autoAct),'var(--human)',T.auto)
+    +sc('Manual',fmt(manAct),'var(--review)',T.manual)
+    +sc('Manual +Lines','+'+manLines,'var(--ai)',T.manLines)
+    +sc('Manual Entries',String(man.entries||0),'var(--cost)',T.manEntries)
     +'</div>';
 }
 function manualRowsHtml(wid){
@@ -852,6 +913,7 @@ function renderWorkItemDetail(){
   var w=WI.find(function(x){return x.workItemId===selWi;});
   if(!w){projView='list';return renderProjectList();}
   var I=insights(w);
+  var T=wiTips(w,I);
   var G=w.generated||{};
   var genH=(typeof G.equivalentHours==='number')?(Math.round(G.equivalentHours*100)/100):null;
   var genNote=(genH==null)?'':' <span style="color:var(--vscode-descriptionForeground);font-size:.75em">\\u2248 '+genH+'h generated</span>';
@@ -865,23 +927,23 @@ function renderWorkItemDetail(){
   if(!branchRows.length)branchRows=['<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No branches roll up into this work item yet.</td></tr>'];
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
     +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
-    +'<div class="st"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
-    +'<div class="st"><div class="lbl">Actual</div><div class="val">'+fmt(activeMsOf(w))+'</div></div>'
-    +'<div class="st"><div class="lbl">Net ROI / AI gain</div><div class="val" style="color:'+moneyColor(I.netGain)+'">'+fmtMoney(I.netGain,I.currency)+'</div></div></div>'
+    +'<div class="st tip" title="'+esc(T.estimate)+'"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
+    +sc('Actual',fmt(activeMsOf(w)),'inherit',T.actual)
+    +sc('Net ROI / AI gain',fmtMoney(I.netGain,I.currency),moneyColor(I.netGain),T.netGain)+'</div>'
     +'<div class="sg" style="margin-top:4px">'
-    +sc('Invoice value',fmtMoney(I.invoiceValue,I.currency),moneyColor(I.invoiceValue))
-    +sc('Profit',fmtMoney(I.profit,I.currency),moneyColor(I.profit))
-    +sc('Actual hrs',(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h')+genNote,'var(--human)')
-    +sc('Billable hrs',(I.billableHours==null?ROI_NONE:(Math.round(I.billableHours*100)/100)+'h'),'var(--ai)')
-    +sc('Generated value',fmtMoney(G.generatedValue,I.currency),moneyColor(G.generatedValue))
+    +sc('Invoice value',fmtMoney(I.invoiceValue,I.currency),moneyColor(I.invoiceValue),T.invoice)
+    +sc('Profit',fmtMoney(I.profit,I.currency),moneyColor(I.profit),T.profit)
+    +sc('Actual hrs',(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h')+genNote,'var(--human)',T.actualHrs)
+    +sc('Billable hrs',(I.billableHours==null?ROI_NONE:(Math.round(I.billableHours*100)/100)+'h'),'var(--ai)',T.billable)
+    +sc('Generated value',fmtMoney(G.generatedValue,I.currency),moneyColor(G.generatedValue),T.generated)
     +'</div>'
     +'<div class="sg" style="margin-top:4px">'
-    +sc('AI Share',aiPctOf(w)+'%','var(--ai)')
-    +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)')
-    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)')
-    +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)')
+    +sc('AI Share',aiPctOf(w)+'%','var(--ai)',T.aiShare)
+    +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)',T.credits)
+    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)',T.aiSpend)
+    +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)',T.timeSaved)
     +'</div>'
-    +manualSplitHtml(w)
+    +manualSplitHtml(w,T)
     +budgetCardHtml(w,I.currency)
     +reviewCardHtml(w)
     +translationSummaryHtml(w)
@@ -1055,10 +1117,10 @@ function showDetail(branch){
   var savedColor=I.timeSavedMin>=0?'var(--added)':'var(--deleted)';
   var roiColor=moneyColor(I.roi);
   var insHtml='<div class="sg">'
-    +sc('AI Share of Lines',I.aiShare.toFixed(0)+'%','var(--ai)')
-    +sc('Velocity',I.velocity.toFixed(1)+' loc/min','var(--human)')
-    +sc('Effective Lines',String(I.totalNet),'var(--vscode-foreground)')
-    +sc('Active Time',fmtMin(I.activeMin),'var(--review)')
+    +sc('AI Share of Lines',I.aiShare.toFixed(0)+'%','var(--ai)','Share of effective changed lines written by Copilot.\\n= '+I.aiNet+' AI \\u00f7 '+I.totalNet+' total.')
+    +sc('Velocity',I.velocity.toFixed(1)+' loc/min','var(--human)','Effective changed lines per active minute.\\n= '+I.totalNet+' \\u00f7 '+I.activeMin.toFixed(0)+' min.')
+    +sc('Effective Lines',String(I.totalNet),'var(--vscode-foreground)','Meaningful changed lines (human + AI). Unchanged rewrites of whole files are left out; later corrections count again.')
+    +sc('Active Time',fmtMin(I.activeMin),'var(--review)','Coding, Copilot generating and reviewing time on this branch, plus manual entries. Idle time does not count.')
     +'</div>'
     +translationSummaryHtml(d)
     +'<div class="card" style="margin-top:16px"><h3>\\uD83D\\uDE80 Productivity Story</h3>'
@@ -1067,16 +1129,16 @@ function showDetail(branch){
     +'At a manual baseline of <strong>'+CFG.baselineLocPerMinute+' loc/min</strong> the same output would take <strong>'+fmtMin(I.manualEquivMin)+'</strong>, '
     +'so AI saved about <strong style="color:'+savedColor+'">'+fmtMin(I.timeSavedMin)+'</strong>.</p></div>'
     +'<div class="sg" style="margin-top:16px">'
-    +sc('Manual-Equiv Time',fmtMin(I.manualEquivMin),'var(--review)')
-    +sc('Time Saved',fmtMin(I.timeSavedMin),savedColor)
-    +sc('Value Produced',fmtMoney(I.savedValue,I.currency),moneyColor(I.savedValue))
+    +sc('Manual-Equiv Time',fmtMin(I.manualEquivMin),'var(--review)','How long the same output would take by hand.\\n= '+I.totalNet+' lines \\u00f7 '+(CFG.baselineLocPerMinute>0?CFG.baselineLocPerMinute:5)+' lines/min (aiEffortTracker.baselineLocPerMinute).')
+    +sc('Time Saved',fmtMin(I.timeSavedMin),savedColor,'Manual-equivalent time minus active time.\\n= '+fmtMin(I.manualEquivMin)+' \\u2212 '+fmtMin(I.activeMin)+' = '+fmtMin(I.timeSavedMin))
+    +sc('Value Produced',fmtMoney(I.savedValue,I.currency),moneyColor(I.savedValue),I.savedValue==null?'Active hours \\u00d7 sell rate. Needs the project\\u2019s sell rate. '+RATES_HINT:'Your active hours at the sell rate.\\n= '+tH(roiOf(d).actualHours)+' \\u00d7 '+tR(roiOf(d).hourlySellRate,I.currency)+' = '+fmtMoney(I.savedValue,I.currency))
     +sc('Chat Turns',String(I.chatTurns),'var(--human)')
     +'</div>'
     +'<div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><h3>\\uD83D\\uDCB0 Credits & Cost</h3><button class="dtab" data-action="cmd" data-value="logCredits">+ Log Credits</button></div>'
     +'<div class="sg" style="margin-top:12px">'
-    +sc('Credits Used',I.credits.toFixed(1),'var(--cost)')
-    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)')
-    +sc('Net ROI',fmtMoney(I.roi,I.currency),roiColor)
+    +sc('Credits Used',I.credits.toFixed(1),'var(--cost)','Copilot credits (premium requests) used on this branch, including entries you logged.')
+    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)',aiSpendTip(roiOf(d),I.credits,I.currency))
+    +sc('Net ROI',fmtMoney(I.roi,I.currency),roiColor,I.roi==null?'Value produced minus total cost. Needs the project\\u2019s sell and cost rates. '+RATES_HINT:'Value produced minus total cost (your hours at the cost rate, plus AI).\\n= '+fmtMoney(I.savedValue,I.currency)+' \\u2212 '+fmtMoney(roiOf(d).totalCost,I.currency)+' = '+fmtMoney(I.roi,I.currency))
     +'</div>'
     +'<table style="margin-top:14px"><thead><tr><th>Model</th><th>Credits</th><th>Cost</th></tr></thead><tbody>'+modelRows+'</tbody></table>'
     +'<p style="margin-top:10px;font-size:.8em;color:var(--vscode-descriptionForeground)">Net ROI = value produced \\u2212 total cost (labor + credits) from the project\\u2019s effective rates. Credit cost uses the ledger \\u201cCost\\u201d when set, else credits \\u00d7 the project credit rate. \\u201c\\u2014\\u201d means a required rate is unset \\u2014 use \\u201cSet Rates\\u201d on the project. Baseline loc/min tunes the productivity estimate only.</p></div>';
