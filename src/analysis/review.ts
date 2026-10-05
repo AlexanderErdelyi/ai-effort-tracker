@@ -173,21 +173,73 @@ export function changedLines(base: readonly string[] | null, current: readonly s
   return out;
 }
 
-interface MarkIndex { byC: Map<string, ReviewMark>; byP: Map<string, ReviewMark> }
+interface MarkIndex {
+  byC: Map<string, ReviewMark>;
+  /** Line text hash -> non-clear marks holding it, newest first. */
+  byP: Map<string, ReviewMark[]>;
+  /** Per mark id: how many of its lines have each text hash. */
+  pCount: Map<string, Map<string, number>>;
+}
 
 function indexMarks(marks: readonly ReviewMark[]): MarkIndex {
-  const byC = new Map<string, ReviewMark>(), byP = new Map<string, ReviewMark>();
+  const byC = new Map<string, ReviewMark>(), byP = new Map<string, ReviewMark[]>(), pCount = new Map<string, Map<string, number>>();
   for (const m of marks) {
     for (const s of m.lines) {
       const k = decodeKey(s);
       const hc = byC.get(k.c);
       if (!hc || hc.at <= m.at) byC.set(k.c, m);
       if (m.status === 'clear') continue;
-      const hp = byP.get(k.p);
-      if (!hp || hp.at <= m.at) byP.set(k.p, m);
+      let counts = pCount.get(m.id);
+      if (!counts) pCount.set(m.id, counts = new Map());
+      const n = counts.get(k.p) ?? 0;
+      counts.set(k.p, n + 1);
+      if (!n) { const list = byP.get(k.p); if (list) list.push(m); else byP.set(k.p, [m]); }
     }
   }
-  return { byC, byP };
+  for (const list of byP.values()) list.sort((x, y) => y.at - x.at);
+  return { byC, byP, pCount };
+}
+
+/**
+ * The mark of each line. A line matches by its context hash (text + neighbours);
+ * when that changed, a long line can still keep the mark it had before it was
+ * moved, but only if (1) the mark still has that text unaccounted for, i.e. the
+ * line is no longer where it was (a copy does not inherit it), and (2) a
+ * neighbour belongs to the same mark: matched by context, or another long moved
+ * line of it. So a duplicate line elsewhere next to e.g. `var` stays unmarked.
+ */
+function matchLines(lines: readonly string[], keys: readonly (LineKey | null)[], index: MarkIndex): (ReviewMark | undefined)[] {
+  const { byC, byP, pCount } = index;
+  const n = lines.length;
+  const match: (ReviewMark | undefined)[] = new Array(n);
+  const left = new Map<string, Map<string, number>>();
+  const leftOf = (m: ReviewMark) => {
+    let l = left.get(m.id);
+    if (!l) left.set(m.id, l = new Map(pCount.get(m.id) ?? []));
+    return l;
+  };
+  const take = (m: ReviewMark, p: string) => { const l = leftOf(m); const v = l.get(p) ?? 0; if (v > 0) l.set(p, v - 1); };
+  const has = (m: ReviewMark, p: string) => (leftOf(m).get(p) ?? 0) > 0;
+  for (let i = 0; i < n; i++) {
+    const k = keys[i];
+    if (!k) continue;
+    const m = byC.get(k.c);
+    if (m) { match[i] = m; if (m.status !== 'clear') take(m, k.p); }
+  }
+  const long = (i: number) => normalizeLine(lines[i]).length >= MOVE_MIN_LENGTH;
+  const prev: number[] = new Array(n), next: number[] = new Array(n);
+  for (let i = 0, last = -1; i < n; i++) { prev[i] = last; if (keys[i]) last = i; }
+  for (let i = n - 1, last = -1; i >= 0; i--) { next[i] = last; if (keys[i]) last = i; }
+  const candidates = (i: number) => (keys[i] && !match[i] && long(i) ? (byP.get(keys[i]!.p) ?? []).filter(m => has(m, keys[i]!.p)) : []);
+  for (let i = 0; i < n; i++) {
+    const cands = candidates(i);
+    if (!cands.length) continue;
+    const supports = (m: ReviewMark, j: number) => j >= 0
+      && (match[j] ? match[j]!.id === m.id : long(j) && has(m, keys[j]!.p) && keys[j]!.p !== keys[i]!.p);
+    const m = cands.find(c => supports(c, prev[i]) || supports(c, next[i]));
+    if (m) { match[i] = m; take(m, keys[i]!.p); }
+  }
+  return match;
 }
 
 export interface FileReview {
@@ -213,26 +265,16 @@ export interface FileReview {
  */
 export function evaluateFile(lines: readonly string[], changed: ReadonlySet<number> | null, marks: readonly ReviewMark[]): FileReview {
   const keys = lineKeys(lines);
-  const { byC, byP } = indexMarks(marks);
+  const matched = matchLines(lines, keys, indexMarks(marks));
   const status: (LineStatus | undefined)[] = new Array(lines.length);
   const okAt: number[] = new Array(lines.length);
   const issueMap = new Map<string, FileReview['issues'][number]>();
   const fixedMap = new Map<string, FileReview['fixed'][number]>();
   let total = 0, reviewed = 0, issueLines = 0;
-  let prevP: string | undefined;
-  const nextP: (string | undefined)[] = new Array(lines.length);
-  let np: string | undefined;
-  for (let i = lines.length - 1; i >= 0; i--) { nextP[i] = np; if (keys[i]) np = keys[i]!.p; }
   for (let i = 0; i < lines.length; i++) {
     const k = keys[i];
     if (!k) continue;
-    let mark = byC.get(k.c);
-    if (!mark) {
-      const moved = byP.get(k.p);
-      if (moved && normalizeLine(lines[i]).length >= MOVE_MIN_LENGTH
-        && ((prevP !== undefined && byP.has(prevP)) || (nextP[i] !== undefined && byP.has(nextP[i]!)))) mark = moved;
-    }
-    prevP = k.p;
+    const mark = matched[i];
     if (mark?.fixed) {
       const hit = fixedMap.get(mark.id);
       if (hit) hit.indices.push(i); else fixedMap.set(mark.id, { markId: mark.id, line: i, indices: [i] });
