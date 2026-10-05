@@ -14,6 +14,7 @@ import { ESTIMATION_SNAPSHOT_FILE, estimateAccuracy, suggestEstimate, type Estim
 import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewIssues, reviewStatus, type ReviewIssuesIo } from '../analysis/review';
 import { reviewMark, reviewResolveIssue, type ResolveAction, type ReviewMarkArgs, type ReviewMarkIo } from '../analysis/reviewMark';
 import { ReviewStore } from '../review/reviewStore';
+import { CORRECTIONS_FILE, decodeCorrectionStore, emptyCorrectionStore, listCorrections, type CorrectionKind } from '../analysis/corrections';
 import { changedFilesSync, contentAtSync, resolveReviewBaseSync } from '../review/reviewGit';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
@@ -25,6 +26,12 @@ function loadReviewStore() {
   const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), REVIEW_FILE) : '';
   if (!file || !fs.existsSync(file)) return emptyReviewStore();
   return readStore(file, decodeReviewStore, emptyReviewStore).value;
+}
+
+function loadCorrectionStore() {
+  const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), CORRECTIONS_FILE) : '';
+  if (!file || !fs.existsSync(file)) return emptyCorrectionStore();
+  return readStore(file, decodeCorrectionStore, emptyCorrectionStore).value;
 }
 
 /** Read-only access to the working tree for `review_issues`. */
@@ -200,6 +207,25 @@ export const TOOLS = [
         branch: { type: 'string', description: 'Only issues in files changed on this git branch.' },
         path: { type: 'string', description: 'Only files whose repository-relative path contains this text.' },
         contextLines: { type: 'number', description: 'Unflagged lines of code shown before and after each issue (0–10, default 3).' }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'list_corrections',
+    title: 'Corrections of AI-written code',
+    description: 'Changes made later to code that an AI edit wrote, captured in VS Code: the developer\'s own edits (source "human") and Copilot rework requested with a new prompt (source "ai"). Each correction has its kind (modify, insert, delete, move), file and line, the enclosing declaration, a short before/after snippet and, when known, the prompt that asked for the change (trigger) and the prompt that produced the original code (origin). Newest first, with counts by source, kind and file type. Use it to learn what the developer usually changes after AI programming (ordering, documentation, naming, checks) and to suggest coding rules.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workItemId: { type: 'string', description: 'Only corrections on branches of this work item.' },
+        branch: { type: 'string', description: 'Only corrections on this git branch.' },
+        path: { type: 'string', description: 'Only files whose relative path contains this text.' },
+        repo: { type: 'string', description: 'Only this workspace folder (name contains this text).' },
+        source: { type: 'string', enum: ['human', 'ai'], description: 'Only the developer\'s edits (human) or prompted Copilot rework (ai).' },
+        kind: { type: 'string', enum: ['modify', 'insert', 'delete', 'move'], description: 'Only this kind of change.' },
+        days: { type: 'number', description: 'Only the last N days.' },
+        limit: { type: 'number', description: 'Maximum corrections returned (1–500, default 50).' }
       },
       additionalProperties: false
     }
@@ -423,6 +449,17 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       const str = (v: unknown) => typeof v === 'string' && v ? v : undefined;
       return reviewStatus(store, data.branches as Record<string, { workItemId?: string | null }>, data.workItems as Record<string, { title?: string | null; status?: string }>,
         { workItemId: str(args.workItemId), branch: str(args.branch) });
+    }
+    case 'list_corrections': {
+      const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+      const numArg = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+      const source = args.source === 'human' || args.source === 'ai' ? args.source : undefined;
+      const kind = ['modify', 'insert', 'delete', 'move'].includes(args.kind as string) ? args.kind as CorrectionKind : undefined;
+      const result = listCorrections(loadCorrectionStore(), {
+        workItemId: str(args.workItemId), branch: str(args.branch), path: str(args.path), repo: str(args.repo),
+        source, kind, days: numArg(args.days), limit: numArg(args.limit)
+      });
+      return result.total ? result : { ...result, note: 'No corrections captured yet. They are recorded in VS Code when code an AI edit wrote is changed later (setting aiEffortTracker.corrections.enabled).' };
     }
     case 'review_issues': {
       const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;

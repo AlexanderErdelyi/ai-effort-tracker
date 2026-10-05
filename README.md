@@ -29,6 +29,7 @@
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
+| `AI Effort Tracker: Show Captured Corrections` | Newest corrections of AI-written code (see below) |
 
 ## Configuration
 
@@ -250,6 +251,7 @@ or *"Analyse my usage for work item 1987"*. All tools are read-only except
 | `review_issues` | Open review issues read live from disk: file, current lines, your note and the flagged code, so Copilot can fix them |
 | `review_mark` | Marks changed code reviewed, removes marks or flags lines, by path, glob or category, only when you ask (writes review marks only) |
 | `review_resolve_issue` | Reports a flagged issue as fixed by Copilot (with a note of what changed) so it waits in **Fixed — to verify**; can reopen it, or remove the flag when you ask |
+| `list_corrections` | Captured corrections of AI-written code (see below): what you or prompted Copilot rework changed, with snippets and prompts, to learn rules from |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -456,6 +458,36 @@ Settings: `aiEffortTracker.review.enabled`, `review.showDecorations`,
 `review.highlightReviewedLines`, `review.codeLens`, `review.showStatusBar`, `review.groupBy`, `review.exclude` (globs, default lock
 files, build output, minified files, source maps and generated `*.g.xlf`) and `review.baseRef` (default baseline for
 all branches).
+
+## Capturing corrections of AI code
+
+The tracker learns how AI-written code gets corrected, the first step toward rules
+Copilot can follow on its own. Every line an AI edit adds (chat, agent or inline
+completion) is remembered as AI-written for 90 days. When that code changes later,
+the change is saved as a **correction** once the file has been quiet for 10 seconds,
+saved or closed:
+
+- **modify** or **delete**: AI-written lines were replaced or removed;
+- **insert**: lines were added between AI-written lines (e.g. documentation or a
+  missing check);
+- **move**: an AI-written block was moved, e.g. to reorder procedures.
+
+Each correction records the file, line, the enclosing declaration, the branch and
+work item, a short before/after snippet and, from Copilot's debug logs, the prompt
+that produced the original code. A correction is either **yours** (typing, pasting,
+undo) or **AI rework**. AI rework is only kept when you sent a new prompt between the
+original code and the change (that prompt is stored as the trigger). Without a new
+prompt, Copilot was fixing its own code within the same request. Whitespace-only
+changes are ignored.
+
+Run **AI Effort Tracker: Show Captured Corrections** to see the newest 50, or ask
+Copilot with the MCP tool `list_corrections` (filters: `workItemId`, `branch`,
+`path`, `repo`, `source`, `kind`, `days`, `limit`). Corrections are kept in
+`corrections.json` next to the tracker's store, with the same locking, `.bak` and
+history copies. Nothing leaves your machine. Turn off
+`aiEffortTracker.corrections.captureCode` to keep only metadata (no code snippets
+or prompt text), or `aiEffortTracker.corrections.enabled` to stop capturing.
+Files matching `aiEffortTracker.review.exclude` are skipped.
 
 ## Development
 

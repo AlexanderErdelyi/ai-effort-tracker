@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { Database } from '../store/database';
 import { GitTracker } from './gitTracker';
 import { categorize } from '../util/fileTypes';
-import { parseDebugLog } from '../util/debugLog';
+import { extractUserMessages, parseDebugLog, type DebugUserMessage } from '../util/debugLog';
 import { parseChatAliases } from '../util/chatAliases';
 import { parseModelPrices, parseToolset } from '../util/modelCatalog';
 import { BranchSwitch, branchAt } from '../util/reflog';
@@ -158,6 +158,9 @@ export class DebugLogUsageTracker implements vscode.Disposable {
     return { files, stamp, total, modified };
   }
 
+  /** Receives the prompts of each re-read session (correction capture, #131). */
+  onUserMessages?: (messages: DebugUserMessage[]) => void;
+
   private async parseSession(files: string[]): Promise<ReturnType<typeof parseDebugLog>> {
     const logs: string[] = [];
     let remaining = MAX_SESSION_BYTES;
@@ -165,6 +168,10 @@ export class DebugLogUsageTracker implements vscode.Disposable {
       const text = await this.read(file, Math.min(MAX_FILE_BYTES, remaining));
       remaining -= Buffer.byteLength(text, 'utf8');
       logs.push(text);
+    }
+    if (this.onUserMessages && logs[0]) {
+      try { this.onUserMessages(extractUserMessages(logs[0])); }
+      catch (error) { this.output.warn(`Cannot read prompts for corrections: ${String(error)}`); }
     }
     return parseDebugLog(logs[0], logs.slice(1));
   }
