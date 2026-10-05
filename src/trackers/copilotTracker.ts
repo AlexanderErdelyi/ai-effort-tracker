@@ -3,11 +3,25 @@ import { Database } from '../store/database';
 import { TimeTracker } from './timeTracker';
 import { getFileExt } from '../util/fileTypes';
 
+export interface CodeEdit {
+  event: vscode.TextDocumentChangeEvent;
+  before: string[];
+  after: string[];
+  source: 'human' | 'ai';
+  branch: string;
+}
+
 export class CopilotTracker implements vscode.Disposable {
   private disposables: vscode.Disposable[] = [];
   private documentLines = new Map<string, string[]>();
+  private editListener?: (edit: CodeEdit) => void;
 
   constructor(private db: Database, private timeTracker: TimeTracker) {}
+
+  /** Observes classified file edits (correction capture, #131). */
+  setEditListener(listener: ((edit: CodeEdit) => void) | undefined) {
+    this.editListener = listener;
+  }
 
   start(_context: vscode.ExtensionContext) {
     for (const doc of vscode.workspace.textDocuments) {
@@ -98,6 +112,10 @@ export class CopilotTracker implements vscode.Disposable {
       this.db.recordAiSplit(branch, looksInline ? 'inline' : 'chat', insertedLines, insertedChars);
     }
     this.timeTracker.markEdit(source);
+    if (before && this.editListener && scheme === 'file') {
+      try { this.editListener({ event, before, after, source, branch }); }
+      catch (error) { console.error('AI Effort Tracker: correction capture failed', error); }
+    }
   }
 
   /** Best-effort: count characters the human types into the Copilot chat input. */

@@ -9,6 +9,9 @@ import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
 import { CreditImportTracker } from './trackers/creditImportTracker';
 import { DebugLogUsageTracker } from './trackers/debugLogUsageTracker';
+import { CorrectionTracker } from './trackers/correctionTracker';
+import { CorrectionStore } from './store/correctionStore';
+import { correctionsMarkdown, listCorrections } from './analysis/corrections';
 import { Database } from './store/database';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
@@ -482,6 +485,26 @@ export function activate(context: vscode.ExtensionContext) {
   } catch (error) {
     console.error('AI Effort Tracker: review tracking failed to start', error);
   }
+  const correctionStore = new CorrectionStore(context.globalStorageUri.fsPath);
+  try {
+    const correctionTracker = new CorrectionTracker(db, correctionStore, () => DebugLogUsageTracker.enabled());
+    copilotTracker.setEditListener(edit => correctionTracker.onEdit(edit));
+    debugLogUsageTracker.onUserMessages = msgs => correctionTracker.onUserMessages(msgs);
+    context.subscriptions.push(correctionTracker);
+  } catch (error) {
+    console.error('AI Effort Tracker: correction capture failed to start', error);
+  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand('aiEffortTracker.showCorrections', async () => {
+      try {
+        const content = correctionsMarkdown(listCorrections(correctionStore.load(), { limit: 50 }));
+        const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (error) {
+        vscode.window.showErrorMessage(`AI Effort Tracker: cannot read corrections: ${String(error)}`);
+      }
+    })
+  );
   try { registerUsageInsightsMcp(context); } catch (error) {
     console.error('AI Effort Tracker: MCP server registration failed', error);
   }

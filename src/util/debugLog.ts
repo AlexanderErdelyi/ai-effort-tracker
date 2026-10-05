@@ -90,6 +90,37 @@ export function requestEffort(options: unknown): string | undefined {
   return effort ? effort.slice(0, 20) : undefined;
 }
 
+export interface DebugUserMessage { t: number; sessionId: string; text: string }
+
+/**
+ * The prompts you sent in a session's main log (not subagent prompts), for
+ * linking captured corrections to the request behind them (#131). Only used
+ * when correction capture is on; text is clipped to `maxChars`.
+ */
+export function extractUserMessages(mainText: string, maxChars = 1000): DebugUserMessage[] {
+  const out: DebugUserMessage[] = [];
+  const subagents = new Set<string>();
+  let session = '';
+  for (const line of mainText.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const start = line.includes('"session_start"');
+    if (!start && !line.includes('"user_message"')) continue;
+    let v: unknown;
+    try { v = JSON.parse(line); } catch { continue; }
+    if (!object(v)) continue;
+    const sid = str(v.sid) || session;
+    if (v.type === 'session_start') {
+      session = sid;
+      if (object(v.attrs) && str(v.attrs.parentSessionId)) subagents.add(sid);
+      continue;
+    }
+    if (v.type !== 'user_message' || !sid || subagents.has(sid) || !object(v.attrs)) continue;
+    const ts = validNumber(v.ts) ? v.ts : typeof v.ts === 'string' ? Date.parse(v.ts) : NaN;
+    const text = typeof v.attrs.content === 'string' ? v.attrs.content.trim() : '';
+    if (Number.isFinite(ts) && text) out.push({ t: ts, sessionId: sid, text: text.slice(0, maxChars) });
+  }
+  return out;
+}
+
 /**
  * Parse a persisted Copilot debug log without I/O or retaining prompt/code text.
  * Span IDs identify physical calls: responseId can be reused by every tool round.
