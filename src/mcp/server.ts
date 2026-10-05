@@ -234,8 +234,8 @@ export const TOOLS = [
 }, {
   name: 'review_resolve_issue',
   title: 'Report a review issue as fixed',
-  description: 'Update a review issue the developer flagged in VS Code. After you fixed an issue from review_issues, call this with its issueId, action "fixed" (default) and a one-line note of what you changed: '
-    + 'the issue then waits under "Fixed — to verify" in the developer\'s Review view, so they can check your fix. '
+  description: 'Update a review issue the developer flagged in VS Code. After you fixed an issue from review_issues, call this with its issueId, action "fixed" (default), a one-line note of what you changed '
+    + 'and startLine/endLine of the code you changed (line numbers in the file now): the issue then waits under "Fixed — to verify" in the developer\'s Review view with your change highlighted, so they can check your fix. '
     + 'Use action "reopen" to undo that. Use action "remove" (deletes the flag) ONLY when the developer explicitly asks to remove or dismiss the issue. '
     + 'Do not report an issue as fixed when you did not change the code for it.',
   inputSchema: {
@@ -245,6 +245,8 @@ export const TOOLS = [
       file: { type: 'string', description: 'Instead of issueId: path or name of a file with exactly one matching issue.' },
       action: { type: 'string', enum: ['fixed', 'reopen', 'remove'], description: 'fixed (default): fixed, waits for verification; reopen: open again; remove: delete the flag (only when asked).' },
       note: { type: 'string', description: 'What you changed to fix it (shown to the developer).' },
+      startLine: { type: 'number', description: 'action fixed: 1-based first line of the code you changed for the fix, in the file now. Highlighted for the developer to verify.' },
+      endLine: { type: 'number', description: 'action fixed: 1-based last line of the changed code (default startLine).' },
       repo: { type: 'string', description: 'Repository (part of its remote URL or folder) to narrow the search.' }
     },
     additionalProperties: false
@@ -447,7 +449,10 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       const action = str(args.action);
       if (action && action !== 'fixed' && action !== 'reopen' && action !== 'remove') throw new Error('"action" must be fixed, reopen or remove.');
       return reviewResolveIssue(loadReviewStore(),
-        { issueId: str(args.issueId), file: str(args.file), action: action as ResolveAction | undefined, note: str(args.note), repo: str(args.repo) }, reviewMarkIo);
+        {
+          issueId: str(args.issueId), file: str(args.file), action: action as ResolveAction | undefined, note: str(args.note), repo: str(args.repo),
+          startLine: typeof args.startLine === 'number' ? args.startLine : undefined, endLine: typeof args.endLine === 'number' ? args.endLine : undefined
+        }, reviewMarkIo);
     }
     default: throw new Error(`Unknown tool "${name}".`);
   }

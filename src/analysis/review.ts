@@ -21,7 +21,13 @@ export interface LineKey { c: string; p: string }
 
 /** Who said a flagged issue is fixed: Copilot via MCP (`review_resolve_issue`) or the developer. */
 export type FixedBy = 'ai' | 'user';
-export interface IssueFix { at: number; by: FixedBy; note?: string }
+export interface IssueFix {
+  at: number;
+  by: FixedBy;
+  note?: string;
+  /** Keys of the code changed for the fix (shown purple until the developer accepts or reopens it). */
+  lines?: string[];
+}
 
 export interface ReviewMark {
   id: string;
@@ -64,6 +70,8 @@ export interface ResolvedIssue extends OpenIssue {
   by: FixedBy | 'changed';
   fixedAt?: number;
   fixNote?: string;
+  /** Lines changed for the fix that are still in the file (highlighted purple). */
+  changedLines?: number;
 }
 
 export interface BranchCoverage {
@@ -93,6 +101,8 @@ export interface ReviewStoreData {
 const HASH_LEN = 12;
 /** Only lines at least this long can keep their review when moved. */
 export const MOVE_MIN_LENGTH = 20;
+/** Changed lines remembered per fix. */
+const MAX_FIX_LINES = 2000;
 const MARK_TTL_MS = 400 * 86_400_000;
 const MAX_KEYS_PER_FILE = 40_000;
 const MAX_COVERAGE_FILES = 2000;
@@ -250,8 +260,8 @@ export interface FileReview {
   issueLines: number;
   /** Flagged issues matched in this file (one per mark, first matching line). */
   issues: { line: number; lines: number; note: string; at: number; markId: string; indices: number[]; flagged: number }[];
-  /** Issues reported fixed whose lines are still (partly) in the file. */
-  fixed: { markId: string; line: number; indices: number[] }[];
+  /** Issues reported fixed whose flagged lines (`indices`) or changed lines (`changed`) are in the file; `line` = first of both. */
+  fixed: { markId: string; line: number; indices: number[]; changed: number[] }[];
   /** Runs of unreviewed changed lines (0-based, inclusive), blank lines bridge a run. */
   todoBlocks: { start: number; end: number; lines: number }[];
   /** Runs of reviewed changed lines (0-based, inclusive), `at` = newest mark in the run. */
@@ -277,7 +287,7 @@ export function evaluateFile(lines: readonly string[], changed: ReadonlySet<numb
     const mark = matched[i];
     if (mark?.fixed) {
       const hit = fixedMap.get(mark.id);
-      if (hit) hit.indices.push(i); else fixedMap.set(mark.id, { markId: mark.id, line: i, indices: [i] });
+      if (hit) hit.indices.push(i); else fixedMap.set(mark.id, { markId: mark.id, line: i, indices: [i], changed: [] });
     }
     const verdict = mark && mark.status !== 'clear' && !mark.fixed ? mark.status : undefined;
     const isChanged = changed ? changed.has(i) : true;
@@ -291,6 +301,20 @@ export function evaluateFile(lines: readonly string[], changed: ReadonlySet<numb
     total++;
     if (verdict === 'ok') { status[i] = 'ok'; okAt[i] = mark!.at; reviewed++; }
     else if (verdict !== 'issue') status[i] = 'todo';
+  }
+  const fixC = new Map<string, ReviewMark>();
+  for (const m of marks) {
+    if (m.status !== 'issue' || !m.fixed?.lines) continue;
+    for (const s of m.fixed.lines) { const c = decodeKey(s).c; const h = fixC.get(c); if (!h || h.fixed!.at <= m.fixed.at) fixC.set(c, m); }
+  }
+  if (fixC.size) {
+    for (let i = 0; i < lines.length; i++) {
+      const m = keys[i] && fixC.get(keys[i]!.c);
+      if (!m) continue;
+      const hit = fixedMap.get(m.id);
+      if (!hit) fixedMap.set(m.id, { markId: m.id, line: i, indices: [], changed: [i] });
+      else if (!hit.indices.includes(i)) { hit.changed.push(i); hit.line = Math.min(hit.line, i); }
+    }
   }
   const todoBlocks: FileReview['todoBlocks'] = [];
   const reviewedBlocks: FileReview['reviewedBlocks'] = [];
@@ -306,7 +330,7 @@ export function evaluateFile(lines: readonly string[], changed: ReadonlySet<numb
     } else ok = undefined;
   }
   const issues = [...issueMap.values()].sort((x, y) => x.line - y.line);
-  return { status, total, reviewed, issueLines, issues, todoBlocks, reviewedBlocks, fixed: [...fixedMap.values()] };
+  return { status, total, reviewed, issueLines, issues, todoBlocks, reviewedBlocks, fixed: [...fixedMap.values()].sort((x, y) => x.line - y.line) };
 }
 
 /**
@@ -326,7 +350,7 @@ export function resolvedIssuesOf(rel: string, marks: readonly ReviewMark[], revi
     const mine = m.branch ? m.branch === branch : fileChanged;
     if (!hit && !mine) continue;
     const base = { path: rel, line: hit ? hit.line + 1 : m.line ?? 1, lines: hit?.indices.length ?? 0, note: m.note ?? '', at: m.at, markId: m.id };
-    if (m.fixed) out.push({ ...base, by: m.fixed.by, fixedAt: m.fixed.at, ...(m.fixed.note ? { fixNote: m.fixed.note } : {}) });
+    if (m.fixed) out.push({ ...base, by: m.fixed.by, fixedAt: m.fixed.at, ...(m.fixed.note ? { fixNote: m.fixed.note } : {}), ...(hit?.changed.length ? { changedLines: hit.changed.length } : {}) });
     else out.push({ ...base, by: 'changed' });
   }
   return out.sort((a, b) => a.line - b.line);
@@ -341,6 +365,7 @@ export function setIssueFix(marks: readonly ReviewMark[], markId: string, fix: I
     m.fixed = { at: fix.at, by: fix.by };
     const text = fix.note?.trim();
     if (text) m.fixed.note = text.slice(0, 2000);
+    if (fix.lines?.length) m.fixed.lines = fix.lines.slice(0, MAX_FIX_LINES);
   } else delete m.fixed;
   const next = [...marks];
   if (m.lines.length || m.fixed) next[i] = m; else next.splice(i, 1);
@@ -470,6 +495,8 @@ function decodeMark(v: unknown): ReviewMark | undefined {
   if (f) {
     m.fixed = { at: num(f.at), by: f.by as FixedBy };
     if (typeof f.note === 'string' && f.note) m.fixed.note = f.note;
+    const fl = Array.isArray(f.lines) ? f.lines.filter((s): s is string => typeof s === 'string' && s.length === HASH_LEN * 2).slice(0, MAX_FIX_LINES) : [];
+    if (fl.length) m.fixed.lines = fl;
   }
   return m;
 }
@@ -598,7 +625,7 @@ export function fixIssuesPrompt(branch: string | null, issues: readonly { path: 
   });
   if (total > issues.length) out.push(`… and ${total - issues.length} more (see \`review_issues\`).`);
   out.push('', 'For each issue make the smallest fix that addresses the note and do not change unrelated code. '
-    + 'After fixing an issue, call the MCP tool `review_resolve_issue` with its issueId and a one-line note of what you changed, '
+    + 'After fixing an issue, call the MCP tool `review_resolve_issue` with its issueId, a one-line note of what you changed and startLine/endLine of the changed code, '
     + 'so it shows up as "fixed by Copilot" for me to verify (skip this if the tool is not available). '
     + 'When you are done, list each issue with what you changed, or why you left it unchanged.');
   return out.join('\n');
@@ -706,7 +733,8 @@ export function reviewIssues(
     ...(toVerify.length ? { fixedAwaitingVerification: toVerify.slice(0, 50) } : {}),
     instructions: 'The developer flagged these lines while reviewing code in VS Code; "note" says what is wrong. Fix each issue in "file" around startLine–endLine '
       + '(lines marked ">" in "code" are the flagged ones; line numbers are for the file on disk now). Keep changes minimal and do not touch unrelated code. '
-      + 'After fixing an issue, call review_resolve_issue with its issueId and a short note of what you changed: it moves to "Fixed — to verify" in VS Code '
+      + 'After fixing an issue, call review_resolve_issue with its issueId, a short note of what you changed and startLine/endLine of the code you changed (lines in the file now): '
+      + 'it moves to "Fixed — to verify" in VS Code with your change highlighted '
       + 'and the changed code shows up as "to review". If you left an issue unchanged, say why instead of resolving it. '
       + '"fixedAwaitingVerification" lists issues already reported fixed; do not fix them again unless asked.',
     ...(live.length || elsewhere.length || toVerify.length ? {} : { note: store.repos && Object.keys(store.repos).length

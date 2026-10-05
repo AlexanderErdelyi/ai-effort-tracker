@@ -1,5 +1,5 @@
 import {
-  applyMark, blockContext, changedLines, DEFAULT_REVIEW_EXCLUDE, dropMark, evaluateFile, excludeMatcher, globToRegExp, keysForLines, setIssueFix, splitLines, withRoot,
+  applyMark, blockContext, changedLines, DEFAULT_REVIEW_EXCLUDE, dropMark, evaluateFile, excludeMatcher, globToRegExp, keysForLines, keysForRange, setIssueFix, splitLines, withRoot,
   type MarkStatus, type RepoReview, type ReviewIssuesIo, type ReviewMark, type ReviewStoreData
 } from './review';
 import { ALL_CATEGORIES, type FileCategory } from '../util/categoryRules';
@@ -227,6 +227,9 @@ export interface ResolveIssueArgs {
   action?: ResolveAction;
   /** What was changed (fixed) or why (remove / reopen). */
   note?: string;
+  /** action fixed: 1-based range of the code changed for the fix, in the file on disk now (highlighted for the developer). */
+  startLine?: number;
+  endLine?: number;
   repo?: string;
 }
 
@@ -234,7 +237,7 @@ export interface ResolveIssueArgs {
  * MCP `review_resolve_issue`: report a flagged issue as fixed by Copilot (it then
  * waits in "Fixed — to verify" in VS Code), open it again, or remove the flag.
  */
-export function reviewResolveIssue(store: ReviewStoreData, args: ResolveIssueArgs, io: Pick<ReviewMarkIo, 'update' | 'now'>): unknown {
+export function reviewResolveIssue(store: ReviewStoreData, args: ResolveIssueArgs, io: Pick<ReviewMarkIo, 'update' | 'now' | 'exists' | 'currentBranch' | 'readFile'>): unknown {
   const action: ResolveAction = args.action ?? 'fixed';
   if (action !== 'fixed' && action !== 'reopen' && action !== 'remove') throw new Error('"action" must be fixed, reopen or remove.');
   const id = args.issueId?.trim();
@@ -259,10 +262,24 @@ export function reviewResolveIssue(store: ReviewStoreData, args: ResolveIssueArg
   const { repoId, rel, mark } = found[0];
   if (action === 'fixed' && mark.fixed) return { result: 'This issue is already reported fixed; nothing was changed.', issueId: mark.id, file: rel, fixNote: mark.fixed.note ?? null };
   if (action === 'reopen' && !mark.fixed) return { result: 'This issue is open already; nothing was changed.', issueId: mark.id, file: rel };
+  const ranged = action === 'fixed' && (args.startLine !== undefined || args.endLine !== undefined);
+  let fixLines: string[] | undefined, changedRange: { startLine: number; endLine: number; lines: number } | undefined;
+  if (ranged) {
+    const s = Math.round(Number(args.startLine ?? args.endLine)), e = Math.round(Number(args.endLine ?? args.startLine));
+    if (!Number.isFinite(s) || !Number.isFinite(e) || s < 1 || e < s) throw new Error('"startLine"/"endLine" must be 1-based with startLine ≤ endLine.');
+    const roots = (store.repos[repoId].roots ?? []).filter(r => io.exists(r));
+    roots.sort((a, b) => Number(io.currentBranch(b) === mark.branch) - Number(io.currentBranch(a) === mark.branch));
+    const text = roots.map(r => io.readFile(joinPath(r, rel))).find((x): x is string => x !== null);
+    if (text === undefined) throw new Error(`Cannot read ${rel} to highlight the changed lines; call again without startLine/endLine.`);
+    const lines = splitLines(text);
+    if (s > lines.length) throw new Error(`${rel} has only ${lines.length} lines.`);
+    fixLines = keysForRange(lines, s - 1, Math.min(e, lines.length) - 1);
+    changedRange = { startLine: s, endLine: Math.min(e, lines.length), lines: fixLines.length };
+  }
   const now = io.now();
   io.update(repoId, latest => {
     const marks = latest.files[rel] ?? [];
-    const next = action === 'remove' ? dropMark(marks, mark.id) : setIssueFix(marks, mark.id, action === 'fixed' ? { at: now, by: 'ai', note: args.note } : null);
+    const next = action === 'remove' ? dropMark(marks, mark.id) : setIssueFix(marks, mark.id, action === 'fixed' ? { at: now, by: 'ai', note: args.note, lines: fixLines } : null);
     if (!next) throw new Error('The issue was changed in the meantime. Call review_issues and try again.');
     const files = { ...latest.files };
     if (next.length) files[rel] = next; else delete files[rel];
@@ -272,6 +289,7 @@ export function reviewResolveIssue(store: ReviewStoreData, args: ResolveIssueArg
     result: action === 'fixed' ? 'Reported as fixed by Copilot. The developer verifies it in VS Code (Review view → "Fixed — to verify").'
       : action === 'reopen' ? 'The issue is open again.' : 'The review flag was removed.',
     issueId: mark.id, repo: repoId, file: rel, note: mark.note || '(no note)',
+    ...(changedRange ? { highlighted: changedRange } : action === 'fixed' ? { hint: 'Pass startLine/endLine of the code you changed next time so the developer sees it highlighted.' } : {}),
     ...(action === 'remove' ? {} : { undo: `Call review_resolve_issue with issueId "${mark.id}" and action "${action === 'fixed' ? 'reopen' : 'fixed'}".` })
   };
 }

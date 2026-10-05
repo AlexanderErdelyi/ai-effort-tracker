@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.29.2",
+  "version": "0.30.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -949,6 +949,16 @@
           "light": "#2ea0431a",
           "highContrast": "#2ea04326",
           "highContrastLight": "#2ea04326"
+        }
+      },
+      {
+        "id": "aiEffortTracker.review.fixedLineBackground",
+        "description": "Background of code reported fixed for a review issue, waiting for verification (AI Effort Tracker code review).",
+        "defaults": {
+          "dark": "#a371f726",
+          "light": "#8250df1f",
+          "highContrast": "#a371f740",
+          "highContrastLight": "#8250df33"
         }
       }
     ]

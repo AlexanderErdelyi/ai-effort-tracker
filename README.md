@@ -432,6 +432,16 @@ well ("flagged lines changed"), but only on the branch they were flagged on. Cli
 to jump to the code, then **✓ Accept fix** (removes the flag, with Undo) or **↺
 Reopen**. You can also move an issue there yourself with **Fixed — verify later** in
 its actions or the right-click menu.
+
+Fixes waiting for verification get a **purple background** in the editor, like the
+red one of open issues. Copilot passes the `startLine`/`endLine` of the code it
+changed to `review_resolve_issue`, so the new code is highlighted, along with any
+flagged lines that are still there. The highlight follows the code when lines
+shift. Hover a purple line to see the issue and fix notes, with **✓ Accept fix** and
+**↺ Reopen**; both remove the purple. Clicking a fixed issue in the Review view jumps
+to the first purple line. The color is the theme color
+`aiEffortTracker.review.fixedLineBackground`. Like the red issue background, it is
+always shown while review decorations are on (`aiEffortTracker.review.showDecorations`).
 Marks are anchored to the line's content and its neighbours, not to line numbers,
 so they survive edits elsewhere, rebases and branch switches, and a moved block
 keeps its marks. Editing a reviewed line makes it (and its direct neighbours)
