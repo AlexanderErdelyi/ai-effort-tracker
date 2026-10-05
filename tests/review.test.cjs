@@ -71,6 +71,46 @@ test('long lines moved as a block keep their review, isolated short duplicates d
   assert.equal(r.evaluateFile(single, null, marks).status[1], 'todo', 'a lone moved line is not trusted');
 });
 
+test('a duplicate line elsewhere does not inherit a mark through a common short neighbour', () => {
+  const file = [
+    'local procedure CollectErrorEntries()',
+    'var',
+    '    JobQueueEntry: Record "Job Queue Entry";',
+    '    JobQueueLogEntry: Record "Job Queue Log Entry";',
+    'begin',
+    '    JobQueueLogEntry.SetRange(Status, JobQueueLogEntry.Status::Error);',
+    'end;',
+    '',
+    '#region Restart',
+    'local procedure RestartEntry()',
+    'var',
+    '    JobQueueEntry: Record "Job Queue Entry";',
+    '    EntryId: Guid;',
+    'begin',
+    '    JobQueueEntry.Get(EntryId);',
+    'end;',
+  ];
+  for (const status of ['issue', 'ok']) {
+    const marks = mark([], keysOf(file, 0, 6), status, 1, 'note');
+    const e = r.evaluateFile(file, null, marks);
+    assert.deepEqual(e.status.slice(0, 7), Array(7).fill(status), status + ': flagged range');
+    assert.equal(e.status[11], 'todo', status + ': the duplicate declaration stays unmarked');
+    if (status === 'issue') { assert.equal(e.issues.length, 1); assert.deepEqual(e.issues[0].indices, [0, 1, 2, 3, 4, 5, 6]); }
+    const restart = file.slice(8);
+    assert.equal(r.evaluateFile(restart, null, marks).status[3], 'todo', status + ': not marked when the original is gone and the neighbours are not part of the mark');
+  }
+});
+
+test('a moved block keeps its mark but a copy next to the original does not', () => {
+  const block = ['    SalesHeader.SetRange("Document Type", DocType);', '    SalesHeader.SetRange("No.", DocumentNo);'];
+  const v1 = ['begin', ...block, 'end;'];
+  const marks = mark([], keysOf(v1, 0, 3), 'issue', 1, 'x');
+  const copied = [...v1, '', 'trigger OnRun()', ...block, 'y := 2;'];
+  const e = r.evaluateFile(copied, null, marks);
+  assert.deepEqual(e.status.slice(0, 3), ['issue', 'issue', 'issue']);
+  assert.deepEqual(e.status.slice(5, 9), ['todo', 'todo', 'todo', 'todo'], 'the copy is new code to review');
+});
+
 test('only changed lines count; issues show everywhere; newest decision wins; clear un-reviews', () => {
   const lines = L('a1 := 1;\na2 := 2;\na3 := 3;\na4 := 4;\na5 := 5;');
   const changed = new Set([1, 2, 3]);
