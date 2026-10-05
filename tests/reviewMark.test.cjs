@@ -173,7 +173,7 @@ test('fixed issues stop flagging their lines and are listed for verification', (
   ev = r.evaluateFile(lines, null, marks);
   assert.equal(ev.issues.length, 0);
   assert.equal(ev.status[1], 'todo', 'the fixed line needs a look again');
-  assert.deepEqual(ev.fixed, [{ markId: 'iss', line: 1, indices: [1] }]);
+  assert.deepEqual(ev.fixed, [{ markId: 'iss', line: 1, indices: [1], changed: [] }]);
   const res = r.resolvedIssuesOf('a.al', marks, ev, 'other', false);
   assert.deepEqual(res, [{ path: 'a.al', line: 2, lines: 1, note: 'wrong', at: 100, markId: 'iss', by: 'ai', fixedAt: 200, fixNote: 'used the right field' }]);
 
@@ -245,4 +245,30 @@ test('review_resolve_issue reports fixed, reopens and removes issues', () => {
   assert.deepEqual(files()['src/b.al'].map(m => m.id), ['bbbbbbbb-1']);
   assert.match(reviewResolveIssue(store, { issueId: 'bbbbbbbb' }, io).result, /fixed by Copilot/, 'a unique prefix is enough');
   assert.throws(() => reviewResolveIssue(store, { issueId: 'bbbbbbbb', action: 'nope' }, io), /action/);
+});
+
+test('review_resolve_issue with a line range highlights the changed code until accepted or reopened', () => {
+  const before = L('procedure A()\nbegin\n    Amount := Amount * 2;\nend;');
+  const mark = r.applyMark([], r.keysForLines(before, [2]), 'issue', 100, 'cccccccc-1', 'wrong factor', { branch: 'feature/x', line: 3 })[0];
+  const after = L('procedure A()\nbegin\n    // use the configured factor\n    Amount := Amount * Setup.Factor;\nend;');
+  const store = mkStore({ 'src/c.al': [mark] });
+  const { io, setStore } = fakeIo({ 'src/c.al': after.join('\n') });
+  setStore(store);
+  assert.throws(() => reviewResolveIssue(store, { issueId: 'cccccccc-1', startLine: 9 }, io), /only 5 lines/);
+  const res = reviewResolveIssue(store, { issueId: 'cccccccc-1', note: 'factor from setup', startLine: 3, endLine: 4 }, io);
+  assert.deepEqual(res.highlighted, { startLine: 3, endLine: 4, lines: 2 });
+  const marks = store.repos['github.com/o/r'].files['src/c.al'];
+  assert.equal(marks[0].fixed.lines.length, 2);
+  const back = r.decodeReviewStore(JSON.stringify(store)).repos['github.com/o/r'].files['src/c.al'];
+  assert.deepEqual(back[0].fixed, marks[0].fixed, 'the changed lines are saved');
+  const ev = r.evaluateFile(after, null, back);
+  assert.deepEqual(ev.fixed, [{ markId: 'cccccccc-1', line: 2, indices: [], changed: [2, 3] }]);
+  assert.equal(ev.issues.length, 0);
+  const resolved = r.resolvedIssuesOf('src/c.al', back, ev, 'feature/x', true);
+  assert.equal(resolved[0].line, 3);
+  assert.equal(resolved[0].changedLines, 2);
+  assert.deepEqual(r.evaluateFile(['', '', ...after], null, back).fixed[0].changed, [4, 5], 'follows the code when it shifts');
+  reviewResolveIssue(store, { issueId: 'cccccccc-1', action: 'reopen' }, io);
+  assert.equal(r.evaluateFile(after, null, store.repos['github.com/o/r'].files['src/c.al']).fixed.length, 0, 'reopen drops the highlight');
+  assert.match(reviewResolveIssue(store, { issueId: 'cccccccc-1' }, io).hint, /startLine/, 'without a range it asks for one next time');
 });

@@ -82,6 +82,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
   private readonly okBgType: vscode.TextEditorDecorationType;
   private readonly issueType: vscode.TextEditorDecorationType;
   private readonly todoType: vscode.TextEditorDecorationType;
+  private readonly fixedType: vscode.TextEditorDecorationType;
   private readonly statusItem: vscode.StatusBarItem;
   private snapshot: Snapshot | undefined;
   private currentRoot: string | undefined;
@@ -111,6 +112,10 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       backgroundColor: 'rgba(248,81,73,0.08)',
       overviewRulerColor: 'rgba(248,81,73,0.9)', overviewRulerLane: vscode.OverviewRulerLane.Full
     });
+    this.fixedType = vscode.window.createTextEditorDecorationType({
+      isWholeLine: true, backgroundColor: new vscode.ThemeColor('aiEffortTracker.review.fixedLineBackground'),
+      overviewRulerColor: 'rgba(163,113,247,0.9)', overviewRulerLane: vscode.OverviewRulerLane.Full
+    });
     this.todoType = vscode.window.createTextEditorDecorationType({
       gutterIconPath: icon('review-todo.svg'), gutterIconSize: '70%',
       overviewRulerColor: 'rgba(210,153,34,0.8)', overviewRulerLane: vscode.OverviewRulerLane.Left
@@ -126,7 +131,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     this.disposables.push(
       view, watcher, watcher.onDidChange(external), watcher.onDidCreate(external),
       view.onDidChangeCheckboxState(e => void this.onCheckbox(e)),
-      this.okType, this.okBgType, this.issueType, this.todoType, this.statusItem, this.lensEmitter, this.treeEmitter,
+      this.okType, this.okBgType, this.issueType, this.fixedType, this.todoType, this.statusItem, this.lensEmitter, this.treeEmitter,
       vscode.languages.registerCodeLensProvider({ scheme: 'file' }, this),
       vscode.window.onDidChangeActiveTextEditor(e => { if (e) this.queueDoc(e.document, 50, true); }),
       vscode.window.onDidChangeVisibleTextEditors(eds => { for (const e of eds) this.queueDoc(e.document, 50); }),
@@ -279,7 +284,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
     const show = this.enabled() && (cfg().get<boolean>('showDecorations') ?? true);
     const background = show && (cfg().get<boolean>('highlightReviewedLines') ?? true);
     const ok: vscode.DecorationOptions[] = [], todo: vscode.Range[] = [];
-    const issues: vscode.DecorationOptions[] = [];
+    const issues: vscode.DecorationOptions[] = [], fixed: vscode.DecorationOptions[] = [];
     if (ev && show) {
       const s = ev.review.status;
       for (let i = 0; i < s.length && i < doc.lineCount; i++) if (s[i] === 'todo') todo.push(doc.lineAt(i).range);
@@ -300,6 +305,19 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         const md = new vscode.MarkdownString(`**⚑ Review issue** · ${new Date(issue.at).toLocaleString()}\n\n${issue.note ? escapeMd(issue.note) : '_no note_'}`);
         for (const i of issue.indices) if (i < doc.lineCount) issues.push({ range: doc.lineAt(i).range, hoverMessage: md });
       }
+      if (ev.review.fixed.length) {
+        const byId = new Map(this.marksFor(ev.ctx.repoId, ev.rel).map(m => [m.id, m]));
+        for (const f of ev.review.fixed) {
+          const m = byId.get(f.markId);
+          if (!m?.fixed) continue;
+          const args = (cmd: string) => `command:aiEffortTracker.review.${cmd}?${encodeURIComponent(JSON.stringify([doc.uri.fsPath, f.markId]))}`;
+          const md = new vscode.MarkdownString(`$(${m.fixed.by === 'ai' ? 'sparkle' : 'verified'}) **Fixed by ${m.fixed.by === 'ai' ? 'Copilot' : 'you'} — to verify** · ${new Date(m.fixed.at).toLocaleString()}\n\n`
+            + `⚑ ${m.note ? escapeMd(m.note) : '_no note_'}\n\n${m.fixed.note ? '> ' + escapeMd(m.fixed.note) + '\n\n' : ''}`
+            + `[$(check) Accept fix](${args('acceptFix')} "Remove the flag") · [$(discard) Reopen](${args('reopenIssue')} "Open the issue again")`, true);
+          md.isTrusted = { enabledCommands: ['aiEffortTracker.review.acceptFix', 'aiEffortTracker.review.reopenIssue'] };
+          for (const i of [...f.indices, ...f.changed]) if (i < doc.lineCount) fixed.push({ range: doc.lineAt(i).range, hoverMessage: md });
+        }
+      }
     }
     for (const editor of vscode.window.visibleTextEditors) {
       if (editor.document !== doc) continue;
@@ -307,6 +325,7 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       editor.setDecorations(this.okBgType, background ? ok.map(o => o.range) : []);
       editor.setDecorations(this.todoType, todo);
       editor.setDecorations(this.issueType, issues);
+      editor.setDecorations(this.fixedType, fixed);
     }
   }
 
@@ -399,8 +418,8 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
       }),
       reg('treeMarkReviewed', (node?: Node) => this.treeAction(node, 'ok')),
       reg('treeRemoveMarks', (node?: Node) => this.treeAction(node, 'clear')),
-      reg('acceptFix', (target?: Node | vscode.Uri, markId?: string) => this.resolvedAction(target, 'accept', markId)),
-      reg('reopenIssue', (target?: Node | vscode.Uri, markId?: string) => this.resolvedAction(target, 'reopen', markId)),
+      reg('acceptFix', (target?: Node | vscode.Uri | string, markId?: string) => this.resolvedAction(typeof target === 'string' ? vscode.Uri.file(target) : target, 'accept', markId)),
+      reg('reopenIssue', (target?: Node | vscode.Uri | string, markId?: string) => this.resolvedAction(typeof target === 'string' ? vscode.Uri.file(target) : target, 'reopen', markId)),
       reg('markIssueFixed', (target?: Node | vscode.Uri, markId?: string) => this.resolvedAction(target, 'fixed', markId)),
       reg('openRange', (root: string, rel: string, start: number, end: number) => this.openAt(path.join(root, rel), start, end)),
       reg('setBaseline', () => this.setBaseline()),
@@ -976,6 +995,8 @@ export class ReviewController implements vscode.Disposable, vscode.CodeLensProvi
         else md.appendMarkdown(`$(verified) ${i.by === 'ai' ? 'Copilot' : 'You'} reported it fixed${i.fixedAt ? ' · ' + new Date(i.fixedAt).toLocaleString() : ''}\n\n`);
         if (i.fixNote) md.appendMarkdown(`> ${escapeMd(i.fixNote)}\n\n`);
         md.appendMarkdown(i.lines ? `${plural(i.lines, 'flagged line')} still in the file.` : 'The flagged lines are gone.');
+        if (i.changedLines) md.appendMarkdown(` ${plural(i.changedLines, 'changed line')} of the fix.`);
+        if (i.lines || i.changedLines) md.appendMarkdown('\n\nClick to open it; the fix is highlighted purple.');
         item.tooltip = md;
         item.iconPath = i.by === 'ai' ? new vscode.ThemeIcon('sparkle', new vscode.ThemeColor('charts.purple'))
           : i.by === 'user' ? new vscode.ThemeIcon('verified', new vscode.ThemeColor('charts.blue'))
