@@ -1205,6 +1205,7 @@ function showTab(name){
   else if(name==='estimates'){document.getElementById('tab-estimates').classList.add('active');requestEstimates();}
   else if(name==='timesheet'){document.getElementById('tab-timesheet').classList.add('active');requestTimesheet();}
   else if(name==='health'){document.getElementById('tab-health').classList.add('active');requestHealth();}
+  else if(name==='corrections'){document.getElementById('tab-corrections').classList.add('active');requestCorrections();}
   else{document.getElementById('dtab').classList.add('active');}
 }
 
@@ -1352,6 +1353,93 @@ function renderHealth(){
     +kpi+(r.checks.length?cards:'<div class="card" style="margin-bottom:12px">\u2705 No problems found.</div>')+ok;
 }
 
+// #132 Corrections tab: label captured corrections (what was wrong + where it applies).
+var CORR=null,corrLoading=false,corrFilter='todo',corrSrc='all',corrOpen={},corrLimit=40;
+function requestCorrections(){corrLoading=true;renderCorrections();vscode.postMessage({type:'corrections'});}
+function corrIsLesson(cat){return !!cat&&CORR&&CORR.nonLesson.indexOf(cat)<0;}
+function corrOptions(sel){
+  var o='<option value="">\\u2014 unlabeled \\u2014</option><optgroup label="Lessons">';
+  var cats=CORR.categories.slice();if(sel&&cats.indexOf(sel)<0&&CORR.nonLesson.indexOf(sel)<0)cats.push(sel);
+  o+=cats.map(function(c){return'<option value="'+esc(c)+'"'+(c===sel?' selected':'')+'>'+esc(c)+'</option>';}).join('')+'</optgroup><optgroup label="Not a lesson">';
+  o+=CORR.nonLesson.map(function(c){return'<option value="'+esc(c)+'"'+(c===sel?' selected':'')+'>'+esc(c)+'</option>';}).join('')+'</optgroup>';
+  return o;
+}
+function corrCatBadge(cat){return cat?'<span class="badge '+(corrIsLesson(cat)?'ba':'bh')+'">'+esc(cat)+'</span>':'';}
+function corrDiff(i){
+  var mk=function(lines,sign,color){return(lines||[]).map(function(l){return'<div style="color:'+color+';white-space:pre">'+sign+' '+esc(l)+'</div>';}).join('');};
+  var body=mk(i.before,'-','var(--deleted)')+mk(i.after,'+','var(--added)');
+  if(i.kind==='move')body='<div>moved from line '+(i.fromLine||'?')+(i.context?' ('+esc(i.context)+')':'')+' to line '+i.line+(i.toContext?' ('+esc(i.toContext)+')':'')+'</div>'+body;
+  return body?'<div style="font-family:var(--vscode-editor-font-family);font-size:.85em;background:var(--vscode-textCodeBlock-background);padding:6px 8px;border-radius:4px;overflow:auto;max-height:260px;margin-top:6px">'+body+'</div>':'';
+}
+function corrItem(i){
+  var sug=!i.category&&i.suggestion?'<div style="margin-top:4px;font-size:.85em">\\uD83D\\uDCA1 Suggestion: <strong>'+esc(i.suggestion.category)+'</strong> <span style="color:var(--vscode-descriptionForeground)">('+esc(i.suggestion.reason)+')</span> <button class="dtab" style="padding:1px 8px" data-action="corrAccept" data-id="'+esc(i.id)+'" data-cat="'+esc(i.suggestion.category)+'">Accept</button></div>':'';
+  var by=i.labeledBy&&i.labeledBy!=='user'?' <span style="font-size:.8em;color:var(--vscode-descriptionForeground)">by '+esc(i.labeledBy)+'</span>':'';
+  return'<div class="corr-row" style="border-top:1px solid var(--vscode-panel-border);padding:8px 0">'
+    +'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between">'
+    +'<span><strong>'+esc(i.kind)+'</strong> '+esc(i.path)+':'+i.line+(i.context?' <span style="color:var(--vscode-descriptionForeground)">('+esc(i.context)+')</span>':'')+' <span style="color:var(--added)">+'+i.added+'</span> <span style="color:var(--deleted)">-'+i.removed+'</span>'+by+'</span>'
+    +'<span style="display:flex;gap:6px;align-items:center"><select class="corr-cat" data-id="'+esc(i.id)+'">'+corrOptions(i.category||'')+'</select>'
+    +'<input class="corr-scope" data-id="'+esc(i.id)+'" title="Files this lesson applies to (glob)" style="width:170px" value="'+esc(i.scope||i.suggestedScope)+'"></span></div>'
+    +sug+corrDiff(i)+'</div>';
+}
+function corrVisible(e){
+  if(corrSrc!=='all'&&e.source!==corrSrc)return false;
+  if(corrFilter==='todo')return e.items.some(function(i){return!i.category;});
+  if(corrFilter==='lessons')return e.items.some(function(i){return corrIsLesson(i.category);});
+  return true;
+}
+function renderCorrections(){
+  var el=document.getElementById('corrections');if(!el)return;
+  var pill=function(act,val,cur,lbl){return'<button class="dtab'+(val===cur?' active':'')+'" data-action="'+act+'" data-value="'+val+'">'+lbl+'</button>';};
+  if(!CORR||CORR.error){el.innerHTML='<p>'+(CORR&&CORR.error?esc(CORR.error):corrLoading?'Loading\\u2026':'No data yet.')+'</p>';return;}
+  var s=CORR.stats;
+  var ctl='<div class="rng">'+pill('corrFilter','todo',corrFilter,'To label')+pill('corrFilter','lessons',corrFilter,'Lessons')+pill('corrFilter','all',corrFilter,'All')
+    +'<span style="width:14px"></span>'+pill('corrSrc','all',corrSrc,'Everyone')+pill('corrSrc','human',corrSrc,'Your changes')+pill('corrSrc','ai',corrSrc,'AI rework')
+    +'<span style="width:14px"></span><button class="dtab" data-action="corrRefresh">\\u21bb Refresh</button>'
+    +(s.suggested?'<button class="dtab active" data-action="corrAcceptAll" title="Label every unlabeled correction with its suggestion. You can still change each one.">\\u2714 Accept all suggestions ('+s.suggested+')</button>':'')+'</div>';
+  var kpi='<div class="sg">'+sc('Corrections',String(s.total))+sc('Your changes',String(s.human),undefined,'Lines of AI-written code you changed yourself. These are the most valuable lessons.')
+    +sc('AI rework prompts',String(s.prompts),undefined,'Prompts after which Copilot changed its own earlier code.')
+    +sc('Labelled',s.labeled+' / '+s.total,s.labeled===s.total&&s.total?'var(--added)':undefined)+sc('Lessons',String(s.lessons),undefined,'Labelled with a lesson category (not requirement change, progress update or not a lesson).')+'</div>';
+  var cat=CORR.byCategory.length?'<div class="card" style="margin-bottom:12px"><h3>By category</h3><table style="width:100%"><thead><tr><th>Category</th><th>Corrections</th><th>Yours</th><th>Episodes</th><th>Scopes</th></tr></thead><tbody>'
+    +CORR.byCategory.map(function(g){return'<tr><td>'+corrCatBadge(g.category)+'</td><td>'+g.count+'</td><td>'+g.human+'</td><td>'+g.episodes+'</td><td style="font-size:.85em">'+esc(g.scopes.join(', '))+'</td></tr>';}).join('')+'</tbody></table></div>':'';
+  var list=CORR.episodes.filter(corrVisible),shown=list.slice(0,corrLimit);
+  var eps=shown.map(function(e){
+    var open=!!corrOpen[e.id],when=new Date(e.start).toLocaleString();
+    var who=e.source==='human'?'<span class="badge bd">You</span>':'<span class="badge bh">AI</span>';
+    var n=e.correctionIds.length,files=e.files.length===1?esc(e.files[0]):e.files.length+' files';
+    var lbl=e.category?corrCatBadge(e.category):e.labeled?'<span style="font-size:.85em">'+e.labeled+' / '+n+' labelled</span>':'';
+    var sug=e.suggestion&&e.labeled<n?' <span style="font-size:.85em">\\uD83D\\uDCA1 '+esc(e.suggestion.category)+'</span>':'';
+    var head='<div data-action="corrToggle" data-id="'+esc(e.id)+'" style="cursor:pointer;display:flex;gap:8px;align-items:baseline;justify-content:space-between">'
+      +'<span>'+(open?'\\u25BE':'\\u25B8')+' '+who+' <span style="color:var(--vscode-descriptionForeground);font-size:.85em">'+esc(when)+'</span> \\u00b7 '+files+' \\u00b7 '+n+' change'+(n===1?'':'s')+(e.workItemId?' \\u00b7 #'+esc(e.workItemId):'')+'</span>'
+      +'<span>'+lbl+sug+'</span></div>'
+      +(e.prompt?'<div style="margin-top:4px;font-size:.9em;color:var(--vscode-descriptionForeground)">'+(e.source==='ai'?'Prompt: ':'Code came from: ')+esc(e.prompt.length>220?e.prompt.slice(0,220)+'\\u2026':e.prompt)+'</div>':'');
+    var body='';
+    if(open){
+      body='<div style="margin-top:8px;display:flex;gap:6px;align-items:center;font-size:.9em">Label all '+n+': <select class="corr-ep-cat" data-ep="'+esc(e.id)+'">'+corrOptions(e.category||'')+'</select>'
+        +(e.suggestion&&e.labeled<n?'<button class="dtab" style="padding:1px 8px" data-action="corrAcceptEp" data-ep="'+esc(e.id)+'" data-cat="'+esc(e.suggestion.category)+'">Accept \\u201c'+esc(e.suggestion.category)+'\\u201d for all</button>':'')+'</div>'
+        +e.items.map(corrItem).join('');
+    }
+    return'<div class="card" style="margin-bottom:10px;border-left:3px solid '+(e.source==='human'?'var(--deleted)':'var(--review)')+'">'+head+body+'</div>';
+  }).join('');
+  var more=list.length>shown.length?'<button class="dtab" data-action="corrMore">Show more ('+(list.length-shown.length)+')</button>':'';
+  var empty=!list.length?'<div class="card">'+(s.total?(corrFilter==='todo'?'\\u2705 Everything here is labelled.':'Nothing matches this filter.'):'No corrections captured yet. They appear when you or Copilot change code an AI edit wrote earlier.')+'</div>':'';
+  el.innerHTML=ctl+'<p style="margin-bottom:12px;font-size:.85em;color:var(--vscode-descriptionForeground)">Say what was wrong with AI-written code and which files the lesson applies to. Lessons you label here become the input for coding rules for Copilot. Copilot can label them too through the <strong>label_correction</strong> MCP tool.</p>'
+    +kpi+cat+eps+more+empty;
+}
+function corrEpisode(id){return CORR?CORR.episodes.filter(function(e){return e.id===id;})[0]:null;}
+function corrLabel(ids,category,scope){var m={type:'labelCorrections',ids:ids,category:category};if(scope!==undefined)m.scope=scope;corrLoading=true;vscode.postMessage(m);}
+document.addEventListener('change',function(e){
+  var t=e.target;if(!t||!t.classList)return;
+  if(t.classList.contains('corr-cat')){
+    var sc0=t.parentNode.querySelector('.corr-scope');
+    corrLabel([t.dataset.id],t.value,t.value&&sc0?sc0.value:undefined);
+  }else if(t.classList.contains('corr-scope')){
+    var cs=t.parentNode.querySelector('.corr-cat');
+    if(cs&&cs.value)corrLabel([t.dataset.id],cs.value,t.value);
+  }else if(t.classList.contains('corr-ep-cat')){
+    var ep=corrEpisode(t.dataset.ep);if(ep)corrLabel(ep.correctionIds,t.value);
+  }
+});
+
 // #97/#98 Estimates tab: accuracy of finished work items + suggestions for open ones.
 var EST=null,estLoading=false,estProj='';
 function requestEstimates(){estLoading=true;renderEstimates();vscode.postMessage({type:'estimates',projectId:estProj||undefined});}
@@ -1482,8 +1570,9 @@ window.addEventListener('message',function(e){
   if(msg.type==='sessionsData'){sesLoading=false;SES=msg;var sv=document.querySelector('.view.active');if(sv&&sv.id==='sessions')renderSessions();return;}
   if(msg.type==='sessionDetailData'){sesDet[msg.sessionId]=msg;var dv=document.querySelector('.view.active');if(dv&&dv.id==='sessions')renderSessions();return;}
   if(msg.type==='openWorkItem'&&msg.id){selWi=String(msg.id);projView='workitem';showTab('projects');return;}
-  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions','estimates','timesheet','health'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
+  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions','estimates','timesheet','health','corrections'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
   if(msg.type==='timesheetData'){tsLoading=false;TS=msg;var tv=document.querySelector('.view.active');if(tv&&tv.id==='timesheet')renderTimesheet();return;}
+  if(msg.type==='correctionsData'){corrLoading=false;CORR=msg;var cv=document.querySelector('.view.active');if(cv&&cv.id==='corrections')renderCorrections();return;}
   if(msg.type==='healthData'){healthLoading=false;HEALTH=msg.report;var hv=document.querySelector('.view.active');if(hv&&hv.id==='health')renderHealth();return;}
   if(msg.type==='estimatesData'){estLoading=false;EST=msg;var ev=document.querySelector('.view.active');if(ev&&ev.id==='estimates')renderEstimates();return;}
   if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
@@ -1524,6 +1613,7 @@ document.getElementById('tab-sessions').addEventListener('click',function(){show
 document.getElementById('tab-estimates').addEventListener('click',function(){showTab('estimates');});
 document.getElementById('tab-timesheet').addEventListener('click',function(){showTab('timesheet');});
 document.getElementById('tab-health').addEventListener('click',function(){showTab('health');});
+document.getElementById('tab-corrections').addEventListener('click',function(){showTab('corrections');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -1575,6 +1665,14 @@ document.addEventListener('click',function(e){
   else if(a==='wiOpen'){e.preventDefault();selWi=t.dataset.id;projView='workitem';showTab('projects');}
   else if(a==='estRefresh')requestEstimates();
   else if(a==='healthRefresh')requestHealth();
+  else if(a==='corrRefresh')requestCorrections();
+  else if(a==='corrFilter'){corrFilter=v;corrLimit=40;renderCorrections();}
+  else if(a==='corrSrc'){corrSrc=v;corrLimit=40;renderCorrections();}
+  else if(a==='corrMore'){corrLimit+=40;renderCorrections();}
+  else if(a==='corrToggle'){var cid=t.dataset.id;if(corrOpen[cid])delete corrOpen[cid];else corrOpen[cid]=true;renderCorrections();}
+  else if(a==='corrAccept'){var crow=t.closest('.corr-row'),sci=crow?crow.querySelector('.corr-scope'):null;corrLabel([t.dataset.id],t.dataset.cat,sci?sci.value:undefined);}
+  else if(a==='corrAcceptEp'){var cep=corrEpisode(t.dataset.ep);if(cep)corrLabel(cep.items.filter(function(i){return!i.category;}).map(function(i){return i.id;}),t.dataset.cat);}
+  else if(a==='corrAcceptAll'){corrLoading=true;vscode.postMessage({type:'acceptCorrectionSuggestions'});}
   else if(a==='handoff'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'newChatWithHandoff',arg:t.dataset.id});}
   else if(a==='tsWeek'){var dv=parseInt(v,10)||0;if(dv===0||!tsWeek){tsWeek='';}else{var p=tsWeek.split('-').map(Number);var nd=new Date(p[0],p[1]-1,p[2]+7*dv);tsWeek=nd.getFullYear()+'-'+String(nd.getMonth()+1).padStart(2,'0')+'-'+String(nd.getDate()).padStart(2,'0');}requestTimesheet();}
   else if(a==='tsRound'){tsRound=v;requestTimesheet();}
@@ -1606,6 +1704,7 @@ vscode.postMessage({type:'ready'});`;
     '  <button class="tab" id="tab-estimates">\uD83D\uDCD0 Estimates</button>',
     '  <button class="tab" id="tab-timesheet">\uD83D\uDDD3 Timesheet</button>',
     '  <button class="tab" id="tab-health">\uD83E\uDE7A Health</button>',
+    '  <button class="tab" id="tab-corrections">\uD83E\uDDE0 Corrections</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
@@ -1619,6 +1718,7 @@ vscode.postMessage({type:'ready'});`;
     '<div id="estimates" class="view"></div>',
     '<div id="timesheet" class="view"></div>',
     '<div id="health" class="view"></div>',
+    '<div id="corrections" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,

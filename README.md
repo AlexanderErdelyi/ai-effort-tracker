@@ -30,6 +30,7 @@
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
 | `AI Effort Tracker: Show Captured Corrections` | Newest corrections of AI-written code (see below) |
+| `AI Effort Tracker: Label Corrections` | Opens the dashboard's Corrections tab to label what each correction teaches |
 
 ## Configuration
 
@@ -251,7 +252,8 @@ or *"Analyse my usage for work item 1987"*. All tools are read-only except
 | `review_issues` | Open review issues read live from disk: file, current lines, your note and the flagged code, so Copilot can fix them |
 | `review_mark` | Marks changed code reviewed, removes marks or flags lines, by path, glob or category, only when you ask (writes review marks only) |
 | `review_resolve_issue` | Reports a flagged issue as fixed by Copilot (with a note of what changed) so it waits in **Fixed — to verify**; can reopen it, or remove the flag when you ask |
-| `list_corrections` | Captured corrections of AI-written code (see below): what you or prompted Copilot rework changed, with snippets and prompts, to learn rules from |
+| `list_corrections` | Captured corrections of AI-written code (see below): what you or prompted Copilot rework changed, with snippets and prompts, to learn rules from (filter `category`, `none` = unlabeled) |
+| `label_correction` | Labels corrections (by `ids` or a whole `episodeId`) with a category, an optional `scope` glob and a `note`, only when you ask; an empty category removes the label (writes corrections only) |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -492,6 +494,33 @@ history copies. Nothing leaves your machine. Turn off
 `aiEffortTracker.corrections.captureCode` to keep only metadata (no code snippets
 or prompt text), or `aiEffortTracker.corrections.enabled` to stop capturing.
 Files matching `aiEffortTracker.review.exclude` are skipped.
+
+### Labelling corrections
+
+A correction becomes a lesson once it says *what kind of* mistake it fixed. Run
+**AI Effort Tracker: Label Corrections** (or open the dashboard's **🧠 Corrections**
+tab). It lists the episodes (your changes first, then AI rework by prompt) with the
+before/after code; filter **To label**, **Lessons** or **All**, and **Yours** or
+**AI rework**. Pick a category per line or for the whole episode, and adjust the
+**scope**, a glob saying where the lesson applies (suggested from the file: `**/*.Codeunit.al`
+for AL objects, otherwise `**/*.<ext>`). Notes and labels show up in the
+**Show Captured Corrections** report too.
+
+The tracker suggests a label you can accept per line, per episode or all at once:
+
+- your changes: moved code is *ordering/structure*, whitespace-only edits are *style*,
+  changed numbers are *wrong fact*, added or changed comments are *documentation*;
+- AI rework: the first keyword rule matching the prompt (e.g. "wrong", "doesn't work"
+  → *logic bug*, "status" → *progress update*), else the same checks of the change,
+  otherwise *requirement change*.
+
+Lesson categories are `aiEffortTracker.corrections.categories` (wrong fact, logic bug,
+style, naming, documentation, ordering/structure, error handling, tests and performance
+by default). *requirement change*, *progress update* and *not a lesson* are always
+available for corrections that do not teach a rule; they are kept but do not count as lessons. The keyword rules are
+`aiEffortTracker.corrections.keywordRules` (`{ "pattern": regex, "category": name }`,
+case-insensitive, first match wins). Copilot can label too with the MCP tool
+`label_correction`, e.g. "label the corrections of the last episode as naming".
 
 ## Development
 

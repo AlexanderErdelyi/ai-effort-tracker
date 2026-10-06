@@ -75,7 +75,19 @@ export interface Correction {
   origin?: PromptRef;
   /** Set by labeling (#132). */
   category?: string;
+  /** Files the lesson applies to, as a glob such as `**\/*.Codeunit.al` (#132). */
+  scope?: string;
+  /** Why it was corrected, in a few words. */
+  note?: string;
+  labeledBy?: LabelSource;
+  labeledAt?: number;
 }
+
+export type LabelSource = 'user' | 'copilot' | 'rule';
+
+/** Label fields a patch can set; an empty string clears the field. */
+export interface CorrectionLabel { category?: string; scope?: string; note?: string; labeledBy?: LabelSource; labeledAt?: number }
+export type CorrectionPatch = { trigger?: PromptRef; origin?: PromptRef } & CorrectionLabel;
 
 export interface FileOwnership {
   /** Last time this file's ownership changed. */
@@ -95,7 +107,7 @@ export interface CorrectionStoreData {
 export interface CorrectionDelta {
   owned: Record<string, Record<string, number>>;
   add: Correction[];
-  patch: Record<string, { trigger?: PromptRef; origin?: PromptRef }>;
+  patch: Record<string, CorrectionPatch>;
 }
 
 export interface UserMessage { t: number; sessionId: string; text: string }
@@ -308,13 +320,20 @@ export function mergeCorrectionDelta(data: CorrectionStoreData, delta: Correctio
     owned[key] = { u: now, h };
   }
   const ids = new Set(data.corrections.map(c => c.id));
-  const corrections = data.corrections.map(c => delta.patch[c.id] ? { ...c, ...delta.patch[c.id] } : c);
+  const corrections = data.corrections.map(c => delta.patch[c.id] ? applyPatch(c, delta.patch[c.id]) : c);
   for (const c of delta.add) {
     if (ids.has(c.id)) continue;
     ids.add(c.id);
-    corrections.push(delta.patch[c.id] ? { ...c, ...delta.patch[c.id] } : c);
+    corrections.push(delta.patch[c.id] ? applyPatch(c, delta.patch[c.id]) : c);
   }
   return pruneCorrectionStore({ version: 1, owned, corrections }, now);
+}
+
+function applyPatch(c: Correction, p: CorrectionPatch): Correction {
+  const out: Correction = { ...c, ...p };
+  for (const k of ['category', 'scope', 'note'] as const) if (out[k] === '') delete out[k];
+  if (!out.category) { delete out.labeledBy; delete out.labeledAt; }
+  return out;
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -350,6 +369,10 @@ function decodeCorrection(v: unknown): Correction | undefined {
   if (s(v.context)) c.context = s(v.context);
   if (s(v.toContext)) c.toContext = s(v.toContext);
   if (s(v.category)) c.category = s(v.category);
+  if (s(v.scope)) c.scope = s(v.scope);
+  if (s(v.note)) c.note = s(v.note);
+  if (c.category && (v.labeledBy === 'user' || v.labeledBy === 'copilot' || v.labeledBy === 'rule')) c.labeledBy = v.labeledBy;
+  if (c.category && finite(v.labeledAt)) c.labeledAt = v.labeledAt;
   const trigger = decodePrompt(v.trigger), origin = decodePrompt(v.origin);
   if (trigger) c.trigger = trigger;
   if (origin) c.origin = origin;
@@ -377,6 +400,8 @@ export function decodeCorrectionStore(raw: string): CorrectionStoreData {
 export interface ListCorrectionsArgs {
   workItemId?: string; branch?: string; path?: string; repo?: string;
   source?: CorrectionSource; kind?: CorrectionKind; days?: number; limit?: number;
+  /** Only this category; `none` for unlabeled corrections. */
+  category?: string;
 }
 
 /** Newest corrections matching the filter (MCP `list_corrections`, "Show Captured Corrections"). */
@@ -392,6 +417,7 @@ export function listCorrections(data: CorrectionStoreData, args: ListCorrections
     && (!repo || c.repo.toLowerCase().includes(repo))
     && (!args.source || c.source === args.source)
     && (!args.kind || c.kind === args.kind)
+    && (!args.category || (args.category.toLowerCase() === 'none' ? !c.category : c.category?.toLowerCase() === args.category.toLowerCase()))
   ).sort((x, y) => y.t - x.t);
   const limit = Math.max(1, Math.min(500, Math.floor(finite(args.limit) ? args.limit : 50)));
   const count = (pick: (c: Correction) => string) => {
@@ -405,6 +431,7 @@ export function listCorrections(data: CorrectionStoreData, args: ListCorrections
     bySource: count(c => c.source),
     byKind: count(c => c.kind),
     byExt: count(c => c.ext || '(none)'),
+    byCategory: count(c => c.category || '(unlabeled)'),
     episodes: groupEpisodes(corrections),
     corrections
   };
@@ -433,6 +460,10 @@ export interface CorrectionEpisode {
   added: number;
   removed: number;
   correctionIds: string[];
+  /** Corrections in the episode that have a category. */
+  labeled: number;
+  /** Set when every correction in the episode has this category. */
+  category?: string;
 }
 
 /** Groups corrections into episodes, newest first. */
@@ -451,7 +482,7 @@ export function groupEpisodes(corrections: readonly Correction[]): CorrectionEpi
     if (!e) {
       e = {
         id: c.id, source: c.source, start: c.start, end: c.t, repo: c.repo, branch: c.branch,
-        files: [], added: 0, removed: 0, correctionIds: []
+        files: [], added: 0, removed: 0, correctionIds: [], labeled: 0
       };
       const prompt = c.source === 'ai' ? c.trigger?.text : c.origin?.text;
       if (prompt) e.prompt = prompt;
@@ -468,6 +499,11 @@ export function groupEpisodes(corrections: readonly Correction[]): CorrectionEpi
     e.added += c.added;
     e.removed += c.removed;
     e.correctionIds.push(c.id);
+    if (c.category) {
+      e.labeled++;
+      if (e.labeled === 1 && e.correctionIds.length === 1) e.category = c.category;
+      else if (e.category !== c.category) delete e.category;
+    } else delete e.category;
   }
   return episodes.sort((x, y) => y.end - x.end);
 }
@@ -505,6 +541,7 @@ export function correctionsMarkdown(result: ReturnType<typeof listCorrections>):
       if (c.context) out.push(`- In: ${c.toContext && c.toContext !== c.context ? `${c.context} → ${c.toContext}` : c.context}`);
       out.push(`- AI lines touched: ${c.aiLines} · +${c.added} / -${c.removed}${c.fromLine ? ` · moved from line ${c.fromLine}` : ''}`);
       if (c.origin?.text) out.push(`- Code came from: ${oneLine(c.origin.text)}`);
+      if (c.category) out.push(`- Label: ${c.category}${c.scope ? ` · ${c.scope}` : ''}${c.note ? ` · ${c.note}` : ''}`);
       out.push('', ...fence(c.before, '-'), ...fence(c.after, '+'), '');
     }
   }
@@ -516,7 +553,7 @@ export function correctionsMarkdown(result: ReturnType<typeof listCorrections>):
     out.push(`- ${where(e)} · ${e.correctionIds.length} correction(s) in ${e.files.length} file(s) · +${e.added} / -${e.removed}`);
     for (const id of e.correctionIds) {
       const c = byId.get(id);
-      if (c) out.push(`- ${c.kind} ${c.path}:${c.line}${c.context ? ` (${c.context})` : ''} +${c.added} / -${c.removed}`);
+      if (c) out.push(`- ${c.kind} ${c.path}:${c.line}${c.context ? ` (${c.context})` : ''} +${c.added} / -${c.removed}${c.category ? ` · ${c.category}` : ''}`);
     }
     out.push('');
   }

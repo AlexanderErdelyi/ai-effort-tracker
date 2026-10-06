@@ -14,7 +14,9 @@ import { ESTIMATION_SNAPSHOT_FILE, estimateAccuracy, suggestEstimate, type Estim
 import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewIssues, reviewStatus, type ReviewIssuesIo } from '../analysis/review';
 import { reviewMark, reviewResolveIssue, type ResolveAction, type ReviewMarkArgs, type ReviewMarkIo } from '../analysis/reviewMark';
 import { ReviewStore } from '../review/reviewStore';
-import { CORRECTIONS_FILE, decodeCorrectionStore, emptyCorrectionStore, listCorrections, type CorrectionKind } from '../analysis/corrections';
+import { CORRECTIONS_FILE, decodeCorrectionStore, emptyCorrectionStore, groupEpisodes, listCorrections, type CorrectionKind } from '../analysis/corrections';
+import { DEFAULT_LESSON_CATEGORIES, labelDelta, NON_LESSON_CATEGORIES } from '../analysis/correctionLabels';
+import { CorrectionStore } from '../store/correctionStore';
 import { changedFilesSync, contentAtSync, resolveReviewBaseSync } from '../review/reviewGit';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
@@ -224,6 +226,7 @@ export const TOOLS = [
         repo: { type: 'string', description: 'Only this workspace folder (name contains this text).' },
         source: { type: 'string', enum: ['human', 'ai'], description: 'Only the developer\'s edits (human) or prompted Copilot rework (ai).' },
         kind: { type: 'string', enum: ['modify', 'insert', 'delete', 'move'], description: 'Only this kind of change.' },
+        category: { type: 'string', description: 'Only corrections labelled with this category; "none" for unlabeled ones.' },
         days: { type: 'number', description: 'Only the last N days.' },
         limit: { type: 'number', description: 'Maximum corrections returned (1–500, default 50).' }
       },
@@ -274,6 +277,25 @@ export const TOOLS = [
       startLine: { type: 'number', description: 'action fixed: 1-based first line of the code you changed for the fix, in the file now. Highlighted for the developer to verify.' },
       endLine: { type: 'number', description: 'action fixed: 1-based last line of the changed code (default startLine).' },
       repo: { type: 'string', description: 'Repository (part of its remote URL or folder) to narrow the search.' }
+    },
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as Json
+}, {
+  name: 'label_correction',
+  title: 'Label corrections of AI-written code',
+  description: 'Say what was wrong with AI-written code that was corrected (from list_corrections) and which files the lesson applies to. The label is shown to the developer in the dashboard\'s Corrections tab and feeds coding rules for Copilot. '
+    + `Lesson categories: ${DEFAULT_LESSON_CATEGORIES.join(', ')}. Categories that teach nothing: ${NON_LESSON_CATEGORIES.join(', ')} (use "requirement change" when a prompt changed what was wanted, "progress update" when the AI only updated a status or progress text). `
+    + 'Select corrections with "ids" and/or "episodeId" (labels every correction of that episode). "scope" is a file glob such as "**/*.Codeunit.al"; without it each correction keeps its scope or gets one from its file type. '
+    + 'An empty category removes the label. Label only when the developer asks you to, or when the reason is clear from the before/after code and the prompts.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      ids: { type: 'array', items: { type: 'string' }, description: 'Correction ids from list_corrections.' },
+      episodeId: { type: 'string', description: 'Episode id from list_corrections: labels all its corrections.' },
+      category: { type: 'string', description: 'Required. What was wrong (see the description for the categories). Empty string removes the label.' },
+      scope: { type: 'string', description: 'Files the lesson applies to, as a glob (e.g. "**/*.Codeunit.al", "app/src/**").' },
+      note: { type: 'string', description: 'The lesson in one sentence, e.g. "Use the field ID from the table, not the page".' }
     },
     additionalProperties: false
   },
@@ -457,9 +479,37 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       const kind = ['modify', 'insert', 'delete', 'move'].includes(args.kind as string) ? args.kind as CorrectionKind : undefined;
       const result = listCorrections(loadCorrectionStore(), {
         workItemId: str(args.workItemId), branch: str(args.branch), path: str(args.path), repo: str(args.repo),
-        source, kind, days: numArg(args.days), limit: numArg(args.limit)
+        source, kind, days: numArg(args.days), limit: numArg(args.limit), category: str(args.category)
       });
       return result.total ? result : { ...result, note: 'No corrections captured yet. They are recorded in VS Code when code an AI edit wrote is changed later (setting aiEffortTracker.corrections.enabled).' };
+    }
+    case 'label_correction': {
+      if (typeof args.category !== 'string') throw new Error('"category" is required (empty string removes the label).');
+      if (!process.env.AET_STORE_PATH) throw new Error('AET_STORE_PATH is not set.');
+      const store = new CorrectionStore(path.dirname(process.env.AET_STORE_PATH));
+      const data = store.load();
+      const ids = Array.isArray(args.ids) ? args.ids.filter((x): x is string => typeof x === 'string') : typeof args.ids === 'string' ? [args.ids] : [];
+      if (typeof args.episodeId === 'string' && args.episodeId) {
+        const episode = groupEpisodes(data.corrections).find(e => e.id === args.episodeId);
+        if (!episode) throw new Error(`No episode "${args.episodeId}". Use the episode ids from list_corrections.`);
+        ids.push(...episode.correctionIds);
+      }
+      if (!ids.length) throw new Error('Give "ids" or "episodeId".');
+      const delta = labelDelta(data, ids, {
+        category: args.category,
+        ...(typeof args.scope === 'string' ? { scope: args.scope } : {}),
+        ...(typeof args.note === 'string' ? { note: args.note } : {})
+      }, 'copilot');
+      const labeled = Object.keys(delta.patch);
+      const unknown = [...new Set(ids)].filter(id => !delta.patch[id]);
+      if (!labeled.length) throw new Error(`No corrections with these ids: ${unknown.join(', ')}.`);
+      const after = store.apply(delta);
+      const set = new Set(labeled);
+      return {
+        labeled: labeled.length,
+        corrections: after.corrections.filter(c => set.has(c.id)).map(c => ({ id: c.id, path: c.path, line: c.line, category: c.category ?? null, scope: c.scope ?? null, note: c.note ?? null })),
+        ...(unknown.length ? { unknownIds: unknown } : {})
+      };
     }
     case 'review_issues': {
       const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
