@@ -321,6 +321,11 @@ const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const strs = (v: unknown): string[] | undefined => Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : undefined;
 
+/** Work item id, or undefined for the `unknown` / `__unassigned__` placeholders. */
+export function realWorkItemId(v: unknown): string | undefined {
+  return typeof v === 'string' && v && v !== 'unknown' && v !== '__unassigned__' ? v : undefined;
+}
+
 function decodePrompt(v: unknown): PromptRef | undefined {
   if (!isObj(v) || !finite(v.t) || typeof v.sessionId !== 'string') return undefined;
   return { t: v.t, sessionId: v.sessionId, ...(typeof v.text === 'string' ? { text: v.text } : {}) };
@@ -337,7 +342,8 @@ function decodeCorrection(v: unknown): Correction | undefined {
     repo: s(v.repo) ?? '', path: v.path, ext: s(v.ext) ?? '', branch: s(v.branch) ?? 'unknown',
     line: Math.max(1, num(v.line)), aiLines: num(v.aiLines), added: num(v.added), removed: num(v.removed), aiAt: num(v.aiAt)
   };
-  if (s(v.workItemId)) c.workItemId = s(v.workItemId);
+  const workItemId = realWorkItemId(v.workItemId);
+  if (workItemId) c.workItemId = workItemId;
   if (finite(v.fromLine)) c.fromLine = v.fromLine;
   if (strs(v.before)) c.before = strs(v.before);
   if (strs(v.after)) c.after = strs(v.after);
@@ -393,13 +399,77 @@ export function listCorrections(data: CorrectionStoreData, args: ListCorrections
     for (const c of matches) out[pick(c)] = (out[pick(c)] ?? 0) + 1;
     return out;
   };
+  const corrections = matches.slice(0, limit);
   return {
     total: matches.length,
     bySource: count(c => c.source),
     byKind: count(c => c.kind),
     byExt: count(c => c.ext || '(none)'),
-    corrections: matches.slice(0, limit)
+    episodes: groupEpisodes(corrections),
+    corrections
   };
+}
+
+/** Human corrections this close together in one repo form one episode. */
+const HUMAN_EPISODE_GAP_MS = 10 * 60_000;
+
+/**
+ * Corrections that belong together: AI rework caused by the same prompt, or one
+ * sitting of the developer's own edits. One prompt that changes a requirement
+ * often touches dozens of lines; counting it once keeps it from drowning the
+ * real fixes.
+ */
+export interface CorrectionEpisode {
+  id: string;
+  source: CorrectionSource;
+  /** AI: the prompt that asked for the rework. Human: the prompt that produced the corrected code, if one. */
+  prompt?: string;
+  start: number;
+  end: number;
+  repo: string;
+  branch: string;
+  workItemId?: string;
+  files: string[];
+  added: number;
+  removed: number;
+  correctionIds: string[];
+}
+
+/** Groups corrections into episodes, newest first. */
+export function groupEpisodes(corrections: readonly Correction[]): CorrectionEpisode[] {
+  const episodes: CorrectionEpisode[] = [];
+  const byPrompt = new Map<string, CorrectionEpisode>();
+  const lastHuman = new Map<string, CorrectionEpisode>();
+  for (const c of [...corrections].sort((x, y) => x.t - y.t)) {
+    let e: CorrectionEpisode | undefined;
+    const promptKey = c.source === 'ai' && c.trigger ? `${c.trigger.sessionId}|${c.trigger.t}` : undefined;
+    if (promptKey) e = byPrompt.get(promptKey);
+    else if (c.source === 'human') {
+      const prev = lastHuman.get(c.repo);
+      if (prev && c.start - prev.end <= HUMAN_EPISODE_GAP_MS) e = prev;
+    }
+    if (!e) {
+      e = {
+        id: c.id, source: c.source, start: c.start, end: c.t, repo: c.repo, branch: c.branch,
+        files: [], added: 0, removed: 0, correctionIds: []
+      };
+      const prompt = c.source === 'ai' ? c.trigger?.text : c.origin?.text;
+      if (prompt) e.prompt = prompt;
+      if (c.workItemId) e.workItemId = c.workItemId;
+      episodes.push(e);
+      if (promptKey) byPrompt.set(promptKey, e);
+    }
+    if (c.source === 'human') lastHuman.set(c.repo, e);
+    e.start = Math.min(e.start, c.start);
+    e.end = Math.max(e.end, c.t);
+    if (!e.files.includes(c.path)) e.files.push(c.path);
+    if (!e.workItemId && c.workItemId) e.workItemId = c.workItemId;
+    if (!e.prompt && c.source === 'human' && c.origin?.text) e.prompt = c.origin.text;
+    e.added += c.added;
+    e.removed += c.removed;
+    e.correctionIds.push(c.id);
+  }
+  return episodes.sort((x, y) => y.end - x.end);
 }
 
 /** Markdown report of the newest corrections ("Show Captured Corrections"). */
@@ -407,6 +477,10 @@ export function correctionsMarkdown(result: ReturnType<typeof listCorrections>):
   const fmt = (r: Record<string, number>) => Object.entries(r).map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
   const fence = (lines: string[] | undefined, mark: string) => lines?.length
     ? ['```diff', ...lines.map(l => `${mark} ${l}`), '```'] : [];
+  const oneLine = (text: string, max = 200) => text.replace(/\s+/g, ' ').slice(0, max);
+  const byId = new Map(result.corrections.map(c => [c.id, c]));
+  const human = result.episodes.filter(e => e.source === 'human');
+  const ai = result.episodes.filter(e => e.source === 'ai');
   const out = [
     '# Captured corrections',
     '',
@@ -415,16 +489,36 @@ export function correctionsMarkdown(result: ReturnType<typeof listCorrections>):
   ];
   if (!result.total) {
     out.push('Nothing captured yet. Corrections appear when you or Copilot change code an AI edit wrote earlier.');
+    return out.join('\n');
   }
-  for (const c of result.corrections) {
-    out.push(`## ${c.source === 'ai' ? 'AI rework' : 'Your change'}: ${c.kind} in ${c.path}:${c.line}`);
+  if (result.corrections.length < result.total) out.push(`Showing the newest ${result.corrections.length}.`, '');
+  const where = (e: CorrectionEpisode) => `${new Date(e.end).toLocaleString()} · branch ${e.branch}${e.workItemId ? ` · work item ${e.workItemId}` : ''}`;
+
+  out.push(`## Your changes to AI code (${human.reduce((n, e) => n + e.correctionIds.length, 0)})`, '');
+  if (!human.length) out.push('None yet. These are the most useful ones for learning rules.', '');
+  for (const e of human) {
+    for (const id of e.correctionIds) {
+      const c = byId.get(id);
+      if (!c) continue;
+      out.push(`### ${c.kind} in ${c.path}:${c.line}`, '');
+      out.push(`- When: ${new Date(c.t).toLocaleString()} · branch ${c.branch}${c.workItemId ? ` · work item ${c.workItemId}` : ''}`);
+      if (c.context) out.push(`- In: ${c.toContext && c.toContext !== c.context ? `${c.context} → ${c.toContext}` : c.context}`);
+      out.push(`- AI lines touched: ${c.aiLines} · +${c.added} / -${c.removed}${c.fromLine ? ` · moved from line ${c.fromLine}` : ''}`);
+      if (c.origin?.text) out.push(`- Code came from: ${oneLine(c.origin.text)}`);
+      out.push('', ...fence(c.before, '-'), ...fence(c.after, '+'), '');
+    }
+  }
+
+  out.push(`## AI rework by prompt (${ai.length} prompt(s), ${ai.reduce((n, e) => n + e.correctionIds.length, 0)} correction(s))`, '');
+  out.push('Copilot changed its own earlier code because you asked for something new. Mostly changed requirements, not mistakes.', '');
+  for (const e of ai) {
+    out.push(`### ${e.prompt ? `"${oneLine(e.prompt, 120)}"` : 'No prompt found'}`, '');
+    out.push(`- ${where(e)} · ${e.correctionIds.length} correction(s) in ${e.files.length} file(s) · +${e.added} / -${e.removed}`);
+    for (const id of e.correctionIds) {
+      const c = byId.get(id);
+      if (c) out.push(`- ${c.kind} ${c.path}:${c.line}${c.context ? ` (${c.context})` : ''} +${c.added} / -${c.removed}`);
+    }
     out.push('');
-    out.push(`- When: ${new Date(c.t).toLocaleString()} · branch ${c.branch}${c.workItemId ? ` · work item ${c.workItemId}` : ''}`);
-    if (c.context) out.push(`- In: ${c.toContext && c.toContext !== c.context ? `${c.context} → ${c.toContext}` : c.context}`);
-    out.push(`- AI lines touched: ${c.aiLines} · +${c.added} / -${c.removed}${c.fromLine ? ` · moved from line ${c.fromLine}` : ''}`);
-    if (c.trigger?.text) out.push(`- Asked: ${c.trigger.text.replace(/\s+/g, ' ').slice(0, 200)}`);
-    if (c.origin?.text) out.push(`- Code came from: ${c.origin.text.replace(/\s+/g, ' ').slice(0, 200)}`);
-    out.push('', ...fence(c.before, '-'), ...fence(c.after, '+'), '');
   }
   return out.join('\n');
 }

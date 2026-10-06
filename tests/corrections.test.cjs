@@ -153,9 +153,38 @@ test('listCorrections filters and counts; the markdown report lists them', () =>
   assert.equal(C.listCorrections(data, { limit: 1 }, now).corrections.length, 1);
   const md = C.correctionsMarkdown(all);
   assert.match(md, /# Captured corrections/);
-  assert.match(md, /AI rework: insert in src\/Sales\.al:3/);
-  assert.match(md, /Asked: add docs/);
+  assert.match(md, /## Your changes to AI code \(2\)/);
+  assert.match(md, /### modify in src\/Purch\.al:3/);
+  assert.match(md, /### "add docs"/);
+  assert.match(md, /- insert src\/Sales\.al:3/);
   assert.match(C.correctionsMarkdown(C.listCorrections(C.emptyCorrectionStore(), {}, now)), /Nothing captured yet/);
+});
+
+test('groupEpisodes groups AI rework per prompt and human edits per sitting', () => {
+  const min = 60_000, p1 = { t: 1, sessionId: 's', text: 'make it sales or purchase' };
+  const list = [
+    corr({ id: 'a1', t: 10 * min, start: 10 * min, source: 'ai', path: 'plan.md', trigger: p1, added: 2 }),
+    corr({ id: 'a2', t: 11 * min, start: 11 * min, source: 'ai', path: 'ac.md', trigger: p1, added: 3 }),
+    corr({ id: 'a3', t: 12 * min, start: 12 * min, source: 'ai', path: 'plan.md', trigger: { t: 2, sessionId: 's' } }),
+    corr({ id: 'h1', t: 20 * min, start: 20 * min, source: 'human', path: 'x.al', workItemId: '7' }),
+    corr({ id: 'h2', t: 25 * min, start: 25 * min, source: 'human', path: 'y.al' }),
+    corr({ id: 'h3', t: 60 * min, start: 60 * min, source: 'human', path: 'x.al' })
+  ];
+  const eps = C.groupEpisodes(list);
+  assert.deepEqual(eps.map(e => e.correctionIds), [['h3'], ['h1', 'h2'], ['a3'], ['a1', 'a2']]);
+  const promptEp = eps[3];
+  assert.equal(promptEp.prompt, 'make it sales or purchase');
+  assert.deepEqual(promptEp.files, ['plan.md', 'ac.md']);
+  assert.equal(promptEp.added, 5);
+  assert.equal(eps[1].workItemId, '7');
+});
+
+test('placeholder work items are not stored on corrections', () => {
+  assert.equal(C.realWorkItemId('__unassigned__'), undefined);
+  assert.equal(C.realWorkItemId('unknown'), undefined);
+  assert.equal(C.realWorkItemId('2294'), '2294');
+  const raw = JSON.stringify({ version: 1, owned: {}, corrections: [corr({ id: 'a', workItemId: '__unassigned__' })] });
+  assert.equal(C.decodeCorrectionStore(raw).corrections[0].workItemId, undefined);
 });
 
 test('MCP list_corrections reads the store next to the effort store', () => {

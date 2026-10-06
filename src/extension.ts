@@ -497,7 +497,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showCorrections', async () => {
       try {
-        const content = correctionsMarkdown(listCorrections(correctionStore.load(), { limit: 50 }));
+        const content = correctionsMarkdown(listCorrections(correctionStore.load(), { limit: 500 }));
         const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content });
         await vscode.window.showTextDocument(doc, { preview: true });
       } catch (error) {

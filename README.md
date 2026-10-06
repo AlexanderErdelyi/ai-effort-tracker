@@ -480,9 +480,13 @@ original code and the change (that prompt is stored as the trigger). Without a n
 prompt, Copilot was fixing its own code within the same request. Whitespace-only
 changes are ignored.
 
-Run **AI Effort Tracker: Show Captured Corrections** to see the newest 50, or ask
+Run **AI Effort Tracker: Show Captured Corrections** to see them: your own changes
+first, with before/after snippets, then AI rework grouped by the prompt that caused it.
+One prompt that changes a requirement can rework dozens of lines, so it is listed
+once with all the lines it touched. You can also ask
 Copilot with the MCP tool `list_corrections` (filters: `workItemId`, `branch`,
-`path`, `repo`, `source`, `kind`, `days`, `limit`). Corrections are kept in
+`path`, `repo`, `source`, `kind`, `days`, `limit`); it returns the same grouping as
+`episodes`. Corrections are kept in
 `corrections.json` next to the tracker's store, with the same locking, `.bak` and
 history copies. Nothing leaves your machine. Turn off
 `aiEffortTracker.corrections.captureCode` to keep only metadata (no code snippets

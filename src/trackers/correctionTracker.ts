@@ -5,7 +5,7 @@ import { CorrectionStore } from '../store/correctionStore';
 import { getFileExt } from '../util/fileTypes';
 import { DEFAULT_REVIEW_EXCLUDE, excludeMatcher } from '../analysis/review';
 import {
-  addedLineHashes, addOwnership, deltaIsEmpty, detectCorrections, emptyCorrectionDelta, linkPrompts,
+  addedLineHashes, addOwnership, deltaIsEmpty, detectCorrections, emptyCorrectionDelta, linkPrompts, realWorkItemId,
   type Correction, type CorrectionDelta, type CorrectionSource, type UserMessage
 } from '../analysis/corrections';
 import type { CodeEdit } from './copilotTracker';
@@ -161,7 +161,7 @@ export class CorrectionTracker implements vscode.Disposable {
     const owned = this.ownedFor(key);
     const source: CorrectionSource = w.human ? 'human' : 'ai';
     const now = Date.now();
-    const workItemId = this.db.getWorkItemForBranch(w.branch) ?? undefined;
+    const workItemId = realWorkItemId(this.db.getWorkItemForBranch(w.branch));
     for (const d of detectCorrections(w.snapshot, w.last, owned, w.start, w.path, this.captureCode())) {
       const c: Correction = {
         id: randomUUID(), t: now, start: w.start, source,
