@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
@@ -11,6 +12,8 @@ import { CreditImportTracker } from './trackers/creditImportTracker';
 import { DebugLogUsageTracker } from './trackers/debugLogUsageTracker';
 import { CorrectionTracker } from './trackers/correctionTracker';
 import { CorrectionStore } from './store/correctionStore';
+import { LessonStore } from './store/lessonStore';
+import { createRule, GENERATED_MARKER, lessonGroups, updateRule, writeLessonExport, rulesForRepo, type LessonRule, type RulePatch, type RuleStatus } from './analysis/lessons';
 import { correctionsMarkdown, listCorrections } from './analysis/corrections';
 import { acceptSuggestionsDelta, correctionsView, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta } from './analysis/correctionLabels';
 import { Database } from './store/database';
@@ -57,6 +60,7 @@ let budgetMonitor: BudgetMonitor | undefined;
 let nudgeController: NudgeController | undefined;
 let reviewController: ReviewController | undefined;
 let correctionStore: CorrectionStore | undefined;
+let lessonStore: LessonStore | undefined;
 let lastBilling: BillingUsage | null = null;
 const ghService = new GitHubService();
 
@@ -395,6 +399,8 @@ export function activate(context: vscode.ExtensionContext) {
     // #132: label captured corrections.
     vscode.commands.registerCommand('aiEffortTracker.labelCorrections', () =>
       vscode.commands.executeCommand('aiEffortTracker.openDashboardTab', 'corrections')),
+    // #134: approved rules → Copilot instructions files + review skill.
+    vscode.commands.registerCommand('aiEffortTracker.exportLessons', () => exportLessons()),
     vscode.commands.registerCommand('aiEffortTracker.timesheetAddEntry', (arg?: string) => timesheetAddEntry(arg)),
     vscode.commands.registerCommand('aiEffortTracker.exportTimesheetCsv', (arg?: string) => exportTimesheetCsv(arg)),
     vscode.commands.registerCommand('aiEffortTracker.resetNudgeMutes', async () => {
@@ -492,6 +498,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
   const corrections = new CorrectionStore(context.globalStorageUri.fsPath);
   correctionStore = corrections;
+  lessonStore = new LessonStore(context.globalStorageUri.fsPath);
   try {
     const correctionTracker = new CorrectionTracker(db, corrections, () => DebugLogUsageTracker.enabled());
     copilotTracker.setEditListener(edit => correctionTracker.onEdit(edit));
@@ -569,6 +576,16 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       } catch (error) {
         dashboardPanel?.webview.postMessage({ type: 'correctionsData', error: String(error) });
       }
+      return;
+    }
+    if (m?.type === 'lessonRule' || m?.type === 'exportLessons') {
+      try {
+        if (m.type === 'exportLessons') await exportLessons();
+        else applyRuleMessage(m);
+      } catch (error) {
+        void vscode.window.showWarningMessage(`AI Effort Tracker: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      dashboardPanel?.webview.postMessage({ type: 'correctionsData', ...correctionsPayload() });
       return;
     }
     if (m?.type === 'timesheet') {
@@ -2548,16 +2565,96 @@ async function assignWorkItemToProject(workItemId?: string) {
   refreshDashboard();
 }
 
-/** Corrections tab (#132): captured corrections with labels and suggestions. */
+/** Corrections tab (#132): captured corrections with labels and suggestions, plus rules (#133). */
 function correctionsPayload() {
   const cfg = vscode.workspace.getConfiguration('aiEffortTracker.corrections');
   const categories = cfg.get<string[]>('categories');
   const rules = cfg.get<unknown>('keywordRules');
-  return correctionsView(
-    correctionStore?.load() ?? { version: 1, owned: {}, corrections: [] },
+  const data = correctionStore?.load() ?? { version: 1 as const, owned: {}, corrections: [] };
+  const view = correctionsView(
+    data,
     Array.isArray(categories) && categories.length ? categories : DEFAULT_LESSON_CATEGORIES,
     Array.isArray(rules) ? rules : DEFAULT_KEYWORD_RULES
   );
+  const lcfg = vscode.workspace.getConfiguration('aiEffortTracker.lessons');
+  const lessonRules = lessonStore?.load().rules ?? [];
+  return {
+    ...view,
+    lessons: {
+      rules: lessonRules,
+      groups: lessonGroups(data.corrections, lessonRules, { minOccurrences: lcfg.get<number>('minOccurrences'), minWorkItems: lcfg.get<number>('minWorkItems') }),
+      minOccurrences: lcfg.get<number>('minOccurrences') ?? 3,
+      minWorkItems: lcfg.get<number>('minWorkItems') ?? 2
+    }
+  };
+}
+
+/** Rule changes from the Corrections tab (#133). */
+function applyRuleMessage(m: { op?: unknown; id?: unknown; rule?: unknown; patch?: unknown }): void {
+  if (!lessonStore) throw new Error('The rules store is not available.');
+  const s = (v: unknown) => typeof v === 'string' ? v : undefined;
+  const rec = (v: unknown) => v && typeof v === 'object' ? v as Record<string, unknown> : {};
+  if (m.op === 'create') {
+    const r = rec(m.rule);
+    const rule = createRule({
+      category: s(r.category) ?? '', scope: s(r.scope) ?? '**', text: s(r.text) ?? '',
+      examples: Array.isArray(r.examples) ? r.examples.filter((x): x is string => typeof x === 'string') : [],
+      ...(s(r.repo) ? { repo: s(r.repo) } : {})
+    }, 'user');
+    lessonStore.apply({ upsert: [rule], remove: [] });
+    return;
+  }
+  const id = s(m.id);
+  const current = lessonStore.load().rules.find(r => r.id === id);
+  if (!id || !current) throw new Error('This rule no longer exists. Refresh the tab.');
+  if (m.op === 'delete') { lessonStore.apply({ upsert: [], remove: [id] }); return; }
+  if (m.op === 'update') {
+    const p = rec(m.patch);
+    const patch: RulePatch = {
+      ...(s(p.category) !== undefined ? { category: s(p.category) } : {}),
+      ...(s(p.scope) !== undefined ? { scope: s(p.scope) } : {}),
+      ...(s(p.text) !== undefined ? { text: s(p.text) } : {}),
+      ...(s(p.repo) !== undefined ? { repo: s(p.repo) } : {}),
+      ...(s(p.status) !== undefined ? { status: s(p.status) as RuleStatus } : {})
+    };
+    lessonStore.apply({ upsert: [updateRule(current, patch)], remove: [] });
+  }
+}
+
+/** #134: writes the approved rules as Copilot instructions files and the review skill. */
+async function exportLessons(): Promise<void> {
+  if (!lessonStore) throw new Error('The rules store is not available.');
+  const rules: LessonRule[] = lessonStore.load().rules;
+  const cfg = vscode.workspace.getConfiguration('aiEffortTracker.lessons');
+  const folderSetting = (cfg.get<string>('exportFolder') ?? '').trim();
+  const skillMode = cfg.get<string>('reviewSkill') ?? 'personal';
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const targets: Array<{ dir: string; rules: LessonRule[]; skillsDir?: string }> = [];
+  const personalSkills = skillMode === 'personal' ? path.join(os.homedir(), '.copilot', 'skills') : undefined;
+  if (folderSetting && path.isAbsolute(folderSetting)) {
+    targets.push({ dir: folderSetting, rules, skillsDir: personalSkills });
+  } else {
+    if (!folders.length) throw new Error('Open a folder to export the rules into, or set aiEffortTracker.lessons.exportFolder to an absolute folder.');
+    folders.forEach((f, i) => targets.push({
+      dir: path.resolve(f.uri.fsPath, folderSetting || path.join('.github', 'instructions')),
+      rules: rulesForRepo(rules, f.name),
+      skillsDir: skillMode === 'workspace' ? path.join(f.uri.fsPath, '.github', 'skills') : i === 0 ? personalSkills : undefined
+    }));
+  }
+  const results = targets.map(t => writeLessonExport(t.rules, t.dir, t.skillsDir));
+  const approved = results.reduce((n, r) => Math.max(n, r.rules), 0);
+  const files = results.reduce((n, r) => n + r.written.length, 0);
+  const removed = results.reduce((n, r) => n + r.removed.length, 0);
+  const where = results.map(r => r.dir).join(', ');
+  const skipped = results.flatMap(r => r.skipped);
+  const msg = (approved
+    ? `AI Effort Tracker: exported ${approved} approved rule${approved === 1 ? '' : 's'} into ${files} instructions file${files === 1 ? '' : 's'} in ${where}${removed ? ` (removed ${removed} old file${removed === 1 ? '' : 's'})` : ''}.`
+    : `AI Effort Tracker: no approved rules to export${removed ? `; removed ${removed} old file${removed === 1 ? '' : 's'}` : ''}. Approve rules in the Corrections tab (Rules) first.`)
+    + (skipped.length ? ` Kept your edited ${skipped.join(', ')} (no "${GENERATED_MARKER}" line).` : '');
+  const open = results.find(r => r.written.length);
+  void vscode.window.showInformationMessage(msg, ...(open ? ['Open file'] : [])).then(pick => {
+    if (pick === 'Open file' && open) void vscode.window.showTextDocument(vscode.Uri.file(path.join(open.dir, open.written[0])));
+  });
 }
 
 /** Data health (issue #104): store contents + file facts through the pure checker. */

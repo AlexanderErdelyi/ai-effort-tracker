@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.32.0",
+  "version": "0.33.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -34,6 +34,10 @@
       {
         "command": "aiEffortTracker.labelCorrections",
         "title": "AI Effort Tracker: Label Corrections"
+      },
+      {
+        "command": "aiEffortTracker.exportLessons",
+        "title": "AI Effort Tracker: Export Lessons to Copilot"
       },
       {
         "command": "aiEffortTracker.setMode",
@@ -797,6 +801,38 @@
             }
           ],
           "markdownDescription": "Suggest a category for AI rework from the prompt that caused it. Rules are checked in order; the first match wins. Without a match the suggestion is `requirement change`. Suggestions are only applied when you accept them."
+        },
+        "aiEffortTracker.lessons.minOccurrences": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "markdownDescription": "A lesson (same category and scope) is suggested as a rule in the **Corrections → Rules** view once it was corrected in this many episodes (prompts or editing sittings)."
+        },
+        "aiEffortTracker.lessons.minWorkItems": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "markdownDescription": "A lesson is suggested as a rule only when it was corrected on at least this many work items (or branches without a work item), so a one-off does not become a rule."
+        },
+        "aiEffortTracker.lessons.exportFolder": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where **Export Lessons to Copilot** writes the approved rules (one `aet-lessons-*.instructions.md` file per scope). Empty: `.github/instructions` in each workspace folder. A relative path is resolved in each workspace folder; an absolute path is one shared folder for all repositories (add it to `chat.instructionsFilesLocations`)."
+        },
+        "aiEffortTracker.lessons.reviewSkill": {
+          "type": "string",
+          "enum": [
+            "personal",
+            "workspace",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Write the lessons-review skill to ~/.copilot/skills (all repositories).",
+            "Write it to .github/skills in each workspace folder.",
+            "Do not write the skill."
+          ],
+          "default": "personal",
+          "markdownDescription": "Export also writes the `lessons-review` agent skill: Copilot checks changed code against the rules (`get_lessons` MCP tool) and can flag violations as review issues."
         },
         "aiEffortTracker.review.enabled": {
           "type": "boolean",

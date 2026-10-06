@@ -17,6 +17,8 @@ import { ReviewStore } from '../review/reviewStore';
 import { CORRECTIONS_FILE, decodeCorrectionStore, emptyCorrectionStore, groupEpisodes, listCorrections, type CorrectionKind } from '../analysis/corrections';
 import { DEFAULT_LESSON_CATEGORIES, labelDelta, NON_LESSON_CATEGORIES } from '../analysis/correctionLabels';
 import { CorrectionStore } from '../store/correctionStore';
+import { decodeLessonStore, emptyLessonStore, findRules, lessonGroups, LESSONS_FILE, proposeRuleDelta } from '../analysis/lessons';
+import { LessonStore } from '../store/lessonStore';
 import { changedFilesSync, contentAtSync, resolveReviewBaseSync } from '../review/reviewGit';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
@@ -34,6 +36,12 @@ function loadCorrectionStore() {
   const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), CORRECTIONS_FILE) : '';
   if (!file || !fs.existsSync(file)) return emptyCorrectionStore();
   return readStore(file, decodeCorrectionStore, emptyCorrectionStore).value;
+}
+
+function loadLessonStore() {
+  const file = process.env.AET_STORE_PATH ? path.join(path.dirname(process.env.AET_STORE_PATH), LESSONS_FILE) : '';
+  if (!file || !fs.existsSync(file)) return emptyLessonStore();
+  return readStore(file, decodeLessonStore, emptyLessonStore).value;
 }
 
 /** Read-only access to the working tree for `review_issues`. */
@@ -232,6 +240,23 @@ export const TOOLS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    name: 'get_lessons',
+    title: 'Coding rules learned from corrections',
+    description: 'The developer\'s approved coding rules, learned from corrections of AI-written code (the Corrections tab in VS Code). Each rule has a category, a file scope (glob) and the rule text. '
+      + 'Call it with "path" (repository-relative file path) before you write or review a file to get the rules for that file, and follow them. '
+      + 'With "includeCandidates": true it also returns repeated lessons that have no rule yet (category, scope, how often, the developer\'s notes and example correction ids) so you can draft rules with propose_rule.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Only rules whose scope matches this file (repository-relative path).' },
+        repo: { type: 'string', description: 'Workspace folder name; rules of other repositories are left out.' },
+        includeProposed: { type: 'boolean', description: 'Also rules still waiting for the developer\'s approval.' },
+        includeCandidates: { type: 'boolean', description: 'Also repeated lessons without a rule.' }
+      },
+      additionalProperties: false
+    }
   }
 ].map(t => ({ ...t, annotations: { readOnlyHint: true, openWorldHint: false } as Json })).concat([{
   name: 'review_mark',
@@ -296,6 +321,24 @@ export const TOOLS = [
       category: { type: 'string', description: 'Required. What was wrong (see the description for the categories). Empty string removes the label.' },
       scope: { type: 'string', description: 'Files the lesson applies to, as a glob (e.g. "**/*.Codeunit.al", "app/src/**").' },
       note: { type: 'string', description: 'The lesson in one sentence, e.g. "Use the field ID from the table, not the page".' }
+    },
+    additionalProperties: false
+  },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as Json
+}, {
+  name: 'propose_rule',
+  title: 'Propose a coding rule',
+  description: 'Propose a coding rule learned from corrections of AI-written code. The rule waits as "proposed" in the developer\'s Corrections tab (Rules) until they approve, edit or reject it; only approved rules reach Copilot. '
+    + 'Draft rules from get_lessons candidates or list_corrections: one clear, checkable instruction per rule, written for an AI coding agent (e.g. "Read field numbers from the table object; never renumber an existing field"). '
+    + 'Proposing the same category, scope and text again only adds example ids. Propose only when the developer asks you to.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      category: { type: 'string', description: `Required. Lesson category: ${DEFAULT_LESSON_CATEGORIES.join(', ')}.` },
+      scope: { type: 'string', description: 'Required. Files the rule applies to, as a glob (e.g. "**/*.Codeunit.al", "specs/**").' },
+      text: { type: 'string', description: 'Required. The rule in one or two sentences.' },
+      correctionIds: { type: 'array', items: { type: 'string' }, description: 'Corrections the rule was learned from.' },
+      repo: { type: 'string', description: 'Workspace folder name when the rule only applies to that repository.' }
     },
     additionalProperties: false
   },
@@ -509,6 +552,40 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
         labeled: labeled.length,
         corrections: after.corrections.filter(c => set.has(c.id)).map(c => ({ id: c.id, path: c.path, line: c.line, category: c.category ?? null, scope: c.scope ?? null, note: c.note ?? null })),
         ...(unknown.length ? { unknownIds: unknown } : {})
+      };
+    }
+    case 'get_lessons': {
+      const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+      const lessons = loadLessonStore();
+      const rules = findRules(lessons.rules, { path: str(args.path), repo: str(args.repo), includeProposed: args.includeProposed === true })
+        .map(r => ({ id: r.id, category: r.category, scope: r.scope, text: r.text, status: r.status, ...(r.repo ? { repo: r.repo } : {}), examples: r.examples.length }));
+      const out: Json = { rules };
+      if (args.includeCandidates === true) {
+        const repo = str(args.repo)?.toLowerCase();
+        out.candidates = lessonGroups(loadCorrectionStore().corrections, lessons.rules)
+          .filter(g => !g.ruleIds.length && (!repo || !g.repos.length || g.repos.some(r => r.toLowerCase() === repo)))
+          .map(g => ({ category: g.category, scope: g.scope, corrections: g.count, yours: g.human, episodes: g.episodes, workItems: g.workItems, repeated: g.suggested, notes: g.notes, exampleIds: g.examples.slice(0, 10) }));
+      }
+      if (!rules.length) out.note = lessons.rules.length
+        ? 'No approved rules match. Rules are approved by the developer in the Corrections tab (Rules).'
+        : 'No rules yet. They are created from labelled corrections in the dashboard\'s Corrections tab, or proposed with propose_rule.';
+      return out;
+    }
+    case 'propose_rule': {
+      for (const k of ['category', 'scope', 'text']) if (typeof args[k] !== 'string' || !(args[k] as string).trim()) throw new Error(`"${k}" is required.`);
+      if (!process.env.AET_STORE_PATH) throw new Error('AET_STORE_PATH is not set.');
+      const store = new LessonStore(path.dirname(process.env.AET_STORE_PATH));
+      const examples = Array.isArray(args.correctionIds) ? args.correctionIds.filter((x): x is string => typeof x === 'string') : [];
+      const { delta, rule, created } = proposeRuleDelta(store.load(), {
+        category: args.category as string, scope: args.scope as string, text: args.text as string, examples,
+        ...(typeof args.repo === 'string' ? { repo: args.repo } : {})
+      });
+      store.apply(delta);
+      return {
+        created, rule: { id: rule.id, category: rule.category, scope: rule.scope, text: rule.text, status: rule.status, ...(rule.repo ? { repo: rule.repo } : {}), examples: rule.examples.length },
+        note: rule.status === 'proposed'
+          ? 'The rule waits for the developer\'s approval in the Corrections tab (Rules).'
+          : `This rule already exists with status "${rule.status}"; nothing changed.`
       };
     }
     case 'review_issues': {
