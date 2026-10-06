@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.31.0",
+  "version": "0.32.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -30,6 +30,10 @@
       {
         "command": "aiEffortTracker.showCorrections",
         "title": "AI Effort Tracker: Show Captured Corrections"
+      },
+      {
+        "command": "aiEffortTracker.labelCorrections",
+        "title": "AI Effort Tracker: Label Corrections"
       },
       {
         "command": "aiEffortTracker.setMode",
@@ -720,6 +724,79 @@
           "type": "boolean",
           "default": true,
           "description": "Store before/after code snippets and prompt text with each correction. Off: only metadata (file, line, kind, counts, times) is kept."
+        },
+        "aiEffortTracker.corrections.categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "wrong fact",
+            "logic bug",
+            "style",
+            "naming",
+            "documentation",
+            "ordering/structure",
+            "error handling",
+            "tests",
+            "performance"
+          ],
+          "markdownDescription": "Lesson categories you can give a captured correction in the dashboard's **Corrections** tab (what was wrong). `requirement change`, `progress update` and `not a lesson` are always available for corrections that teach nothing."
+        },
+        "aiEffortTracker.corrections.keywordRules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "pattern",
+              "category"
+            ],
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "Regular expression (case-insensitive) tested against the prompt."
+              },
+              "category": {
+                "type": "string",
+                "description": "Suggested category when the pattern matches."
+              }
+            }
+          },
+          "default": [
+            {
+              "pattern": "\\b(status|progress)\\b|what you (did|have done|changed)",
+              "category": "progress update"
+            },
+            {
+              "pattern": "\\b(wrong|mistake|incorrect|bug|not correct|does ?n.t work|does not work)\\b",
+              "category": "logic bug"
+            },
+            {
+              "pattern": "\\b(document|documentation|comments?|xml ?doc)\\b",
+              "category": "documentation"
+            },
+            {
+              "pattern": "\\b(sort|sorting|order|reorder|structure|restructure)\\b",
+              "category": "ordering/structure"
+            },
+            {
+              "pattern": "\\b(rename|naming)\\b",
+              "category": "naming"
+            },
+            {
+              "pattern": "\\b(error handling|exception|validation|testfield)\\b",
+              "category": "error handling"
+            },
+            {
+              "pattern": "\\b(unit tests?|tests)\\b",
+              "category": "tests"
+            },
+            {
+              "pattern": "\\b(slow|performance|faster|optimi[sz]e)\\b",
+              "category": "performance"
+            }
+          ],
+          "markdownDescription": "Suggest a category for AI rework from the prompt that caused it. Rules are checked in order; the first match wins. Without a match the suggestion is `requirement change`. Suggestions are only applied when you accept them."
         },
         "aiEffortTracker.review.enabled": {
           "type": "boolean",

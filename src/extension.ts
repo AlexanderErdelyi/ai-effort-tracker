@@ -12,6 +12,7 @@ import { DebugLogUsageTracker } from './trackers/debugLogUsageTracker';
 import { CorrectionTracker } from './trackers/correctionTracker';
 import { CorrectionStore } from './store/correctionStore';
 import { correctionsMarkdown, listCorrections } from './analysis/corrections';
+import { acceptSuggestionsDelta, correctionsView, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta } from './analysis/correctionLabels';
 import { Database } from './store/database';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
@@ -55,6 +56,7 @@ let pendingOpenTab: string | undefined;
 let budgetMonitor: BudgetMonitor | undefined;
 let nudgeController: NudgeController | undefined;
 let reviewController: ReviewController | undefined;
+let correctionStore: CorrectionStore | undefined;
 let lastBilling: BillingUsage | null = null;
 const ghService = new GitHubService();
 
@@ -390,6 +392,9 @@ export function activate(context: vscode.ExtensionContext) {
     // #101: timesheet week grid.
     vscode.commands.registerCommand('aiEffortTracker.openTimesheet', () =>
       vscode.commands.executeCommand('aiEffortTracker.openDashboardTab', 'timesheet')),
+    // #132: label captured corrections.
+    vscode.commands.registerCommand('aiEffortTracker.labelCorrections', () =>
+      vscode.commands.executeCommand('aiEffortTracker.openDashboardTab', 'corrections')),
     vscode.commands.registerCommand('aiEffortTracker.timesheetAddEntry', (arg?: string) => timesheetAddEntry(arg)),
     vscode.commands.registerCommand('aiEffortTracker.exportTimesheetCsv', (arg?: string) => exportTimesheetCsv(arg)),
     vscode.commands.registerCommand('aiEffortTracker.resetNudgeMutes', async () => {
@@ -485,9 +490,10 @@ export function activate(context: vscode.ExtensionContext) {
   } catch (error) {
     console.error('AI Effort Tracker: review tracking failed to start', error);
   }
-  const correctionStore = new CorrectionStore(context.globalStorageUri.fsPath);
+  const corrections = new CorrectionStore(context.globalStorageUri.fsPath);
+  correctionStore = corrections;
   try {
-    const correctionTracker = new CorrectionTracker(db, correctionStore, () => DebugLogUsageTracker.enabled());
+    const correctionTracker = new CorrectionTracker(db, corrections, () => DebugLogUsageTracker.enabled());
     copilotTracker.setEditListener(edit => correctionTracker.onEdit(edit));
     debugLogUsageTracker.onUserMessages = msgs => correctionTracker.onUserMessages(msgs);
     context.subscriptions.push(correctionTracker);
@@ -497,7 +503,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('aiEffortTracker.showCorrections', async () => {
       try {
-        const content = correctionsMarkdown(listCorrections(correctionStore.load(), { limit: 50 }));
+        const content = correctionsMarkdown(listCorrections(corrections.load(), { limit: 500 }));
         const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content });
         await vscode.window.showTextDocument(doc, { preview: true });
       } catch (error) {
@@ -545,6 +551,24 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
     }
     if (m?.type === 'health') {
       dashboardPanel?.webview.postMessage({ type: 'healthData', report: healthReport() });
+      return;
+    }
+    if (m?.type === 'corrections' || m?.type === 'labelCorrections' || m?.type === 'acceptCorrectionSuggestions') {
+      try {
+        if (m.type === 'labelCorrections' && Array.isArray(m.ids) && correctionStore) {
+          const ids = m.ids.filter((x: unknown): x is string => typeof x === 'string');
+          correctionStore.apply(labelDelta(correctionStore.load(), ids, {
+            category: typeof m.category === 'string' ? m.category : '',
+            ...(typeof m.scope === 'string' ? { scope: m.scope } : {}),
+            ...(typeof m.note === 'string' ? { note: m.note } : {})
+          }, 'user'));
+        } else if (m.type === 'acceptCorrectionSuggestions') {
+          correctionStore?.apply(acceptSuggestionsDelta(correctionsPayload()));
+        }
+        dashboardPanel?.webview.postMessage({ type: 'correctionsData', ...correctionsPayload() });
+      } catch (error) {
+        dashboardPanel?.webview.postMessage({ type: 'correctionsData', error: String(error) });
+      }
       return;
     }
     if (m?.type === 'timesheet') {
@@ -2522,6 +2546,18 @@ async function assignWorkItemToProject(workItemId?: string) {
   const name = sel ? (db.getProject(sel)?.name ?? sel) : 'no project';
   vscode.window.showInformationMessage(`Work item #${wi} assigned to ${name}.`);
   refreshDashboard();
+}
+
+/** Corrections tab (#132): captured corrections with labels and suggestions. */
+function correctionsPayload() {
+  const cfg = vscode.workspace.getConfiguration('aiEffortTracker.corrections');
+  const categories = cfg.get<string[]>('categories');
+  const rules = cfg.get<unknown>('keywordRules');
+  return correctionsView(
+    correctionStore?.load() ?? { version: 1, owned: {}, corrections: [] },
+    Array.isArray(categories) && categories.length ? categories : DEFAULT_LESSON_CATEGORIES,
+    Array.isArray(rules) ? rules : DEFAULT_KEYWORD_RULES
+  );
 }
 
 /** Data health (issue #104): store contents + file facts through the pure checker. */
