@@ -1379,6 +1379,8 @@ function corrItem(i){
     +'<span><strong>'+esc(i.kind)+'</strong> '+esc(i.path)+':'+i.line+(i.context?' <span style="color:var(--vscode-descriptionForeground)">('+esc(i.context)+')</span>':'')+' <span style="color:var(--added)">+'+i.added+'</span> <span style="color:var(--deleted)">-'+i.removed+'</span>'+by+'</span>'
     +'<span style="display:flex;gap:6px;align-items:center"><select class="corr-cat" data-id="'+esc(i.id)+'">'+corrOptions(i.category||'')+'</select>'
     +'<input class="corr-scope" data-id="'+esc(i.id)+'" title="Files this lesson applies to (glob)" style="width:170px" value="'+esc(i.scope||i.suggestedScope)+'"></span></div>'
+    +'<input class="corr-note" data-id="'+esc(i.id)+'" style="width:100%;margin-top:6px;box-sizing:border-box"'+(i.category?'':' disabled')
+    +' placeholder="'+(i.category?'Why was it corrected? Write it as a rule, e.g. \\u201cRead field numbers from the table; never renumber a field\\u201d':'Pick a category first, then add a note')+'" value="'+esc(i.note||'')+'">'
     +sug+corrDiff(i)+'</div>';
 }
 function corrVisible(e){
@@ -1391,11 +1393,14 @@ function renderCorrections(){
   var el=document.getElementById('corrections');if(!el)return;
   var pill=function(act,val,cur,lbl){return'<button class="dtab'+(val===cur?' active':'')+'" data-action="'+act+'" data-value="'+val+'">'+lbl+'</button>';};
   if(!CORR||CORR.error){el.innerHTML='<p>'+(CORR&&CORR.error?esc(CORR.error):corrLoading?'Loading\\u2026':'No data yet.')+'</p>';return;}
-  var s=CORR.stats;
+  var s=CORR.stats,L=CORR.lessons||{rules:[],groups:[]};
+  var pend=L.rules.filter(function(r){return r.status==='proposed';}).length+L.groups.filter(function(g){return g.suggested&&!g.ruleIds.length;}).length;
   var ctl='<div class="rng">'+pill('corrFilter','todo',corrFilter,'To label')+pill('corrFilter','lessons',corrFilter,'Lessons')+pill('corrFilter','all',corrFilter,'All')
-    +'<span style="width:14px"></span>'+pill('corrSrc','all',corrSrc,'Everyone')+pill('corrSrc','human',corrSrc,'Your changes')+pill('corrSrc','ai',corrSrc,'AI rework')
+    +pill('corrFilter','rules',corrFilter,'\\uD83D\\uDCCF Rules'+(pend?' ('+pend+')':''))
+    +(corrFilter==='rules'?'':'<span style="width:14px"></span>'+pill('corrSrc','all',corrSrc,'Everyone')+pill('corrSrc','human',corrSrc,'Your changes')+pill('corrSrc','ai',corrSrc,'AI rework'))
     +'<span style="width:14px"></span><button class="dtab" data-action="corrRefresh">\\u21bb Refresh</button>'
-    +(s.suggested?'<button class="dtab active" data-action="corrAcceptAll" title="Label every unlabeled correction with its suggestion. You can still change each one.">\\u2714 Accept all suggestions ('+s.suggested+')</button>':'')+'</div>';
+    +(s.suggested&&corrFilter!=='rules'?'<button class="dtab active" data-action="corrAcceptAll" title="Label every unlabeled correction with its suggestion. You can still change each one.">\\u2714 Accept all suggestions ('+s.suggested+')</button>':'')+'</div>';
+  if(corrFilter==='rules'){el.innerHTML=ctl+renderRules(L);return;}
   var kpi='<div class="sg">'+sc('Corrections',String(s.total))+sc('Your changes',String(s.human),undefined,'Lines of AI-written code you changed yourself. These are the most valuable lessons.')
     +sc('AI rework prompts',String(s.prompts),undefined,'Prompts after which Copilot changed its own earlier code.')
     +sc('Labelled',s.labeled+' / '+s.total,s.labeled===s.total&&s.total?'var(--added)':undefined)+sc('Lessons',String(s.lessons),undefined,'Labelled with a lesson category (not requirement change, progress update or not a lesson).')+'</div>';
@@ -1416,6 +1421,7 @@ function renderCorrections(){
     if(open){
       body='<div style="margin-top:8px;display:flex;gap:6px;align-items:center;font-size:.9em">Label all '+n+': <select class="corr-ep-cat" data-ep="'+esc(e.id)+'">'+corrOptions(e.category||'')+'</select>'
         +(e.suggestion&&e.labeled<n?'<button class="dtab" style="padding:1px 8px" data-action="corrAcceptEp" data-ep="'+esc(e.id)+'" data-cat="'+esc(e.suggestion.category)+'">Accept \\u201c'+esc(e.suggestion.category)+'\\u201d for all</button>':'')+'</div>'
+        +(e.labeled?'<div style="margin-top:6px;display:flex;gap:6px;align-items:center;font-size:.9em">Note for all '+e.labeled+' labelled: <input class="corr-ep-note" data-ep="'+esc(e.id)+'" style="flex:1" placeholder="One lesson for the whole episode" value="'+esc(corrEpNote(e))+'"></div>':'')
         +e.items.map(corrItem).join('');
     }
     return'<div class="card" style="margin-bottom:10px;border-left:3px solid '+(e.source==='human'?'var(--deleted)':'var(--review)')+'">'+head+body+'</div>';
@@ -1425,18 +1431,88 @@ function renderCorrections(){
   el.innerHTML=ctl+'<p style="margin-bottom:12px;font-size:.85em;color:var(--vscode-descriptionForeground)">Say what was wrong with AI-written code and which files the lesson applies to. Lessons you label here become the input for coding rules for Copilot. Copilot can label them too through the <strong>label_correction</strong> MCP tool.</p>'
     +kpi+cat+eps+more+empty;
 }
+var ruleOpen={},ruleDelArm={},ruleShowClosed=false,ruleShowOther=false;
+function ruleSend(m){m.type='lessonRule';corrLoading=true;vscode.postMessage(m);}
+function corrItemById(){var map={};(CORR?CORR.episodes:[]).forEach(function(e){e.items.forEach(function(i){map[i.id]=i;});});return map;}
+function ruleCatOptions(sel){var cats=CORR.categories.slice();if(sel&&cats.indexOf(sel)<0)cats.push(sel);return cats.map(function(c){return'<option value="'+esc(c)+'"'+(c===sel?' selected':'')+'>'+esc(c)+'</option>';}).join('');}
+function ruleCard(r,items){
+  var col={proposed:'var(--review)',approved:'var(--added)',rejected:'var(--deleted)',retired:'var(--vscode-descriptionForeground)'}[r.status];
+  var b=function(act,val,lbl,title){return'<button class="dtab" style="padding:1px 8px" data-action="'+act+'" data-id="'+esc(r.id)+'" data-value="'+val+'"'+(title?' title="'+esc(title)+'"':'')+'>'+lbl+'</button>';};
+  var acts=r.status==='proposed'?b('ruleStatus','approved','\\u2714 Approve','Copilot gets approved rules after you export them')+b('ruleStatus','rejected','\\u2716 Reject')
+    :r.status==='approved'?b('ruleStatus','retired','Retire','No longer applies; kept for history'):b('ruleStatus','proposed','Reopen');
+  acts+=ruleDelArm[r.id]?b('ruleDelete','','\\u26A0 Really delete?'):b('ruleDelete','','\\uD83D\\uDDD1 Delete');
+  var ex=r.examples.length?'<button class="dtab" style="padding:1px 8px" data-action="ruleExamples" data-id="'+esc(r.id)+'">'+(ruleOpen[r.id]?'\\u25BE':'\\u25B8')+' '+r.examples.length+' example'+(r.examples.length===1?'':'s')+'</button>':'';
+  var exBody=ruleOpen[r.id]?r.examples.map(function(id){var i=items[id];return i?'<div style="border-top:1px solid var(--vscode-panel-border);padding:6px 0;font-size:.9em"><strong>'+esc(i.kind)+'</strong> '+esc(i.path)+':'+i.line+(i.note?' \\u2014 <em>'+esc(i.note)+'</em>':'')+corrDiff(i)+'</div>':'<div style="font-size:.85em;color:var(--vscode-descriptionForeground)">'+esc(id)+' (no longer captured)</div>';}).join(''):'';
+  return'<div class="card rule-card" style="margin-bottom:10px;border-left:3px solid '+col+'">'
+    +'<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:space-between">'
+    +'<span style="display:flex;gap:6px;align-items:center"><span class="badge '+(r.status==='approved'?'ba':r.status==='proposed'?'bh':'bd')+'">'+esc(r.status)+'</span>'
+    +'<select class="rule-cat" data-id="'+esc(r.id)+'">'+ruleCatOptions(r.category)+'</select>'
+    +'<input class="rule-scope" data-id="'+esc(r.id)+'" title="Files the rule applies to (glob)" style="width:180px" value="'+esc(r.scope)+'">'
+    +(r.repo?'<span style="font-size:.85em">only '+esc(r.repo)+'</span>':'')
+    +'<span style="font-size:.8em;color:var(--vscode-descriptionForeground)">by '+esc(r.createdBy)+'</span></span>'
+    +'<span style="display:flex;gap:4px;align-items:center">'+ex+acts+'</span></div>'
+    +'<textarea class="rule-text" data-id="'+esc(r.id)+'" rows="2" style="width:100%;box-sizing:border-box;margin-top:6px;font-family:inherit" placeholder="The rule for Copilot in one or two sentences, e.g. \\u201cRead field numbers from the table object; never renumber an existing field.\\u201d">'+esc(r.text)+'</textarea>'
+    +exBody+'</div>';
+}
+function ruleGroup(g,rules){
+  var used={};rules.forEach(function(r){if(g.ruleIds.indexOf(r.id)>=0)used[r.text.toLowerCase()]=true;});
+  var head='<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;justify-content:space-between"><span>'+corrCatBadge(g.category)+' <code>'+esc(g.scope)+'</code> \\u00b7 '
+    +g.episodes+' episode'+(g.episodes===1?'':'s')+' \\u00b7 '+g.count+' correction'+(g.count===1?'':'s')+(g.human?' ('+g.human+' yours)':'')+' \\u00b7 '+g.workItems.length+' work item'+(g.workItems.length===1?'':'s')
+    +(g.suggested?' <span class="badge ba" title="Repeated often enough to become a rule">repeated</span>':'')+(g.ruleIds.length?' <span style="font-size:.85em">\\u2714 '+g.ruleIds.length+' rule'+(g.ruleIds.length===1?'':'s')+'</span>':'')+'</span>'
+    +'<button class="dtab" style="padding:1px 8px" data-action="ruleCreate" data-key="'+esc(g.key)+'" data-note="-1">\\uFF0B Rule</button></div>';
+  var notes=g.notes.map(function(n,ix){return'<div style="display:flex;gap:6px;align-items:baseline;margin-top:4px;font-size:.9em">'
+    +(used[n.toLowerCase()]?'<span title="Already a rule">\\u2714</span>':'<button class="dtab" style="padding:0 6px" data-action="ruleCreate" data-key="'+esc(g.key)+'" data-note="'+ix+'" title="Create a rule with this text">\\uFF0B</button>')
+    +'<span>\\u201c'+esc(n)+'\\u201d</span></div>';}).join('');
+  return'<div class="card" style="margin-bottom:8px">'+head+(notes||'<div style="margin-top:4px;font-size:.85em;color:var(--vscode-descriptionForeground)">No notes yet. Add a note to the corrections (Lessons filter) or create a rule and write its text.</div>')+'</div>';
+}
+function renderRules(L){
+  var items=corrItemById();
+  var by=function(st){return L.rules.filter(function(r){return st.indexOf(r.status)>=0;});};
+  var proposed=by(['proposed']),approved=by(['approved']),closed=by(['rejected','retired']);
+  var cand=L.groups.filter(function(g){return g.suggested&&!g.ruleIds.length;}),other=L.groups.filter(function(g){return!(g.suggested&&!g.ruleIds.length);});
+  var bar='<div class="rng" style="margin-bottom:10px"><button class="dtab" data-action="ruleNew">\\uFF0B New rule</button>'
+    +'<button class="dtab'+(approved.length?' active':'')+'" data-action="ruleExport" title="Write the approved rules as .instructions.md files that Copilot reads automatically for matching files">\\u21EA Export to Copilot ('+approved.length+')</button></div>';
+  var intro='<p style="margin-bottom:12px;font-size:.85em;color:var(--vscode-descriptionForeground)">Lessons that repeat (at least '+L.minOccurrences+' episodes on '+L.minWorkItems+' work items) are suggested as rules. Create a rule from a note, edit its text and scope, then approve it. <strong>Export to Copilot</strong> writes the approved rules as instructions files that Copilot follows for matching files. Copilot can also read them (<strong>get_lessons</strong>) and propose rules (<strong>propose_rule</strong>) through MCP.</p>';
+  var kpi='<div class="sg">'+sc('Approved',String(approved.length),approved.length?'var(--added)':undefined)+sc('Proposed',String(proposed.length),undefined,'Waiting for your decision.')
+    +sc('Repeated lessons',String(cand.length),undefined,'Lessons corrected often enough to become a rule, without a rule yet.')+sc('Rejected / retired',String(closed.length))+'</div>';
+  var sec=function(t,body){return body?'<h3 style="margin:14px 0 8px">'+t+'</h3>'+body:'';};
+  var html=bar+intro+kpi
+    +sec('\\uD83D\\uDCA1 Repeated lessons without a rule ('+cand.length+')',cand.map(function(g){return ruleGroup(g,L.rules);}).join(''))
+    +sec('\\u23F3 Proposed rules ('+proposed.length+')',proposed.map(function(r){return ruleCard(r,items);}).join(''))
+    +sec('\\u2705 Approved rules ('+approved.length+')',approved.map(function(r){return ruleCard(r,items);}).join(''))
+    +(other.length?'<h3 style="margin:14px 0 8px;cursor:pointer" data-action="ruleOther">'+(ruleShowOther?'\\u25BE':'\\u25B8')+' Other lessons ('+other.length+')</h3>'+(ruleShowOther?other.map(function(g){return ruleGroup(g,L.rules);}).join(''):''):'')
+    +(closed.length?'<h3 style="margin:14px 0 8px;cursor:pointer" data-action="ruleClosed">'+(ruleShowClosed?'\\u25BE':'\\u25B8')+' Rejected / retired ('+closed.length+')</h3>'+(ruleShowClosed?closed.map(function(r){return ruleCard(r,items);}).join(''):''):'');
+  if(!L.rules.length&&!L.groups.length)html+='<div class="card">No lessons yet. Label corrections with a lesson category (and a note on why) first; repeated lessons show up here.</div>';
+  return html;
+}
+function ruleFromGroup(key,noteIx){
+  var g=(CORR.lessons.groups||[]).filter(function(x){return x.key===key;})[0];if(!g)return;
+  var ix=parseInt(noteIx,10),text=ix>=0?g.notes[ix]||'':'',items=corrItemById();
+  var ex=text?g.examples.filter(function(id){return items[id]&&(items[id].note||'').toLowerCase()===text.toLowerCase();}):[];
+  ruleSend({op:'create',rule:{category:g.category,scope:g.scope,text:text,examples:ex.length?ex:g.examples}});
+}
 function corrEpisode(id){return CORR?CORR.episodes.filter(function(e){return e.id===id;})[0]:null;}
-function corrLabel(ids,category,scope){var m={type:'labelCorrections',ids:ids,category:category};if(scope!==undefined)m.scope=scope;corrLoading=true;vscode.postMessage(m);}
+function corrEpNote(e){var ns=e.items.filter(function(i){return i.category;}).map(function(i){return i.note||'';});return ns.length&&ns.every(function(n){return n===ns[0];})?ns[0]:'';}
+function corrLabel(ids,category,scope,note){var m={type:'labelCorrections',ids:ids,category:category};if(scope!==undefined)m.scope=scope;if(note!==undefined)m.note=note;corrLoading=true;vscode.postMessage(m);}
 document.addEventListener('change',function(e){
   var t=e.target;if(!t||!t.classList)return;
+  var row=t.closest?t.closest('.corr-row'):null;
+  var rowVal=function(cls){var x=row?row.querySelector(cls):null;return x?x.value:undefined;};
   if(t.classList.contains('corr-cat')){
-    var sc0=t.parentNode.querySelector('.corr-scope');
-    corrLabel([t.dataset.id],t.value,t.value&&sc0?sc0.value:undefined);
+    corrLabel([t.dataset.id],t.value,t.value?rowVal('.corr-scope'):undefined,t.value?rowVal('.corr-note'):undefined);
   }else if(t.classList.contains('corr-scope')){
-    var cs=t.parentNode.querySelector('.corr-cat');
-    if(cs&&cs.value)corrLabel([t.dataset.id],cs.value,t.value);
+    var cv0=rowVal('.corr-cat');if(cv0)corrLabel([t.dataset.id],cv0,t.value);
+  }else if(t.classList.contains('corr-note')){
+    var cv1=rowVal('.corr-cat');if(cv1)corrLabel([t.dataset.id],cv1,undefined,t.value);
   }else if(t.classList.contains('corr-ep-cat')){
     var ep=corrEpisode(t.dataset.ep);if(ep)corrLabel(ep.correctionIds,t.value);
+  }else if(t.classList.contains('corr-ep-note')){
+    var ep2=corrEpisode(t.dataset.ep),byCat={};
+    if(ep2)ep2.items.forEach(function(i){if(i.category)(byCat[i.category]=byCat[i.category]||[]).push(i.id);});
+    Object.keys(byCat).forEach(function(c){corrLabel(byCat[c],c,undefined,t.value);});
+  }else if(t.classList.contains('rule-cat')||t.classList.contains('rule-scope')||t.classList.contains('rule-text')){
+    var f=t.classList.contains('rule-cat')?'category':t.classList.contains('rule-scope')?'scope':'text',pa={};pa[f]=t.value;
+    ruleSend({op:'update',id:t.dataset.id,patch:pa});
   }
 });
 
@@ -1667,6 +1743,14 @@ document.addEventListener('click',function(e){
   else if(a==='healthRefresh')requestHealth();
   else if(a==='corrRefresh')requestCorrections();
   else if(a==='corrFilter'){corrFilter=v;corrLimit=40;renderCorrections();}
+  else if(a==='ruleNew')ruleSend({op:'create',rule:{category:CORR.categories[0]||'style',scope:'**',text:''}});
+  else if(a==='ruleExport'){corrLoading=true;vscode.postMessage({type:'exportLessons'});}
+  else if(a==='ruleCreate')ruleFromGroup(t.dataset.key,t.dataset.note);
+  else if(a==='ruleStatus'){var rc=t.closest('.rule-card'),rtx=rc?rc.querySelector('.rule-text'):null,rp={status:v};if(rtx)rp.text=rtx.value;ruleSend({op:'update',id:t.dataset.id,patch:rp});}
+  else if(a==='ruleDelete'){var rid=t.dataset.id;if(ruleDelArm[rid]){delete ruleDelArm[rid];ruleSend({op:'delete',id:rid});}else{ruleDelArm[rid]=true;renderCorrections();setTimeout(function(){if(ruleDelArm[rid]){delete ruleDelArm[rid];renderCorrections();}},4000);}}
+  else if(a==='ruleExamples'){if(ruleOpen[t.dataset.id])delete ruleOpen[t.dataset.id];else ruleOpen[t.dataset.id]=true;renderCorrections();}
+  else if(a==='ruleOther'){ruleShowOther=!ruleShowOther;renderCorrections();}
+  else if(a==='ruleClosed'){ruleShowClosed=!ruleShowClosed;renderCorrections();}
   else if(a==='corrSrc'){corrSrc=v;corrLimit=40;renderCorrections();}
   else if(a==='corrMore'){corrLimit+=40;renderCorrections();}
   else if(a==='corrToggle'){var cid=t.dataset.id;if(corrOpen[cid])delete corrOpen[cid];else corrOpen[cid]=true;renderCorrections();}

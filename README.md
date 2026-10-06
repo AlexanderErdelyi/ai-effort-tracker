@@ -31,6 +31,7 @@
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
 | `AI Effort Tracker: Show Captured Corrections` | Newest corrections of AI-written code (see below) |
 | `AI Effort Tracker: Label Corrections` | Opens the dashboard's Corrections tab to label what each correction teaches |
+| `AI Effort Tracker: Export Lessons to Copilot` | Writes the approved rules as Copilot instructions files (see [Rules for Copilot](#rules-for-copilot)) |
 
 ## Configuration
 
@@ -40,12 +41,13 @@
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
-| `aiEffortTracker.mcpServer.enabled` | `true` | Offer the usage-insights MCP server to Copilot (read-only except the review-mark tools) |
+| `aiEffortTracker.mcpServer.enabled` | `true` | Offer the usage-insights MCP server to Copilot (read-only except review marks, correction labels and rule proposals) |
 | `aiEffortTracker.sessions.showTitles` | `true` | Show chat titles in the Sessions tab |
 | `aiEffortTracker.budget.*` | | Budget alerts, status bar, thresholds, credits per estimated hour (see [Work item budgets](#work-item-budgets)) |
 | `aiEffortTracker.nudges.*` | | Live nudges and running chat cost (see [Live nudges](#live-nudges-while-you-chat)) |
 | `aiEffortTracker.credits.monthlyBudget` | `0` | Monthly Copilot credit budget for the Overview pace card (0 = off) |
 | `aiEffortTracker.credits.renewalDay` | `1` | Day of the month the credit budget period renews (1–31) |
+| `aiEffortTracker.lessons.*` | | Thresholds for repeated lessons, export folder and review skill (see [Rules for Copilot](#rules-for-copilot)) |
 
 ## Overview dashboard
 
@@ -254,6 +256,8 @@ or *"Analyse my usage for work item 1987"*. All tools are read-only except
 | `review_resolve_issue` | Reports a flagged issue as fixed by Copilot (with a note of what changed) so it waits in **Fixed — to verify**; can reopen it, or remove the flag when you ask |
 | `list_corrections` | Captured corrections of AI-written code (see below): what you or prompted Copilot rework changed, with snippets and prompts, to learn rules from (filter `category`, `none` = unlabeled) |
 | `label_correction` | Labels corrections (by `ids` or a whole `episodeId`) with a category, an optional `scope` glob and a `note`, only when you ask; an empty category removes the label (writes corrections only) |
+| `get_lessons` | Approved rules learned from corrections, filtered by `path` (rules whose scope matches the file) and `repo`; `includeProposed`, and `includeCandidates` for repeated lessons without a rule |
+| `propose_rule` | Proposes a rule (`category`, `scope`, `text`, optional `correctionIds`, `repo`) that waits for your approval in the Rules view (writes lessons only) |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -521,6 +525,42 @@ available for corrections that do not teach a rule; they are kept but do not cou
 `aiEffortTracker.corrections.keywordRules` (`{ "pattern": regex, "category": name }`,
 case-insensitive, first match wins). Copilot can label too with the MCP tool
 `label_correction`, e.g. "label the corrections of the last episode as naming".
+
+Add a **note** per line (or **Note for all** in an open episode) saying *why* the code
+was corrected, written as a rule: "Read field numbers from the table; never renumber a
+field". Notes become the draft text of rules.
+
+### Rules for Copilot
+
+The **📏 Rules** filter of the Corrections tab turns repeated lessons into rules Copilot
+follows:
+
+1. **Repeated lessons without a rule**: lesson-labelled corrections grouped by category
+   and scope. A group is *repeated* when it has at least
+   `aiEffortTracker.lessons.minOccurrences` episodes (3) on
+   `aiEffortTracker.lessons.minWorkItems` work items or branches (2); one prompt that
+   reworks 30 lines counts once. Click **＋** next to a note to create a rule with that
+   text, or **＋ Rule** to write your own. **Other lessons** lists the groups that are
+   not repeated yet.
+2. **Proposed rules**: edit the text, category and scope, then **Approve** or **Reject**.
+   **＋ New rule** adds one from scratch. Copilot can propose rules with the MCP tool
+   `propose_rule`; they wait here for your approval.
+3. **Approved rules**: **Retire** a rule that no longer applies. Each rule keeps its
+   example corrections.
+
+**⇪ Export to Copilot** (or **AI Effort Tracker: Export Lessons to Copilot**) writes
+the approved rules as one `aet-lessons-<scope>.instructions.md` per scope into
+`.github/instructions` of each workspace folder (`applyTo` = the scope), so Copilot
+follows them for matching files. Rules limited to a repository only go to that folder.
+`aiEffortTracker.lessons.exportFolder` changes the folder (relative to each workspace
+folder, or absolute for one shared folder). Generated files carry an
+`aet-lessons:generated` line; files of scopes without rules are removed, and a file
+without that line (your own edit) is never overwritten or removed.
+
+The export also writes the agent skill **lessons-review** (`aiEffortTracker.lessons.reviewSkill`:
+`personal` = `~/.copilot/skills`, `workspace` = `.github/skills`, or `off`). Ask
+Copilot to "review my changes against the lessons": it reads the rules for each changed
+file with `get_lessons` and reports violations (and flags them as review issues if you ask).
 
 ## Development
 
