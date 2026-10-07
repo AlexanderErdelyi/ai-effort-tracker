@@ -228,6 +228,26 @@ function aiSpendTip(R,credits,cur){
     ?'= '+credits.toFixed(1)+' credits \\u00d7 '+fmtMoney(R.creditCostPerUnit,cur,4)+' per credit = '+fmtMoney(R.creditCost,cur)
     :'= the cost recorded on the credit ledger entries: '+fmtMoney(R.creditCost,cur));
 }
+// #130 correction rate: corrected AI lines per 100 AI lines written, shown as a percentage.
+function rpct(v){return v==null?'\\u2014':(Math.round(v*10)/10)+'%';}
+function rateDelta(cur,prev){
+  if(cur==null||prev==null||!(prev>0))return'';
+  var d=(cur-prev)/prev*100;if(Math.abs(d)<1)return'= vs before';
+  return'<span class="'+(d>0?'dup':'ddown')+'">'+(d>0?'\\u25B2':'\\u25BC')+' '+Math.abs(d).toFixed(0)+'%</span> vs before';
+}
+var TREND_ICON={up:['\\u25B2','var(--deleted)','More corrections than before'],down:['\\u25BC','var(--added)','Fewer corrections than before'],flat:['=','var(--vscode-descriptionForeground)','About the same'],'new':['new','var(--deleted)','Not corrected in the weeks before'],gone:['\\u2714','var(--added)','Not corrected any more in the recent weeks']};
+function trendHtml(t){var x=TREND_ICON[t]||TREND_ICON.flat;return'<span style="color:'+x[1]+'" title="'+x[2]+'">'+x[0]+'</span>';}
+function reworkStat(w,I){
+  var rw=w.rework;if(!rw||!rw.episodes)return'';
+  var R=roiOf(w),rate=R.hourlyCostRate!=null?R.hourlyCostRate:R.hourlySellRate,h=rw.ms/3600000;
+  var cost=rate!=null?h*rate:null;
+  var tip='Estimated time spent fixing AI-written code on this work item: '+rw.episodes+' correction episode'+(rw.episodes===1?'':'s')+' ('+rw.corrections+' changes, '+rw.correctedLines+' AI lines).'
+    +'\\nEach episode counts from the rework prompt (or first edit) to the last edit, at least 1 and at most 30 minutes.'
+    +(cost==null?'\\nSet the project\\u2019s hourly cost or sell rate to see the cost. '+RATES_HINT:'\\n= '+tH(h)+' \\u00d7 '+tR(rate,I.currency)+(R.hourlyCostRate!=null?' (cost rate)':' (sell rate)')+' = '+fmtMoney(cost,I.currency))
+    +(rw.rate!=null?'\\nCorrection rate: '+rpct(rw.rate)+' of the '+rw.aiLines+' AI lines written since correction capture started.':'')
+    +'\\nRequirement changes and progress updates do not count.';
+  return sc('Rework',fmt(rw.ms)+(cost==null?'':' <span style="font-size:.7em;color:var(--vscode-descriptionForeground)">'+fmtMoney(cost,I.currency)+'</span>'),'var(--deleted)',tip);
+}
 function wiTips(w,I){
   var R=roiOf(w),cur=I.currency,m=function(v){return fmtMoney(v,cur);};
   var G=w.generated||{},A=R.actualHours,B=R.chargeableHours,sell=R.hourlySellRate,cost=R.hourlyCostRate,credit=R.creditCost||0;
@@ -463,6 +483,21 @@ function ovBars(rows,total,label,max){
     return'<div class="brow"'+(l.action?' data-action="'+l.action+'" data-value="'+esc(r.key)+'" style="cursor:pointer"':'')+' title="'+esc(l.title||l.text)+' \\u2014 '+cr(r.credits)+' credits, '+r.entries+' entries"><span class="bl"'+(l.muted?' style="color:var(--vscode-descriptionForeground)"':'')+'>'+esc(l.text)+'</span><span class="btrack"><span class="bfill" style="display:block;width:'+(r.credits/top*100).toFixed(1)+'%;background:'+(l.color||'var(--ai)')+'"></span></span><span class="bv">'+cr(r.credits)+' \\u00b7 '+pct+'%</span></div>';
   }).join('');
 }
+function ovCorrHtml(){
+  var K=AN&&AN.corrections;if(!K)return'';
+  var r=K.recent,p=K.previous,wk=K.trendWeeks;
+  var kp='<div class="kpis">'
+    +kpi('Correction rate, last '+wk+' weeks',rpct(r.rate),rateDelta(r.rate,p.rate)+(p.rate!=null?' ('+rpct(p.rate)+')':''))
+    +kpi('Corrected AI lines',String(r.correctedLines),'of '+r.aiLines+' AI lines \\u00b7 '+r.episodes+' episodes')
+    +kpi('Rework time',fmt(r.reworkMs),p.reworkMs?dSpend(r.reworkMs,p.reworkMs,'before'):'&nbsp;')
+    +kpi('Since capture started',rpct(K.total.rate),K.total.correctedLines+' of '+K.total.aiLines+' AI lines')+'</div>';
+  var top=K.weeks.reduce(function(m,w){return Math.max(m,w.rate||0);},0)||1;
+  var bars=K.weeks.map(function(w){return'<div class="brow" title="Week of '+esc(fday(w.week,true))+': '+w.correctedLines+' of '+w.aiLines+' AI lines corrected"><span class="bl">'+esc(fday(w.week))+'</span><span class="btrack"><span class="bfill" style="display:block;width:'+((w.rate||0)/top*100).toFixed(1)+'%;background:var(--deleted)"></span></span><span class="bv">'+rpct(w.rate)+'</span></div>';}).join('');
+  var cats=K.categories.length?'<table style="margin-top:10px"><thead><tr><th>Category</th><th>Corrected lines</th><th title="Corrected lines per 100 AI lines in the last '+wk+' weeks">Last '+wk+' wk</th><th>Before</th><th>Trend</th></tr></thead><tbody>'
+    +K.categories.map(function(c){return'<tr><td>'+esc(c.category)+'</td><td>'+c.correctedLines+'</td><td>'+rpct(c.recent)+'</td><td>'+rpct(c.previous)+'</td><td>'+trendHtml(c.trend)+'</td></tr>';}).join('')+'</tbody></table>':'';
+  var help='<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">Correction rate = AI-written lines that you or Copilot changed later, per 100 AI lines written. Lower is better. Requirement changes and progress updates do not count; unlabelled corrections do. <a class="lnk" data-action="tab" data-value="corrections" data-rate="1">Open the corrections</a></p>';
+  return ovSec('corrections','\\uD83D\\uDD01 Corrections of AI code',rpct(r.rate)+' last '+wk+' weeks',kp+'<div style="margin-top:10px">'+bars+'</div>'+cats+help,false);
+}
 function ovCreditsHtml(){
   var C=AN&&AN.credits;
   if(!C)return'';
@@ -572,6 +607,7 @@ function renderOverview(){
   el.innerHTML=top+ovCreditsHtml()
     +ovSec('activity','\\u23F1 Activity','this week vs last week \\u00b7 streak \\u00b7 totals',weekK+timeK+'<div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div>',true)
     +ovSec('branches','\\uD83C\\uDF3F Branches',allData.length+' tracked','<div style="overflow-x:auto"><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
+    +ovCorrHtml()
     +ovSec('hotspots','\\uD83D\\uDD25 Most-edited files',tf.length?tf.length+' files':'','<div style="overflow-x:auto">'+hot+'</div>',false)
     +ovSec('keys','\\u2328\\ufe0f Keystrokes vs AI \\u00b7 token estimate','',kt,false);
   renderOvChart();
@@ -942,6 +978,7 @@ function renderWorkItemDetail(){
     +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)',T.credits)
     +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)',T.aiSpend)
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)',T.timeSaved)
+    +reworkStat(w,I)
     +'</div>'
     +manualSplitHtml(w,T)
     +budgetCardHtml(w,I.currency)
@@ -1397,10 +1434,12 @@ function renderCorrections(){
   var pend=L.rules.filter(function(r){return r.status==='proposed';}).length+L.groups.filter(function(g){return g.suggested&&!g.ruleIds.length;}).length;
   var ctl='<div class="rng">'+pill('corrFilter','todo',corrFilter,'To label')+pill('corrFilter','lessons',corrFilter,'Lessons')+pill('corrFilter','all',corrFilter,'All')
     +pill('corrFilter','rules',corrFilter,'\\uD83D\\uDCCF Rules'+(pend?' ('+pend+')':''))
-    +(corrFilter==='rules'?'':'<span style="width:14px"></span>'+pill('corrSrc','all',corrSrc,'Everyone')+pill('corrSrc','human',corrSrc,'Your changes')+pill('corrSrc','ai',corrSrc,'AI rework'))
+    +pill('corrFilter','rate',corrFilter,'\\uD83D\\uDCC8 Rate')
+    +(corrFilter==='rules'||corrFilter==='rate'?'':'<span style="width:14px"></span>'+pill('corrSrc','all',corrSrc,'Everyone')+pill('corrSrc','human',corrSrc,'Your changes')+pill('corrSrc','ai',corrSrc,'AI rework'))
     +'<span style="width:14px"></span><button class="dtab" data-action="corrRefresh">\\u21bb Refresh</button>'
-    +(s.suggested&&corrFilter!=='rules'?'<button class="dtab active" data-action="corrAcceptAll" title="Label every unlabeled correction with its suggestion. You can still change each one.">\\u2714 Accept all suggestions ('+s.suggested+')</button>':'')+'</div>';
+    +(s.suggested&&corrFilter!=='rules'&&corrFilter!=='rate'?'<button class="dtab active" data-action="corrAcceptAll" title="Label every unlabeled correction with its suggestion. You can still change each one.">\\u2714 Accept all suggestions ('+s.suggested+')</button>':'')+'</div>';
   if(corrFilter==='rules'){el.innerHTML=ctl+renderRules(L);return;}
+  if(corrFilter==='rate'){el.innerHTML=ctl+renderRate(CORR.rate);return;}
   var kpi='<div class="sg">'+sc('Corrections',String(s.total))+sc('Your changes',String(s.human),undefined,'Lines of AI-written code you changed yourself. These are the most valuable lessons.')
     +sc('AI rework prompts',String(s.prompts),undefined,'Prompts after which Copilot changed its own earlier code.')
     +sc('Labelled',s.labeled+' / '+s.total,s.labeled===s.total&&s.total?'var(--added)':undefined)+sc('Lessons',String(s.lessons),undefined,'Labelled with a lesson category (not requirement change, progress update or not a lesson).')+'</div>';
@@ -1452,6 +1491,7 @@ function ruleCard(r,items){
     +'<span style="font-size:.8em;color:var(--vscode-descriptionForeground)">by '+esc(r.createdBy)+'</span></span>'
     +'<span style="display:flex;gap:4px;align-items:center">'+ex+acts+'</span></div>'
     +'<textarea class="rule-text" data-id="'+esc(r.id)+'" rows="2" style="width:100%;box-sizing:border-box;margin-top:6px;font-family:inherit" placeholder="The rule for Copilot in one or two sentences, e.g. \\u201cRead field numbers from the table object; never renumber an existing field.\\u201d">'+esc(r.text)+'</textarea>'
+    +ruleEffectHtml(CORR.rate&&CORR.rate.rules.filter(function(e){return e.id===r.id;})[0])
     +exBody+'</div>';
 }
 function ruleGroup(g,rules){
@@ -1464,6 +1504,44 @@ function ruleGroup(g,rules){
     +(used[n.toLowerCase()]?'<span title="Already a rule">\\u2714</span>':'<button class="dtab" style="padding:0 6px" data-action="ruleCreate" data-key="'+esc(g.key)+'" data-note="'+ix+'" title="Create a rule with this text">\\uFF0B</button>')
     +'<span>\\u201c'+esc(n)+'\\u201d</span></div>';}).join('');
   return'<div class="card" style="margin-bottom:8px">'+head+(notes||'<div style="margin-top:4px;font-size:.85em;color:var(--vscode-descriptionForeground)">No notes yet. Add a note to the corrections (Lessons filter) or create a rule and write its text.</div>')+'</div>';
+}
+function ruleEffectHtml(e){
+  if(!e)return'';
+  var d=e.days+' day'+(e.days===1?'':'s');
+  var main=e.before.aiLines||e.after.aiLines
+    ?'Corrections in its scope: <strong>'+rpct(e.before.rate)+'</strong> before \\u2192 <strong>'+rpct(e.after.rate)+'</strong> since approval ('+d+')'
+      +(e.change!=null?' <span class="'+(e.change>0?'dup':'ddown')+'">'+(e.change>0?'\\u25B2':'\\u25BC')+' '+Math.abs(Math.round(e.change*100))+'%</span>':'')
+      +' \\u00b7 '+e.before.corrections+' \\u2192 '+e.after.corrections+' corrections'
+    :'No AI lines recorded around the approval yet.';
+  var notes=(e.early?' Approved '+d+' ago; wait at least a week before judging.':'')+(e.unlabelledAfter?' '+e.unlabelledAfter+' unlabelled correction'+(e.unlabelledAfter===1?'':'s')+' in its scope since approval; label them to keep the comparison fair.':'');
+  return'<div style="margin-top:6px;font-size:.85em" title="Corrected AI lines of this category in the rule\\u2019s scope per 100 AI lines written, from the approval day until today, compared with the same number of days before (never before correction capture started).">\\uD83D\\uDCC8 '+main+(notes?'<span style="color:var(--vscode-descriptionForeground)">'+notes+'</span>':'')+'</div>';
+}
+function renderRate(R){
+  if(!R||!R.total.corrections)return'<div class="card">No corrections captured yet. The rate appears when you or Copilot change code an AI edit wrote earlier.</div>';
+  var wk=R.trendWeeks;
+  var intro='<p style="margin-bottom:12px;font-size:.85em;color:var(--vscode-descriptionForeground)">Is Copilot getting better? The correction rate is the number of AI-written lines changed later (by you or by a rework prompt) per 100 AI lines written. Lower is better. Requirement changes, progress updates and \\u201cnot a lesson\\u201d do not count; unlabelled corrections do. Rework time is estimated per episode: from the rework prompt (or first edit) to the last edit, 1 to 30 minutes. Copilot can read this through the <strong>correction_rate</strong> MCP tool.</p>';
+  var kp='<div class="sg">'+sc('Rate, last '+wk+' weeks',rpct(R.recent.rate),undefined,R.recent.correctedLines+' of '+R.recent.aiLines+' AI lines corrected.')
+    +sc('Rate, '+wk+' weeks before',rpct(R.previous.rate),undefined,R.previous.correctedLines+' of '+R.previous.aiLines+' AI lines corrected.')
+    +sc('Since capture started',rpct(R.total.rate),undefined,'Capture started '+(R.since?new Date(R.since).toLocaleDateString():'\\u2014')+'. '+R.total.correctedLines+' of '+R.total.aiLines+' AI lines corrected.')
+    +sc('Rework time',fmt(R.total.reworkMs),'var(--deleted)',R.total.episodes+' correction episodes since capture started.')+'</div>';
+  var cats=Object.keys(R.weeks.reduce(function(m,w){Object.keys(w.byCategory).forEach(function(k){m[k]=1;});return m;},{}));
+  var weeks='<div class="card" style="margin-bottom:12px"><h3>Per week</h3><div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>Week</th><th>AI lines</th><th>Corrected</th><th>Rate</th><th>Yours</th><th>Episodes</th><th>Rework</th><th>Top categories</th></tr></thead><tbody>'
+    +R.weeks.slice().reverse().map(function(w){
+      var top=Object.keys(w.byCategory).sort(function(a,b){return w.byCategory[b]-w.byCategory[a];}).slice(0,3).map(function(k){return esc(k)+' '+w.byCategory[k];}).join(', ');
+      return'<tr><td>'+esc(fday(w.week,true))+'</td><td>'+w.aiLines+'</td><td>'+w.correctedLines+'</td><td>'+rpct(w.rate)+'</td><td>'+w.human+'</td><td>'+w.episodes+'</td><td>'+(w.reworkMs?fmt(w.reworkMs):'\\u2014')+'</td><td style="font-size:.85em">'+top+'</td></tr>';
+    }).join('')+'</tbody></table></div></div>';
+  var catT=R.categories.length?'<div class="card" style="margin-bottom:12px"><h3>Per category</h3><table style="width:100%"><thead><tr><th>Category</th><th>Corrected lines</th><th>Corrections</th><th>Episodes</th><th>Last '+wk+' wk</th><th>Before</th><th>Trend</th></tr></thead><tbody>'
+    +R.categories.map(function(c){return'<tr><td>'+corrCatBadge(c.category==='unlabelled'?'':c.category)+(c.category==='unlabelled'?'<em>unlabelled</em>':'')+'</td><td>'+c.correctedLines+'</td><td>'+c.corrections+'</td><td>'+c.episodes+'</td><td>'+rpct(c.recent)+'</td><td>'+rpct(c.previous)+'</td><td>'+trendHtml(c.trend)+'</td></tr>';}).join('')+'</tbody></table></div>':'';
+  var grp=function(title,rows,label){return rows.length?'<div class="card" style="margin-bottom:12px"><h3>'+title+'</h3><table style="width:100%"><thead><tr><th>'+title.replace('Per ','')+'</th><th>AI lines</th><th>Corrected</th><th>Rate</th><th>Episodes</th><th>Rework</th></tr></thead><tbody>'
+    +rows.map(function(g){return'<tr><td>'+label(g.key)+'</td><td>'+g.aiLines+'</td><td>'+g.correctedLines+'</td><td>'+rpct(g.rate)+'</td><td>'+g.episodes+'</td><td>'+fmt(g.reworkMs)+'</td></tr>';}).join('')+'</tbody></table></div>':'';};
+  var wiLabel=function(k){if(!k||k==='__unassigned__')return'<em>Unassigned</em>';var w=(WI||[]).find(function(x){return x.workItemId===k;});return'#'+esc(k)+(w&&w.title?' '+esc(w.title):'');};
+  var pjLabel=function(k){if(!k)return'<em>No project</em>';var p=(PROJ||[]).find(function(x){return x.projectId===k;});return esc(p?p.name:k);};
+  var byId={};((CORR.lessons&&CORR.lessons.rules)||[]).forEach(function(r){byId[r.id]=r;});
+  var rules=R.rules.length?'<div class="card" style="margin-bottom:12px"><h3>Rules: before vs after approval</h3>'
+    +R.rules.map(function(e){return'<div style="border-top:1px solid var(--vscode-panel-border);padding:6px 0">'+corrCatBadge(e.category)+' <code>'+esc(e.scope)+'</code> <span style="font-size:.85em;color:var(--vscode-descriptionForeground)">'+esc(e.status)+' \\u00b7 approved '+esc(new Date(e.approvedAt).toLocaleDateString())+'</span><div style="font-size:.9em">'+esc(e.text||(byId[e.id]&&byId[e.id].text)||'')+'</div>'+ruleEffectHtml(e)+'</div>';}).join('')+'</div>'
+    :'<div class="card" style="margin-bottom:12px">No approved rules yet. Approve a rule on the Rules tab to compare its corrections before and after.</div>';
+  var note='<p style="font-size:.78em;color:var(--vscode-descriptionForeground)">AI lines are the lines Copilot added on the branches, without translation files (like the productivity metrics). They include short lines (fewer than 6 characters) that corrections do not follow, so the rate is a lower bound. Work items and projects follow the current branch mapping.</p>';
+  return intro+kp+weeks+catT+rules+grp('Per work item',R.workItems,wiLabel)+grp('Per project',R.projects,pjLabel)+note;
 }
 function renderRules(L){
   var items=corrItemById();
@@ -1700,7 +1778,7 @@ document.addEventListener('click',function(e){
   if(t.tagName!=='SUMMARY'&&t.closest('summary'))e.preventDefault();
   var a=t.dataset.action,v=t.dataset.value;
   if(a==='detail')showDetail(v);
-  else if(a==='tab')showTab(v);
+  else if(a==='tab'){if(t.dataset.rate)corrFilter='rate';showTab(v);}
   else if(a==='ds')showDS(v,t);
   else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
   else if(a==='optDays'){optDays=parseInt(v,10)||30;requestOptimize();}

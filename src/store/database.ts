@@ -22,6 +22,7 @@ import { MAX_TOOLSETS, type ModelPrice, type ToolsetInfo } from '../util/modelCa
 import { computeBudget, normalizeThresholds, type BudgetDay, type BudgetStatus } from '../analysis/budget';
 import { duplicateLedgerIndexes } from '../analysis/dataHealth';
 import type { TimesheetSourceRow } from '../analysis/timesheet';
+import { rateInputsFromStore } from '../analysis/correctionRate';
 
 export interface LineStats {
   added: number;
@@ -440,6 +441,8 @@ export interface DailyBucket {
   idle: number;
   linesHuman: number;
   linesAi: number;
+  /** AI lines in translation files (included in linesAi); left out of the correction rate. */
+  linesAiTranslation?: number;
   /** Active ms per hour-of-day (0-23) — drives the activity heatmap. */
   hours: number[];
   /** Active ms per hour-of-day split by mode — drives the today timeline. */
@@ -1739,7 +1742,7 @@ function activityOf(daily: BudgetDay[]): { firstDay: string | null; lastDay: str
 function emptyBucket(): DailyBucket {
   return {
     humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0,
-    linesHuman: 0, linesAi: 0, hours: new Array(24).fill(0),
+    linesHuman: 0, linesAi: 0, linesAiTranslation: 0, hours: new Array(24).fill(0),
     hoursByMode: {
       humanCoding: new Array(24).fill(0),
       aiGenerating: new Array(24).fill(0),
@@ -2076,6 +2079,10 @@ export class Database {
     if (source === 'ai') {
       data.copilotAcceptances += 1;
       bucket.linesAi += linesAdded;
+      // Buckets created before this counter existed stay without it (estimated from files instead).
+      if (bucket.linesAiTranslation !== undefined && linesAdded > 0 && filePath && categorize(filePath) === 'translation') {
+        bucket.linesAiTranslation += linesAdded;
+      }
     } else {
       bucket.linesHuman += linesAdded;
     }
@@ -3304,6 +3311,11 @@ export class Database {
     delete this.workItems[id];
     this.save();
     return { removed: true, ...impact };
+  }
+
+  /** #130: AI lines per day and branch plus the branch → work item → project mapping for the correction rate. */
+  getCorrectionRateInputs() {
+    return rateInputsFromStore(this.store, this.workItems, file => categorize(file) === 'translation');
   }
 
   /** Branch names that currently roll up into the given work item. */
