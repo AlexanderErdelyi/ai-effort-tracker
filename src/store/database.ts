@@ -1753,6 +1753,23 @@ function emptyBucket(): DailyBucket {
 
 const COST_PER_AI_LINE_USD = 0.00003;
 
+/** Validate and migrate a raw effort-store file (also used to check backups, #6). */
+export function decodeEffortStore(raw: string): PersistedStore {
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid effort store object');
+  }
+  if ('schemaVersion' in parsed && !isEnvelope(parsed)) throw new Error('Invalid effort store envelope');
+  const branches = isEnvelope(parsed) ? parsed.branches : parsed;
+  for (const branch of Object.values(branches)) {
+    if (!branch || typeof branch !== 'object' || !(branch as BranchData).time ||
+        typeof (branch as BranchData).time !== 'object') {
+      throw new Error('Invalid effort branch');
+    }
+  }
+  return migrateStore(parsed);
+}
+
 export class Database {
   private filePath: string;
   private baseline: PersistedStore;
@@ -1825,19 +1842,64 @@ export class Database {
   }
 
   private decode(raw: string): PersistedStore {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('Invalid effort store object');
+    return decodeEffortStore(raw);
+  }
+
+  /** Take over a committed/restored envelope as the new baseline and in-memory state. */
+  private adopt(data: string): void {
+    const merged: PersistedStore = JSON.parse(data);
+    this.baseline = JSON.parse(data);
+    this.schemaVersion = merged.schemaVersion;
+    this.store = merged.branches;
+    this.workItems = merged.workItems;
+    this.creditLedger = merged.creditLedger;
+    this.projects = merged.projects;
+    this.manualEffort = merged.manualEffort;
+    this.reassignments = merged.reassignments;
+    this.timeEntries = merged.timeEntries;
+    this.toolsets = merged.toolsets;
+    this.modelPrices = merged.modelPrices;
+    this.dirty = false;
+    this.saveErrorReported = false;
+    this.lastSaveError = null;
+  }
+
+  /**
+   * #6: commit this window's pending changes and return the latest data
+   * (including other windows' saves), e.g. for a full backup export.
+   */
+  backupSnapshot(): PersistedStore {
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
+    try {
+      this.commit(5000);
+    } catch (error) {
+      this.dirty = true;
+      this.scheduleSave();
+      throw error;
     }
-    if ('schemaVersion' in parsed && !isEnvelope(parsed)) throw new Error('Invalid effort store envelope');
-    const branches = isEnvelope(parsed) ? parsed.branches : parsed;
-    for (const branch of Object.values(branches)) {
-      if (!branch || typeof branch !== 'object' || !(branch as BranchData).time ||
-          typeof (branch as BranchData).time !== 'object') {
-        throw new Error('Invalid effort branch');
-      }
-    }
-    return migrateStore(parsed);
+    return JSON.parse(JSON.stringify(this.baseline));
+  }
+
+  /**
+   * #6: replace ALL tracking data with a validated backup. The file being
+   * replaced is kept as .bak/history. Unsaved changes of this window are
+   * discarded (callers take a safety copy first); other windows adopt the
+   * restored file on their next refresh and only add their own new changes.
+   */
+  restoreSnapshot(value: unknown): void {
+    const restored = decodeEffortStore(JSON.stringify(value));
+    restored.writer = STORE_WRITER;
+    const data = JSON.stringify(restored, null, 2);
+    if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = undefined; }
+    withStoreLock(this.filePath, 5000, () => {
+      let current: string | undefined;
+      try { current = fs.readFileSync(this.filePath, 'utf8'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      if (current !== undefined && current !== data) retainPrevious(this.filePath, current);
+      atomicWrite(this.filePath, data);
+      syncDirectory(path.dirname(this.filePath));
+      this.adopt(data);
+    });
   }
 
   /** Migrations/recovery are serialized too, never writes from an unlocked load. */
@@ -1964,20 +2026,7 @@ export class Database {
         atomicWrite(this.filePath, data);
       }
       if (legacy) this.reportLegacyWriter();
-      this.baseline = JSON.parse(data);
-      this.schemaVersion = merged.schemaVersion;
-      this.store = merged.branches;
-      this.workItems = merged.workItems;
-      this.creditLedger = merged.creditLedger;
-      this.projects = merged.projects;
-      this.manualEffort = merged.manualEffort;
-      this.reassignments = merged.reassignments;
-      this.timeEntries = merged.timeEntries;
-      this.toolsets = merged.toolsets;
-      this.modelPrices = merged.modelPrices;
-      this.dirty = false;
-      this.saveErrorReported = false;
-      this.lastSaveError = null;
+      this.adopt(data);
       syncDirectory(path.dirname(this.filePath));
     });
   }

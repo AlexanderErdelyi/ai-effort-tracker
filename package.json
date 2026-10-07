@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.34.0",
+  "version": "0.35.0",
   "publisher": "AlexanderErdelyi",
   "engines": {
     "vscode": "^1.101.0"
@@ -146,6 +146,18 @@
       {
         "command": "aiEffortTracker.checkDataHealth",
         "title": "AI Effort Tracker: Check Data Health"
+      },
+      {
+        "command": "aiEffortTracker.exportBackup",
+        "title": "AI Effort Tracker: Export Full Backup…"
+      },
+      {
+        "command": "aiEffortTracker.restoreBackup",
+        "title": "AI Effort Tracker: Restore Data from Backup…"
+      },
+      {
+        "command": "aiEffortTracker.revealDataFolder",
+        "title": "AI Effort Tracker: Reveal Data Folder"
       },
       {
         "command": "aiEffortTracker.newChatWithHandoff",

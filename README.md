@@ -29,6 +29,9 @@
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
+| `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
+| `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
+| `AI Effort Tracker: Reveal Data Folder` | Open the folder where the data is stored |
 | `AI Effort Tracker: Show Captured Corrections` | Newest corrections of AI-written code (see below) |
 | `AI Effort Tracker: Label Corrections` | Opens the dashboard's Corrections tab to label what each correction teaches |
 | `AI Effort Tracker: Export Lessons to Copilot` | Writes the approved rules as Copilot instructions files (see [Rules for Copilot](#rules-for-copilot)) |
@@ -116,7 +119,40 @@ an older window are not trusted. These safeguards cover cooperating processes on
 not network/cloud-sync storage or arbitrary external file edits. File contents are
 fsynced; Windows does not support the directory fsync used on other platforms.
 The fix cannot reconstruct history already overwritten before recovery copies
-existed. Export important reports separately for longer-term backup.
+existed.
+
+## Your data: backups, restore and moving to another machine
+
+Everything is stored locally in the extension's global storage folder
+(**AI Effort Tracker: Reveal Data Folder** opens it). On Windows that is
+`%APPDATA%\Code\User\globalStorage\alexandererdelyi.ai-effort-tracker\`:
+
+| File | Content |
+|------|---------|
+| `effort-tracker.json` | Time, lines, credits, work items, projects, estimates, manual entries |
+| `corrections.json` | Captured corrections of AI code and their labels |
+| `review-marks.json` | Code review marks (approved / issue / fixed) |
+| `lessons.json` | Rules for Copilot |
+
+Each of these keeps automatic checkpoints next to it (`.bak` = previous save,
+`.history/` = hourly and daily snapshots, see above). Other `*-snapshot.json`
+files are derived caches and are rebuilt automatically.
+
+- **AI Effort Tracker: Export Full Backup…** writes one JSON file with all four
+  data sets plus your user-level `aiEffortTracker.*` settings (rates, profile,
+  category rules…). The GitHub token is **never** included. Keep it somewhere
+  safe, e.g. OneDrive, before reinstalling or switching machines.
+- **AI Effort Tracker: Restore Data from Backup…** restores from such a file, from
+  a plain `effort-tracker.json` copied from another machine, or from any automatic
+  checkpoint listed in the picker. It validates the file, lets you pick which data
+  sets (and whether settings) to restore, and shows *Backup vs. Current* totals
+  before anything changes.
+- Before every restore a **safety copy** of all current data is written to
+  `backups/pre-restore-<time>.json` (the newest 10 are kept). These appear at the
+  top of the restore picker, so a restore can always be undone.
+- A restore **replaces** the chosen data sets; it does not merge them. Other open
+  VS Code windows pick up the restored data within two seconds; changes they had
+  not saved yet are added on top.
 
 ## Translation line tracking
 
