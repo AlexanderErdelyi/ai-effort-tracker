@@ -26,6 +26,8 @@ export interface CreditOverviewOptions {
   renewalDay?: number;
   /** Days of daily history to return (default 90). */
   days?: number;
+  /** Extra `[from, to)` window (epoch ms) returned as `breakdown.custom` (#146). */
+  window?: { from?: number; to?: number };
 }
 
 export interface CreditRow { key: string; credits: number; entries: number }
@@ -75,7 +77,7 @@ export interface CreditOverview {
   daily: { date: string; credits: number; byModel: Record<string, number> }[];
   /** Models shown as separate series in `daily` (top 5); the rest are 'other'. */
   models: string[];
-  breakdown: Record<BreakdownWindow, CreditBreakdown>;
+  breakdown: Record<BreakdownWindow, CreditBreakdown> & { custom?: CreditBreakdown };
   budget: BudgetPace | null;
   insights: CreditInsight[];
 }
@@ -270,6 +272,8 @@ export function buildCreditOverview(ledger: CreditOverviewEntry[], opts: CreditO
   const credits30 = last30.reduce((s, e) => s + e.credits, 0);
 
   const budgetValue = opts.monthlyBudget ?? 0;
+  const w = opts.window;
+  const custom = w ? breakdown(entries.filter(e => (w.from === undefined || e.ts >= w.from) && (w.to === undefined || e.ts < w.to))) : undefined;
   const base = {
     today: round(sumBetween(today0, tomorrow0)),
     yesterday: round(sumBetween(addDays(today0, -1), today0)),
@@ -285,6 +289,7 @@ export function buildCreditOverview(ledger: CreditOverviewEntry[], opts: CreditO
       '7': breakdown(within(addDays(today0, -6))),
       '30': breakdown(last30),
       '90': breakdown(within(addDays(today0, -89))),
+      ...(custom ? { custom } : {}),
     },
     budget: budgetValue > 0 ? pace(budgetValue, periodCredits, per.start, per.end, now) : null,
   };

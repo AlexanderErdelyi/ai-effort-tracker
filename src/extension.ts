@@ -43,6 +43,7 @@ import { buildTimesheet, normalizeRounding, timesheetCsv, weekStartOf } from './
 import { defaultClassifier, modelEfficiency, toolProfile } from './analysis/efficiency';
 import { checkDataHealth, HEALTH_SNAPSHOT_FILE, type HealthReport } from './analysis/dataHealth';
 import { buildCreditOverview } from './analysis/creditOverview';
+import { DEFAULT_FILTER, filterWindow, isScoped, matchesScope, normalizeFilter, parseDay, type DashboardFilter } from './analysis/dashboardFilter';
 import { readUserRules } from './util/fileTypes';
 import { suggestEstimate, adjustForBias, toEstimationItem, estimateAccuracy, isFinished } from './analysis/estimation';
 import { NudgeController } from './ui/nudgeController';
@@ -67,6 +68,7 @@ let reviewController: ReviewController | undefined;
 let correctionStore: CorrectionStore | undefined;
 let lessonStore: LessonStore | undefined;
 let lastBilling: BillingUsage | null = null;
+let dashFilter: DashboardFilter = DEFAULT_FILTER;
 const ghService = new GitHubService();
 
 interface InsightsConfig {
@@ -90,7 +92,7 @@ function getInsightsConfig(): InsightsConfig {
 function getAnalytics() {
   const goal = getInsightsConfig().dailyActiveGoalMinutes;
   return {
-    daily: db.getDailySeries(90),
+    daily: db.getDailySeries(filterDays()),
     heatmap: db.getHourHeatmap(),
     calendar: db.getCalendar(),
     focus: db.getFocusStats(goal),
@@ -105,13 +107,33 @@ function getAnalytics() {
   };
 }
 
+const renewalDay = () => vscode.workspace.getConfiguration('aiEffortTracker').get<number>('credits.renewalDay') ?? 1;
+
+/** Days of daily history the global filter needs (at least 90, at most 366). */
+function filterDays(now = Date.now()): number {
+  const w = filterWindow(dashFilter, now, renewalDay());
+  if (w.from === undefined) return dashFilter.range === 'all' || dashFilter.range === 'custom' ? 366 : 90;
+  return Math.min(366, Math.max(90, Math.ceil((now - w.from) / 86_400_000) + 1));
+}
+
+/**
+ * Credit overview for the dashboard. Breakdowns follow the global filter's
+ * scope (#146); the budget always uses every entry, because the allowance is
+ * shared across projects.
+ */
 function getCreditOverview() {
   const c = vscode.workspace.getConfiguration('aiEffortTracker');
-  return buildCreditOverview(db.getCreditEntries(), {
-    now: Date.now(),
-    monthlyBudget: c.get<number>('credits.monthlyBudget') ?? 0,
-    renewalDay: c.get<number>('credits.renewalDay') ?? 1,
+  const now = Date.now();
+  const all = db.getCreditEntries();
+  const opts = { now, monthlyBudget: c.get<number>('credits.monthlyBudget') ?? 0, renewalDay: renewalDay() };
+  const custom = dashFilter.range === 'all' || dashFilter.range === 'custom';
+  const scoped = buildCreditOverview(isScoped(dashFilter) ? all.filter(e => matchesScope(e, dashFilter)) : all, {
+    ...opts,
+    days: filterDays(now),
+    ...(custom ? { window: filterWindow(dashFilter, now, opts.renewalDay) } : {}),
   });
+  if (!isScoped(dashFilter)) return scoped;
+  return { ...scoped, budget: buildCreditOverview(all, opts).budget };
 }
 
 async function setMonthlyCreditBudget(): Promise<void> {
@@ -548,6 +570,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   }
 
   const nonce = crypto.randomBytes(16).toString('hex');
+  dashFilter = normalizeFilter(context.globalState.get('dashboardFilter'));
   dashboardPanel = vscode.window.createWebviewPanel(
     'aiEffortTracker',
     'AI Effort Tracker',
@@ -561,14 +584,20 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
   const initialNet = await GitTracker.getNetLineChange();
   if (initialNet) db.seedEffectiveLinesFromGit(initialNet.branch, initialNet.byCategory);
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(),   db.getManualEffort(), db.getReassignments(), initialNet, dashFilter);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
-    if (m?.type === 'optimize') {
-      dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId) });
-      return;
-    }
+      if (m?.type === 'filter') {
+        dashFilter = normalizeFilter(m.filter);
+        void context.globalState.update('dashboardFilter', dashFilter);
+        refreshDashboard();
+        return;
+      }
+      if (m?.type === 'optimize') {
+        dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId, m.from, m.to) });
+        return;
+      }
     if (m?.type === 'health') {
       dashboardPanel?.webview.postMessage({ type: 'healthData', report: healthReport() });
       return;
@@ -606,7 +635,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       return;
     }
     if (m?.type === 'estimates') {
-      dashboardPanel?.webview.postMessage({ type: 'estimatesData', ...estimatesPayload(m.projectId) });
+      dashboardPanel?.webview.postMessage({ type: 'estimatesData', ...estimatesPayload(m.projectId, m.workItemId) });
       return;
     }
     if (m && typeof m === 'object' && await handleSessionsMessage(m, db, context, msg => dashboardPanel?.webview.postMessage(msg))) return;
@@ -2775,10 +2804,14 @@ async function fixDataHealth(checkId?: string) {
 }
 
 /** Usage-optimization data for the dashboard's Optimize tab (same engine as the MCP server). */
-function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown) {
+function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown, from?: unknown, to?: unknown) {
   try {
+    const isDay = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(parseDay(v));
+    const fromMs = isDay(from) ? parseDay(from) : undefined;
+    const toMs = isDay(to) ? parseDay(to) + 86_400_000 - 1 : undefined;
     const filter: InsightFilter = {
-      days: typeof days === 'number' && days > 0 ? Math.min(days, 365) : 30,
+      ...(fromMs !== undefined ? { from: fromMs } : { days: typeof days === 'number' && days > 0 ? Math.min(days, 3650) : 30 }),
+      ...(toMs !== undefined ? { to: toMs } : {}),
       ...(typeof workItemId === 'string' && workItemId ? { workItemId } : {}),
       ...(typeof projectId === 'string' && projectId ? { projectId } : {})
     };
@@ -2849,14 +2882,15 @@ async function exportTimesheetCsv(arg?: string) {
 }
 
 /** Estimates tab (issues #97/#98): accuracy of finished items + suggestions for open ones. */
-function estimatesPayload(projectId: unknown) {
+function estimatesPayload(projectId: unknown, workItemId?: unknown) {
   try {
-    const pid = typeof projectId === 'string' && projectId ? projectId : undefined;
+    const scope = normalizeFilter({ projectId, workItemId });
     const today = localDay();
     const items = estimationItems();
-    const accuracy = estimateAccuracy(items, today, { projectId: pid });
-    const open = items
-      .filter(i => (!pid || i.projectId === pid) && !isFinished(i, today))
+    const inScope = items.filter(i => matchesScope({ projectId: i.projectId, workItemId: i.id }, scope));
+    const accuracy = estimateAccuracy(inScope, today);
+    const open = inScope
+      .filter(i => !isFinished(i, today))
       .map(i => {
         const s = suggestEstimate(items, { title: i.title, projectId: i.projectId, excludeId: i.id }, today);
         return {
@@ -2867,7 +2901,7 @@ function estimatesPayload(projectId: unknown) {
         };
       })
       .sort((a, b) => (b.lastDay ?? '').localeCompare(a.lastDay ?? ''));
-    return { accuracy, open, projectId: pid ?? '' };
+    return { accuracy, open, projectId: scope.projectId };
   } catch (error) {
     return { error: `Cannot analyse estimates: ${String(error)}` };
   }

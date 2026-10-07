@@ -64,14 +64,32 @@ The Overview tab opens with a credit summary:
   spend and the date it will run out at the current pace. Set it with
   **AI Effort Tracker: Set Monthly Credit Budget** (budget and renewal day).
 - A daily spend chart, stacked by model with a cumulative line (and the budget
-  line in the "This period" view), for this period, 30 or 90 days.
+  line in the "This period" view), for the range picked in the filter bar.
 - Insights: budget pace, spend spikes, credits not linked to a work item,
   one dominant model, and big week-on-week changes.
 - "Where the credits went": model, work item, weekday and source breakdowns
-  for the period, 7, 30 or 90 days. Click a work item to open it in Projects.
+  for the filter range. Click a work item to open it in Projects.
 
 Activity, branches, hotspots and keystrokes sit in collapsible sections below;
-which sections are open and the chosen ranges are remembered.
+which sections are open is remembered.
+
+### Filter everything at once
+
+A filter bar above the tabs sets one date range (7, 30 or 90 days, this
+billing period, all time, or custom dates), one project (or "No project") and
+one work item. Every tab reads the same filter, so switching tabs keeps your
+selection, and it survives reloads. Chips show what is active; **Clear** goes
+back to 30 days, all projects.
+
+Some tabs use only part of it, and a short note on the bar says so:
+
+- Overview: the KPI cards keep their fixed windows (today, 7 days, period) and
+  branch totals are all-time, but both follow the project and work item. The
+  budget always covers all projects.
+- Trends is not split by project; only the date range applies.
+- Estimates ignore the date range; accuracy uses every finished work item.
+- Timesheet keeps its week buttons and only applies the project and work item.
+- Correction episodes without a work item count as "No project".
 
 ## Branch changes and tracked time
 

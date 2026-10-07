@@ -4,6 +4,7 @@ import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 import type { NetLineChange } from '../trackers/gitTracker';
 import type { CreditOverview } from '../analysis/creditOverview';
 import type { CalendarData } from '../analysis/calendar';
+import { DEFAULT_FILTER, type DashboardFilter } from '../analysis/dashboardFilter';
 
 export interface InsightsConfig {
   baselineLocPerMinute: number;
@@ -42,9 +43,11 @@ export function renderDashboardHtml(
   ledger: LedgerEntry[] = [],
   manualEffort: ManualEffortEntry[] = [],
   reassignments: ReassignmentRecord[] = [],
-  netChange: NetLineChange | null = null
+  netChange: NetLineChange | null = null,
+  filter: DashboardFilter = DEFAULT_FILTER
 ): string {
   const data = JSON.stringify(summaries);
+  const gfData = JSON.stringify(filter).replace(/</g, '\\u003c');
   const current = JSON.stringify(currentBranch);
   const catLabels = JSON.stringify(CATEGORY_LABELS);
   const ghData = JSON.stringify(ghMetrics);
@@ -160,6 +163,13 @@ export function renderDashboardHtml(
   .rng{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:16px;}
   .rng .dtab{white-space:nowrap;flex:none;}
   .rng label{font-size:.85em;display:inline-flex;gap:4px;align-items:center;white-space:nowrap;}
+  .gf{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:-8px 0 16px;padding:8px 10px;border:1px solid var(--vscode-panel-border);border-radius:6px;background:rgba(128,128,128,.05);font-size:.9em;}
+  .gf .dtab{white-space:nowrap;flex:none;padding:2px 10px;}
+  .gf .gfl{font-weight:600;margin-right:2px;}
+  .gf .gfsep{width:1px;align-self:stretch;background:var(--vscode-panel-border);margin:0 4px;}
+  .gf .gfchip{display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:10px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);font-size:.85em;}
+  .gf .gfchip button{background:none;border:none;color:inherit;cursor:pointer;padding:0;font-size:1em;}
+  .gf .gfnote{flex-basis:100%;font-size:.85em;color:var(--vscode-descriptionForeground);}
   .sesin{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px;}
   select.sesin{max-width:240px;text-overflow:ellipsis;}
   .hm{display:grid;grid-template-columns:auto repeat(24,1fr);gap:2px;font-size:.7em;}
@@ -203,7 +213,91 @@ let LEDGER=${ledData};
 let ME=${meData};
 let RE=${reData};
 let NET=${netData};
+let GF=${gfData};
 const charts={};
+
+// #146 Global filter bar: one date range + project + work item for every tab.
+var GF_NOTE={
+  overview:'Credits follow the date range, project and work item. Branch totals follow the project and work item but are all-time; streak and week figures are never filtered.',
+  trends:'Follows the date range. Daily activity is not split by project or work item.',
+  ledger:'Follows the date range, project and work item.',
+  optimize:'Follows the date range, project and work item.',
+  sessions:'Follows the date range, project and work item.',
+  estimates:'Follows the project and work item. The date range does not apply: accuracy uses every finished item.',
+  timesheet:'Follows the project and work item. Use the week buttons for dates.',
+  corrections:'Follows the date range, project and work item (episodes without a work item count as \u201cNo project\u201d).'
+};
+function gfIso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function gfDayOf(ts){var d=new Date(ts);return isNaN(d.getTime())?'':gfIso(d);}
+function gfWindow(){
+  if(GF.range==='all')return{from:'',to:''};
+  if(GF.range==='custom')return{from:GF.from||'',to:GF.to||''};
+  if(GF.range==='period'&&AN&&AN.credits&&AN.credits.period)return{from:AN.credits.period.start,to:''};
+  var n=parseInt(GF.range,10)||30,d=new Date();d.setDate(d.getDate()-(n-1));return{from:gfIso(d),to:''};
+}
+function gfInDay(day){var w=gfWindow();return!!day&&(!w.from||day>=w.from)&&(!w.to||day<=w.to);}
+function gfInTs(ts){return gfInDay(gfDayOf(ts));}
+function gfProjOf(wid){if(!wid)return'';var w=(WI||[]).find(function(x){return String(x.workItemId)===String(wid);});return w&&w.projectId||'';}
+function gfScope(pid,wid){
+  if(GF.workItemId&&String(wid||'')!==GF.workItemId)return false;
+  if(!GF.projectId)return true;
+  var p=pid||gfProjOf(wid);
+  return GF.projectId==='__none__'?!p:p===GF.projectId;
+}
+function gfActive(){return GF.range!=='30'||!!GF.projectId||!!GF.workItemId;}
+function gfQuery(){var w=gfWindow(),q={};if(w.from)q.from=w.from;else q.days=3650;if(w.to)q.to=w.to;if(GF.projectId)q.projectId=GF.projectId;if(GF.workItemId)q.workItemId=GF.workItemId;return q;}
+function gfRangeLabel(){
+  var L={'7':'Last 7 days','30':'Last 30 days','90':'Last 90 days','period':'This billing period','all':'All time'};
+  if(GF.range!=='custom')return L[GF.range]||GF.range;
+  return(GF.from?fday(GF.from,true):'start')+' \\u2013 '+(GF.to?fday(GF.to,true):'today');
+}
+function gfProjName(id){if(id==='__none__')return'No project';var p=(PROJ||[]).find(function(x){return x.projectId===id;});return p?p.name:id;}
+function gfWiName(id){var w=(WI||[]).find(function(x){return String(x.workItemId)===String(id);});return'#'+id+(w&&w.title?' \\u2013 '+w.title:'');}
+function gfActiveTab(){var v=document.querySelector('.view.active');return v?v.id:'overview';}
+function renderFilterBar(){
+  var el=document.getElementById('gf');if(!el)return;
+  var tab=gfActiveTab(),note=GF_NOTE[tab];
+  if(!note){el.style.display='none';return;}
+  el.style.display='';
+  var rg=[['7','7d'],['30','30d'],['90','90d'],['period','Period'],['all','All'],['custom','Custom']].map(function(o){return'<button class="dtab'+(GF.range===o[0]?' active':'')+'" data-action="gfRange" data-value="'+o[0]+'">'+o[1]+'</button>';}).join('');
+  var cust=GF.range==='custom'?'<label>From <input type="date" id="gfFrom" class="sesin" value="'+esc(GF.from)+'"></label><label>To <input type="date" id="gfTo" class="sesin" value="'+esc(GF.to)+'"></label>':'';
+  var po=['<option value="">All projects</option>'].concat((PROJ||[]).map(function(p){return'<option value="'+esc(p.projectId)+'"'+(p.projectId===GF.projectId?' selected':'')+'>'+esc(p.name)+'</option>';}))
+    .concat(['<option value="__none__"'+(GF.projectId==='__none__'?' selected':'')+'>No project</option>']).join('');
+  var wis=(WI||[]).filter(function(w){var p=w.projectId||'';return!GF.projectId||(GF.projectId==='__none__'?!p:p===GF.projectId)||String(w.workItemId)===GF.workItemId;});
+  var wo=['<option value="">All work items</option>'].concat(wis.map(function(w){return'<option value="'+esc(w.workItemId)+'"'+(String(w.workItemId)===GF.workItemId?' selected':'')+'>'+esc(gfWiName(w.workItemId))+'</option>';})).join('');
+  var chips=[];
+  if(GF.projectId)chips.push('<span class="gfchip">'+esc(gfProjName(GF.projectId))+' <button data-action="gfClear" data-value="projectId" title="Remove">\\u00d7</button></span>');
+  if(GF.workItemId)chips.push('<span class="gfchip">'+esc(gfWiName(GF.workItemId))+' <button data-action="gfClear" data-value="workItemId" title="Remove">\\u00d7</button></span>');
+  var h='<span class="gfl">\\uD83D\\uDD0E Filter</span>'+rg+cust+'<span class="gfsep"></span>'
+    +'<select id="gfProj" class="sesin" title="Project">'+po+'</select><select id="gfWi" class="sesin" title="Work item">'+wo+'</select>'
+    +chips.join('')+(gfActive()?'<button class="dtab" data-action="gfClear" data-value="all" title="Back to the last 30 days, all projects">Clear</button>':'')
+    +'<span class="gfnote">'+esc(gfRangeLabel())+' \\u00b7 '+esc(note)+'</span>';
+  if(el._h===h)return;
+  el._h=h;el.innerHTML=h;
+  var on=function(id,fn){var x=document.getElementById(id);if(x)x.addEventListener('change',fn);};
+  on('gfProj',function(){gfSet({projectId:this.value});});
+  on('gfWi',function(){gfSet({workItemId:this.value});});
+  on('gfFrom',function(){gfSet({from:this.value});});
+  on('gfTo',function(){gfSet({to:this.value});});
+}
+function gfSet(patch){
+  Object.assign(GF,patch);
+  if(GF.range==='custom'){
+    if(!GF.from&&!GF.to){var d=new Date();GF.to=gfIso(d);d.setDate(d.getDate()-29);GF.from=gfIso(d);}
+    if(GF.from&&GF.to&&GF.from>GF.to){var t=GF.from;GF.from=GF.to;GF.to=t;}
+  }else{GF.from='';GF.to='';}
+  if(patch.projectId!==undefined&&GF.workItemId&&GF.projectId){var p=gfProjOf(GF.workItemId);if(GF.projectId==='__none__'?p:p!==GF.projectId)GF.workItemId='';}
+  if(typeof sesQ!=='undefined')sesQ.offset=0;
+  vscode.postMessage({type:'filter',filter:GF});
+  gfApply();
+}
+function gfApply(){
+  renderFilterBar();
+  var tab=gfActiveTab();
+  if(tab==='timesheet'){renderTimesheet();return;}
+  if(tab==='corrections'){renderCorrections();return;}
+  if(GF_NOTE[tab])showTab(tab);
+}
 
 const fg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-foreground');
 const dfg=()=>getComputedStyle(document.body).getPropertyValue('--vscode-descriptionForeground');
@@ -487,9 +581,7 @@ function aiSplitHtml(){
 // insights and breakdowns from AN.credits (analysis/creditOverview.ts).
 var ovSt=(vscode.getState&&vscode.getState())||{};
 var ovOpen=ovSt.ovOpen||{};
-var ovRange=ovSt.ovRange||'30';
-var ovBd=ovSt.ovBd||'30';
-function ovSave(){if(vscode.setState)vscode.setState(Object.assign({},vscode.getState&&vscode.getState()||{},{ovOpen:ovOpen,ovRange:ovRange,ovBd:ovBd}));}
+function ovSave(){if(vscode.setState)vscode.setState(Object.assign({},vscode.getState&&vscode.getState()||{},{ovOpen:ovOpen}));}
 document.addEventListener('toggle',function(e){var d=e.target;if(d&&d.dataset&&d.dataset.sec){ovOpen[d.dataset.sec]=d.open;ovSave();}},true);
 function ovSec(id,title,meta,body,defOpen){
   var open=ovOpen[id]===undefined?defOpen:ovOpen[id];
@@ -514,7 +606,7 @@ function ovBudgetHtml(C){
   var msg=B.state==='over'?'Over budget by <strong>'+cr(B.used-B.budget)+'</strong> credits.'
     :B.state==='will-exceed'?'At '+cr(B.avgDaily)+' credits a day the budget runs out around <strong>'+fday(B.exceedDate)+'</strong> (projected '+cr(B.projected)+').'
     :'Projected <strong>'+cr(B.projected)+'</strong> credits by the end of the period \\u2014 '+cr(B.budget-B.used)+' left.';
-  return'<div class="bgt"><div class="bgh"><div><div class="kl">Monthly budget</div><div class="kv">'+cr(B.used)+'<small>/ '+cr(B.budget)+' credits \\u00b7 '+usd(B.used)+'</small></div></div>'
+  return'<div class="bgt"><div class="bgh"><div><div class="kl">Monthly budget'+(GF.projectId||GF.workItemId?' \\u00b7 all projects':'')+'</div><div class="kv">'+cr(B.used)+'<small>/ '+cr(B.budget)+' credits \\u00b7 '+usd(B.used)+'</small></div></div>'
     +'<div style="text-align:right;font-size:.82em;color:var(--vscode-descriptionForeground)"><strong style="color:'+col+'">'+B.pct+'%</strong> used \\u00b7 resets '+fday(B.resetDate)+' ('+B.daysLeft+' days)<br><a class="lnk" data-action="cmd" data-value="setMonthlyCreditBudget">Edit budget</a></div></div>'
     +'<div class="ptrack"><div class="pfill" style="width:'+Math.min(100,B.pct)+'%;background:'+col+'"></div><div class="pmark" style="left:'+even.toFixed(1)+'%" title="Even pace: where spend would be today if spread evenly over the period"></div></div>'
     +'<div style="margin-top:8px;font-size:.85em;color:'+col+'">'+msg+'</div></div>';
@@ -545,7 +637,7 @@ function ovCorrHtml(){
 function ovCreditsHtml(){
   var C=AN&&AN.credits;
   if(!C)return'';
-  var anyCredits=(C.breakdown['90'].entries||0)>0||C.period.credits>0;
+  var anyCredits=(C.breakdown['90'].entries||0)>0||C.period.credits>0||(C.breakdown.custom&&C.breakdown.custom.entries>0);
   var P=C.period,endDay=new Date(P.end+'T00:00:00');endDay.setDate(endDay.getDate()-1);
   var periodLbl=fday(P.start)+' \\u2013 '+endDay.toLocaleDateString(undefined,{month:'short',day:'numeric'});
   var head='<div class="kpis">'
@@ -556,13 +648,13 @@ function ovCreditsHtml(){
     +'</div>';
   var ins=(C.insights||[]).length?'<div class="insights">'+C.insights.map(function(i){return'<div class="ins ins-'+i.level+'"><div class="it">'+esc(i.title)+'</div><div class="ib">'+esc(i.body)+'</div></div>';}).join('')+'</div>':'';
   var chart='<div class="card" style="margin-bottom:14px"><div class="chd"><h3 style="margin:0">Daily spend</h3><span id="ovMeta" style="font-size:.8em;color:var(--vscode-descriptionForeground)"></span>'
-    +pills('ovRange',ovRange,[['period','This period'],['30','30 days'],['90','90 days']])+'</div><div class="cw" style="height:220px"><canvas id="cCredits"></canvas></div></div>';
-  var B=C.breakdown[ovBd]||C.breakdown['30'];
+    +'<span style="font-size:.8em;color:var(--vscode-descriptionForeground)">'+esc(gfRangeLabel())+'</span></div><div class="cw" style="height:220px"><canvas id="cCredits"></canvas></div></div>';
+  var B=(GF.range==='all'||GF.range==='custom'?C.breakdown.custom:C.breakdown[GF.range])||C.breakdown['30'];
   var wiTitle=function(id){var w=(WI||[]).find(function(x){return String(x.workItemId)===String(id);});return w&&w.title?w.title:'';};
   var srcLbl={auto:'Automatic capture',manual:'Manual entry',import:'Imported'};
   var wiRows=B.byWorkItem.slice(0,6);
   if(B.unattributed>0)wiRows=wiRows.concat([{key:'',credits:B.unattributed,entries:0}]);
-  var bd='<div class="chd"><span style="font-size:.85em;color:var(--vscode-descriptionForeground)">'+cr(B.total)+' credits \\u00b7 '+usd(B.total)+' \\u00b7 '+B.entries+' entries'+confBadge(B.confidence,'Credits','credits')+'</span>'+pills('ovBd',ovBd,[['period','Period'],['7','7d'],['30','30d'],['90','90d']])+'</div>'
+  var bd='<div class="chd"><span style="font-size:.85em;color:var(--vscode-descriptionForeground)">'+cr(B.total)+' credits \\u00b7 '+usd(B.total)+' \\u00b7 '+B.entries+' entries'+confBadge(B.confidence,'Credits','credits')+'</span><span style="font-size:.8em;color:var(--vscode-descriptionForeground)">'+esc(gfRangeLabel())+'</span></div>'
     +'<div class="bdg">'
     +'<div class="bdc"><h4>By model</h4>'+ovBars(B.byModel,B.total,function(r){var i=C.models.indexOf(r.key);return{text:r.key,color:i>=0&&i<5?OV_COLORS[i]:OV_COLORS[5]};},6)+'</div>'
     +'<div class="bdc"><h4>By work item</h4>'+ovBars(wiRows,B.total,function(r){if(!r.key)return{text:'No work item',muted:true,color:'rgba(128,128,128,.5)'};var t=wiTitle(r.key);return{text:'#'+r.key+(t?' \\u2013 '+t:''),action:'ovWi'};})+'</div>'
@@ -579,11 +671,13 @@ function renderOvChart(){
   dc('credits');
   var C=AN&&AN.credits,cv=document.getElementById('cCredits');
   if(!C||!cv)return;
-  var days=ovRange==='period'?C.daily.filter(function(d){return d.date>=C.period.start;}):C.daily.slice(-(parseInt(ovRange,10)||30));
+  var w=gfWindow();
+  var days=C.daily.filter(function(d){return(!w.from||d.date>=w.from)&&(!w.to||d.date<=w.to);});
+  if(!w.from&&!w.to){var fi=days.findIndex(function(d){return d.credits>0;});days=fi>0?days.slice(fi):days;}
   var ds=C.models.map(function(m,i){return{label:m,data:days.map(function(d){return +(d.byModel[m]||0).toFixed(2);}),backgroundColor:OV_COLORS[Math.min(i,5)],stack:'c',yAxisID:'y',borderRadius:2,order:2};});
   var cum=0,cumData=days.map(function(d){cum+=d.credits;return +cum.toFixed(2);});
   ds.push({label:'Cumulative',type:'line',data:cumData,borderColor:'rgba(244,162,97,.9)',backgroundColor:'rgba(244,162,97,.15)',borderWidth:2,pointRadius:0,tension:.25,yAxisID:'y2',order:1});
-  if(ovRange==='period'&&C.budget)ds.push({label:'Budget',type:'line',data:days.map(function(){return C.budget.budget;}),borderColor:'rgba(244,113,116,.7)',borderDash:[6,4],borderWidth:1.5,pointRadius:0,yAxisID:'y2',order:0});
+  if(GF.range==='period'&&C.budget&&!GF.projectId&&!GF.workItemId)ds.push({label:'Budget',type:'line',data:days.map(function(){return C.budget.budget;}),borderColor:'rgba(244,113,116,.7)',borderDash:[6,4],borderWidth:1.5,pointRadius:0,yAxisID:'y2',order:0});
   var total=days.reduce(function(a,d){return a+d.credits;},0),peak=days.reduce(function(m,d){return d.credits>m.credits?d:m;},{credits:0,date:''});
   var meta=document.getElementById('ovMeta');
   if(meta)meta.textContent=days.length?cr(total)+' credits \\u00b7 '+usd(total)+(peak.credits>0?' \\u00b7 peak '+cr(peak.credits)+' on '+fday(peak.date):''):'';
@@ -601,11 +695,12 @@ function ovConfHtml(){
 }
 function renderOverview(){
   const el=document.getElementById('overview');
-  var sig=JSON.stringify([allData,AN,CFG,currentBranch,ovRange,ovBd,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
+  var sig=JSON.stringify([allData,AN,CFG,currentBranch,GF,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
   if(sig===ovSig&&el.firstChild)return;
   ovSig=sig;
-  const T=allData.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
-  var rows=allData.map(function(d){
+  var OD=allData.filter(function(d){return gfScope('',d.workItemId);});
+  const T=OD.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
+  var rows=OD.map(function(d){
     var tot=tms(d),hp=tot>0?d.humanCodingMs/tot*100:0,ap=tot>0?d.aiGeneratingMs/tot*100:0,rp=tot>0?d.reviewingMs/tot*100:0,isCur=d.branch===currentBranch;
     return '<tr class="'+(isCur?'cur':'')+'" style="cursor:pointer" data-action="detail" data-value="'+d.branch+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+d.branch+'</strong></td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
   }).join('');
@@ -625,7 +720,7 @@ function renderOverview(){
     return'<tr><td title="'+f.path+'" style="font-family:monospace;font-size:.85em">'+p+'</td><td>'+f.edits+'</td><td class="dc">'+pp(f.human,'bp')+'</td><td class="dc">'+pp(f.ai,'ba')+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';
   }).join('')||'<tr><td colspan="5" style="color:var(--vscode-descriptionForeground)">No file edits recorded yet</td></tr>';
   var hot='<table><thead><tr><th>File</th><th>Edits</th><th>Human +</th><th>AI +</th><th>AI %</th></tr></thead><tbody>'+hotRows+'</tbody></table>';
-  var sumF=function(k){return allData.reduce(function(a,d){return a+(d[k]||0);},0);};
+  var sumF=function(k){return OD.reduce(function(a,d){return a+(d[k]||0);},0);};
   var hC=sumF('humanChars'),aC=sumF('aiChars'),ks=sumF('humanKeystrokes'),chC=sumF('chatCharsHuman');
   var nf=function(n){return Math.round(n).toLocaleString();};
   var CPT=4;
@@ -654,36 +749,36 @@ function renderOverview(){
     +'<div class="ovb"><button class="dtab" data-action="cmd" data-value="assignBranchToWorkItem">\\uD83D\\uDD17 Assign Work Item</button><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>';
   el.innerHTML=top+ovCreditsHtml()
     +ovSec('activity','\\u23F1 Activity','this week vs last week \\u00b7 streak \\u00b7 totals',weekK+timeK+'<div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div>',true)
-    +ovSec('branches','\\uD83C\\uDF3F Branches',allData.length+' tracked','<div style="overflow-x:auto"><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
+    +ovSec('branches','\\uD83C\\uDF3F Branches',(OD.length===allData.length?OD.length:OD.length+' of '+allData.length)+' tracked','<div style="overflow-x:auto"><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
     +ovCorrHtml()
     +ovSec('hotspots','\\uD83D\\uDD25 Most-edited files',tf.length?tf.length+' files':'','<div style="overflow-x:auto">'+hot+'</div>',false)
     +ovSec('keys','\\u2328\\ufe0f Keystrokes vs AI \\u00b7 token estimate','',kt,false);
   renderOvChart();
-  var labels=allData.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
+  var labels=OD.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
   dc('bar');
-  charts.bar=new Chart(document.getElementById('cBar'),{type:'bar',data:{labels:labels,datasets:[{label:'Human',data:allData.map(function(d){return Math.round(d.humanCodingMs/60000);}),backgroundColor:'rgba(78,201,176,.7)'},{label:'AI Gen',data:allData.map(function(d){return Math.round(d.aiGeneratingMs/60000);}),backgroundColor:'rgba(197,134,192,.7)'},{label:'Review',data:allData.map(function(d){return Math.round(d.reviewingMs/60000);}),backgroundColor:'rgba(220,220,170,.7)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()}}}}});
+  charts.bar=new Chart(document.getElementById('cBar'),{type:'bar',data:{labels:labels,datasets:[{label:'Human',data:OD.map(function(d){return Math.round(d.humanCodingMs/60000);}),backgroundColor:'rgba(78,201,176,.7)'},{label:'AI Gen',data:OD.map(function(d){return Math.round(d.aiGeneratingMs/60000);}),backgroundColor:'rgba(197,134,192,.7)'},{label:'Review',data:OD.map(function(d){return Math.round(d.reviewingMs/60000);}),backgroundColor:'rgba(220,220,170,.7)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()}}}}});
   dc('ai');
-  charts.ai=new Chart(document.getElementById('cAi'),{type:'bar',data:{labels:labels,datasets:[{label:'AI %',data:allData.map(function(d){return aiPct(d);}),backgroundColor:allData.map(function(d){return aiPct(d)>50?'rgba(197,134,192,.8)':'rgba(78,201,176,.8)';}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:dfg()},grid:{color:gc}},y:{ticks:{color:dfg()},grid:{color:gc},max:100,title:{display:true,text:'%',color:dfg()}}}}});
+  charts.ai=new Chart(document.getElementById('cAi'),{type:'bar',data:{labels:labels,datasets:[{label:'AI %',data:OD.map(function(d){return aiPct(d);}),backgroundColor:OD.map(function(d){return aiPct(d)>50?'rgba(197,134,192,.8)':'rgba(78,201,176,.8)';}),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:dfg()},grid:{color:gc}},y:{ticks:{color:dfg()},grid:{color:gc},max:100,title:{display:true,text:'%',color:dfg()}}}}});
 }
 
-var trendRange=30;
 function renderTrends(){
   var el=document.getElementById('trends');
   var all=AN.daily||[];
-  var days=all.slice(-trendRange);
+  var tw=gfWindow();
+  var days=all.filter(function(d){return(!tw.from||d.date>=tw.from)&&(!tw.to||d.date<=tw.to);});
+  if(!tw.from&&!tw.to){var tfi=days.findIndex(function(d){return(d.humanCoding+d.aiGenerating+d.reviewing+d.linesHuman+d.linesAi)>0;});days=tfi>0?days.slice(tfi):days;}
   var sum=days.reduce(function(a,d){return{h:a.h+d.humanCoding,ai:a.ai+d.aiGenerating,r:a.r+d.reviewing,lh:a.lh+d.linesHuman,la:a.la+d.linesAi};},{h:0,ai:0,r:0,lh:0,la:0});
   var activeMs=sum.h+sum.ai+sum.r;
   var activeDays=days.filter(function(d){return(d.humanCoding+d.aiGenerating+d.reviewing)>0;}).length;
   var avgMs=activeDays>0?activeMs/activeDays:0;
   var totLines=sum.lh+sum.la;
-  var rngBtns=[7,30,90].map(function(n){return'<button class="dtab '+(n===trendRange?'active':'')+'" data-action="rng" data-value="'+n+'">'+n+'d</button>';}).join('');
-  el.innerHTML='<div class="rng">'+rngBtns+'</div>'
+  el.innerHTML=''
     +'<div class="card" id="calCard" style="margin-bottom:16px"></div>'
     +'<div class="sg">'
-    +sc('Active Time ('+trendRange+'d)',fmt(activeMs),'var(--review)')
+    +sc('Active Time ('+gfRangeLabel()+')',fmt(activeMs),'var(--review)')
     +sc('Daily Average',fmt(avgMs),'var(--human)')
     +sc('Active Days',String(activeDays),'var(--vscode-foreground)')
-    +sc('Lines ('+trendRange+'d)','+'+totLines,'var(--ai)')
+    +sc('Lines ('+gfRangeLabel()+')','+'+totLines,'var(--ai)')
     +'</div>'
     +'<div class="card" style="margin-top:8px"><h3>Daily Activity &mdash; Human vs AI vs Review</h3><div class="cw" style="height:240px"><canvas id="cTrend"></canvas></div></div>'
     +'<div class="card" style="margin-top:16px"><h3>\\uD83E\\uDD16 AI Dependency Trend &mdash; AI % of lines per day</h3><div class="cw" style="height:200px"><canvas id="cTrendAi"></canvas></div></div>'
@@ -1164,7 +1259,8 @@ function renderLedger(){
     el.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div><div class="card"><p style="color:var(--vscode-descriptionForeground)">No credit entries yet. Use \\u201cAdd Entry\\u201d to record one.</p></div>';
     return;
   }
-  var rows=LEDGER.map(function(e){
+  var LV=LEDGER.filter(function(e){return gfInTs(e.ts)&&gfScope(e.projectId,e.workItemId);});
+  var rows=(LV.length?LV:[]).map(function(e){
     var when=new Date(e.ts).toLocaleString();
     var attr=e.branch?esc(e.branch):'\\u2014';
     if(e.workItemId)attr+=' <span class="badge ba">#'+esc(e.workItemId)+'</span>';
@@ -1178,8 +1274,8 @@ function renderLedger(){
     return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td style="white-space:nowrap">'+Number(e.credits).toFixed(1)+cfRowBadge(e)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
   var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'
-    +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.</p>'+cfLegend()
-    +'<div class="card"><table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+    +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.'+(LV.length!==LEDGER.length?' Showing '+LV.length+' of '+LEDGER.length+' entries.':'')+'</p>'+cfLegend()
+    +'<div class="card">'+(LV.length?'':'<p style="color:var(--vscode-descriptionForeground)">No entries match the filter.</p>')+'<table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
   if(html===ledHtml&&el.querySelector('table'))return;
   ledHtml=html;
   el.innerHTML=html;
@@ -1398,10 +1494,11 @@ function showTab(name){
   else if(name==='health'){document.getElementById('tab-health').classList.add('active');requestHealth();}
   else if(name==='corrections'){document.getElementById('tab-corrections').classList.add('active');requestCorrections();}
   else{document.getElementById('dtab').classList.add('active');}
+  renderFilterBar();
 }
 
-var OPT=null,optDays=30,optWi='',optProj='',optLoading=false;
-function requestOptimize(){optLoading=true;renderOptimize();vscode.postMessage({type:'optimize',days:optDays,workItemId:optWi||undefined,projectId:optProj||undefined});}
+var OPT=null,optLoading=false;
+function requestOptimize(){optLoading=true;renderOptimize();vscode.postMessage(Object.assign({type:'optimize'},gfQuery()));}
 function n2(v){return(Math.round((v||0)*100)/100).toLocaleString();}
 function sevBadge(s){var c=s==='high'?'bd':s==='medium'?'ba':'bh';return'<span class="badge '+c+'">'+esc(s)+'</span>';}
 function optTable(head,rows,empty){
@@ -1410,13 +1507,7 @@ function optTable(head,rows,empty){
 }
 function renderOptimize(){
   var el=document.getElementById('optimize');
-  var wiOpts=['<option value="">All work items</option>'].concat((WI||[]).map(function(w){
-    return'<option value="'+esc(w.workItemId)+'"'+(w.workItemId===optWi?' selected':'')+'>'+esc('#'+w.workItemId+(w.title?' \\u2013 '+w.title:''))+'</option>';
-  })).join('');
-  var ctl='<div class="rng">'+[7,30,90].map(function(d){return'<button class="dtab'+(d===optDays?' active':'')+'" data-action="optDays" data-value="'+d+'">'+d+' days</button>';}).join('')
-    +'<select id="optProj" style="margin-left:8px;background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px">'+['<option value="">All projects</option>'].concat((PROJ||[]).map(function(p){return'<option value="'+esc(p.projectId)+'"'+(p.projectId===optProj?' selected':'')+'>'+esc(p.name)+'</option>';})).join('')+'</select>'
-    +'<select id="optWi" style="margin-left:8px;background:var(--vscode-dropdown-background);color:var(--vscode-dropdown-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px">'+wiOpts+'</select>'
-    +'<button class="dtab" data-action="optRefresh" style="margin-left:8px">\\u21bb Refresh</button></div>';
+  var ctl='<div class="rng">'+'<button class="dtab" data-action="optRefresh">\\u21bb Refresh</button></div>';
   var tip='<p style="margin-bottom:16px;font-size:.85em;color:var(--vscode-descriptionForeground)">Based on Copilot debug logs (models, tokens, cache, tools). Savings are list-price <strong>estimates</strong>. Ask Copilot in agent mode, e.g. <em>\\u201cUse the AI Effort Tracker usage insights to tell me how to use fewer credits\\u201d</em> \\u2013 the <strong>AI Effort Tracker usage insights</strong> MCP server gives it this data.</p>';
   if(!OPT){el.innerHTML=ctl+tip+'<p>'+(optLoading?'Analysing\\u2026':'No data yet.')+'</p>';bindOptWi();return;}
   if(OPT.error){el.innerHTML=ctl+tip+'<p style="color:var(--deleted)">'+esc(OPT.error)+'</p>';bindOptWi();return;}
@@ -1445,10 +1536,7 @@ function renderOptimize(){
     +'<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">'+esc(o.dataCoverage.note)+' Timing captured for '+o.dataCoverage.withTimingPct+'% of calls.</p>';
   bindOptWi();
 }
-function bindOptWi(){
-  var s=document.getElementById('optWi');if(s)s.addEventListener('change',function(){optWi=this.value;requestOptimize();});
-  var p=document.getElementById('optProj');if(p)p.addEventListener('change',function(){optProj=this.value;requestOptimize();});
-}
+function bindOptWi(){}
 // #99 Model efficiency per task type: heat map (green = cheapest in the row).
 function renderEfficiency(ef){
   if(!ef||!ef.tasks||!ef.tasks.length)return'<div class="card"><h3>Model efficiency by task type</h3><p>No turns with debug-log data in this period.</p></div>';
@@ -1481,7 +1569,7 @@ function renderToolProfile(tp){
     return'<tr><td>'+esc(s.server)+'</td><td title="'+esc(s.reason)+'">'+badge[s.recommendation]+'</td><td>'+s.toolsOffered+'</td><td>'+s.offeredInPct+'%</td><td title="'+esc(s.usedTools.join(', '))+'">'+s.usedTools.length+'</td><td>'+s.calls+(s.failed?' <span class="badge bd">'+s.failed+' failed</span>':'')+'</td><td>'+(s.approxTokens/1000).toFixed(1)+'K</td><td>'+esc(s.lastUsed?s.lastUsed.slice(0,10):'never')+'</td></tr>';
   });
   var kpi='<div class="sg">'+sc('Keep',String(tp.keep.length),'var(--added)')+sc('Disable',String(tp.disable.length),'var(--deleted)')+sc('Tokens saved / request','\u2248 '+(tp.tokensSavedPerRequest/1000).toFixed(1)+'K')+sc('Credits saved','\u2248 '+n2(tp.estimatedCreditsSaved),'var(--cost)')+'</div>';
-  return'<div class="card"><h3>Tool-set profile'+(optProj||optWi?' (filtered)':'')+'</h3><p style="font-size:.82em;color:var(--vscode-descriptionForeground);margin-bottom:8px">Tool definitions are sent with every request. Servers that were offered but never called in this scope are candidates to switch off in the chat \u201cConfigure Tools\u201d picker (or a tool set / per-workspace mcp.json). Credits saved = same requests without those definitions (list-price estimate).</p>'
+  return'<div class="card"><h3>Tool-set profile'+(GF.projectId||GF.workItemId?' (filtered)':'')+'</h3><p style="font-size:.82em;color:var(--vscode-descriptionForeground);margin-bottom:8px">Tool definitions are sent with every request. Servers that were offered but never called in this scope are candidates to switch off in the chat \u201cConfigure Tools\u201d picker (or a tool set / per-workspace mcp.json). Credits saved = same requests without those definitions (list-price estimate).</p>'
     +kpi+optTable(['Server','Recommendation','Tools','Offered in','Tools used','Calls','Definitions','Last used'],rows,'No servers')
     +(tp.disable.length?'<p style="margin-top:8px;font-size:.85em"><strong>Minimal set:</strong> '+esc(tp.keep.join(', '))+'</p>':'')+'</div>';
 }
@@ -1495,6 +1583,9 @@ function renderTimesheet(){
   if(!TS){el.innerHTML='<p>'+(tsLoading?'Loading\u2026':'No data yet.')+'</p>';return;}
   if(TS.error){el.innerHTML='<p style="color:var(--deleted)">'+esc(TS.error)+'</p>';return;}
   var s=TS.sheet;tsWeek=s.weekStart;tsRound=s.rounding;
+  if(GF.projectId||GF.workItemId){var vr=s.rows.filter(function(r){return gfScope(r.projectId,r.workItemId==='__unassigned__'?'':r.workItemId);});
+    var dt=[0,0,0,0,0,0,0];vr.forEach(function(r){r.cells.forEach(function(h,i){dt[i]+=h;});});
+    s=Object.assign({},s,{rows:vr,dayTotals:dt,total:vr.reduce(function(n,r){return n+r.total;},0),rawTotal:vr.reduce(function(n,r){return n+(r.rawTotal!=null?r.rawTotal:r.total);},0)});}
   var names=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
   var projName=function(id){if(!id)return'';var p=(PROJ||[]).find(function(x){return x.projectId===id||x.id===id;});return p?(p.name||id):id;};
   var ro=[['none','Exact'],['0.25','\u00bc h'],['0.5','\u00bd h']].map(function(o){return'<button class="dtab'+(s.rounding===o[0]?' active':'')+'" data-action="tsRound" data-value="'+o[0]+'">'+o[1]+'</button>';}).join('');
@@ -1575,6 +1666,9 @@ function corrItem(i){
     +sug+corrDiff(i)+'</div>';
 }
 function corrVisible(e){
+  if(!gfInTs(e.start))return false;
+  if(GF.workItemId&&String(e.workItemId||'')!==GF.workItemId)return false;
+  if(GF.projectId&&!GF.workItemId&&!gfScope('',e.workItemId))return false;
   if(corrSrc!=='all'&&e.source!==corrSrc)return false;
   if(corrFilter==='todo')return e.items.some(function(i){return!i.category;});
   if(corrFilter==='lessons')return e.items.some(function(i){return corrIsLesson(i.category);});
@@ -1749,15 +1843,14 @@ document.addEventListener('change',function(e){
 });
 
 // #97/#98 Estimates tab: accuracy of finished work items + suggestions for open ones.
-var EST=null,estLoading=false,estProj='';
-function requestEstimates(){estLoading=true;renderEstimates();vscode.postMessage({type:'estimates',projectId:estProj||undefined});}
+var EST=null,estLoading=false;
+function requestEstimates(){estLoading=true;renderEstimates();vscode.postMessage({type:'estimates',projectId:GF.projectId||undefined,workItemId:GF.workItemId||undefined});}
 function estFactor(f){if(f==null)return'\\u2014';var c=Math.abs(f-1)<=0.2?'var(--added)':f>1?'var(--deleted)':'var(--review)';return'<span style="color:'+c+'">'+f.toFixed(2)+'\\u00d7</span>';}
 function estRange(r){return r?(r.median+' h <span style="font-size:.8em;color:var(--vscode-descriptionForeground)">('+r.low+'\\u2013'+r.high+')</span>'):'\\u2014';}
 function estGroupRows(list,label){return list.map(function(g){return'<tr><td>'+esc(label?label(g.key):g.key)+'</td><td>'+g.count+'</td><td>'+estFactor(g.medianFactor)+'</td><td>'+g.withinPct+'%</td><td>'+g.overPct+'%</td><td>'+g.underPct+'%</td><td>'+g.meanAbsErrorPct+'%</td></tr>';});}
 function renderEstimates(){
   var el=document.getElementById('estimates');
-  var projOpts=['<option value="">All projects</option>'].concat((PROJ||[]).map(function(p){return'<option value="'+esc(p.projectId)+'"'+(p.projectId===estProj?' selected':'')+'>'+esc(p.name)+'</option>';})).join('');
-  var ctl='<div class="rng"><select id="estProj" class="sesin">'+projOpts+'</select><button class="dtab" data-action="estRefresh" style="margin-left:8px">\\u21bb Refresh</button></div>';
+  var ctl='<div class="rng"><button class="dtab" data-action="estRefresh">\\u21bb Refresh</button></div>';
   var info='<p style="margin:10px 0;font-size:.85em;color:var(--vscode-descriptionForeground)">A work item counts as <strong>finished</strong> when you mark it done (\\u2713 on the work item) or when it has had no tracked time or credits for 14 days. <strong>Factor</strong> = actual \\u00f7 estimate: 1.00\\u00d7 is spot on, 1.40\\u00d7 took 40% longer. Actual = active tracked time (coding + AI + review, incl. manual entries). Suggestions come from finished items with similar titles or the same project.</p>';
   if(!EST){el.innerHTML=ctl+info+'<p>'+(estLoading?'Analysing\\u2026':'No data yet.')+'</p>';bindEst();return;}
   if(EST.error){el.innerHTML=ctl+info+'<p style="color:var(--deleted)">'+esc(EST.error)+'</p>';bindEst();return;}
@@ -1794,12 +1887,12 @@ function renderEstimates(){
       options:{responsive:true,maintainAspectRatio:false,scales:{y:{position:'left',title:{display:true,text:'factor'}},y1:{position:'right',min:0,max:100,grid:{drawOnChartArea:false}}}}});}
   }
 }
-function bindEst(){var s=document.getElementById('estProj');if(s)s.addEventListener('change',function(){estProj=this.value;requestEstimates();});}
+function bindEst(){}
 
 // #95 Sessions tab: all chat sessions with titles, filters, sorting, paging, CSV.
 var SES=null,sesLoading=false,sesOpen={},sesDet={};
-var sesQ={days:30,from:'',to:'',workItemId:'',branch:'',model:'',minCredits:0,lowOutputOnly:false,sort:'end',descending:true,offset:0,limit:50};
-function sesMsg(type){return Object.assign({type:type},sesQ);}
+var sesQ={branch:'',model:'',minCredits:0,lowOutputOnly:false,sort:'end',descending:true,offset:0,limit:50};
+function sesMsg(type){return Object.assign({type:type},sesQ,gfQuery());}
 function requestSessions(){sesLoading=true;renderSessions();vscode.postMessage(sesMsg('sessions'));}
 function sesSelect(id,first,items,val){
   return'<select id="'+id+'" class="sesin"><option value="">'+esc(first)+'</option>'+items.map(function(o){return'<option value="'+esc(o[0])+'"'+(o[0]===val?' selected':'')+'>'+esc(o[1])+'</option>';}).join('')+'</select>';
@@ -1822,12 +1915,8 @@ function sesDetailHtml(id){
 }
 function renderSessions(){
   var el=document.getElementById('sessions');
-  var wiItems=(WI||[]).map(function(w){return[w.workItemId,'#'+w.workItemId+(w.title?' \\u2013 '+w.title:'')];});
   var S=SES&&!SES.error?SES:{rows:[],total:0,offset:0,totals:{credits:0,turns:0,lowOutput:0},models:[],branches:[],titles:{}};
   var ctl='<div class="rng" style="flex-wrap:wrap;gap:6px;align-items:center">'
-    +[7,30,90,365].map(function(d){return'<button class="dtab'+(!sesQ.from&&d===sesQ.days?' active':'')+'" data-action="sesDays" data-value="'+d+'">'+(d===365?'1 year':d+' days')+'</button>';}).join('')
-    +' <label>From <input type="date" id="sesFrom" class="sesin" value="'+esc(sesQ.from)+'"></label><label>To <input type="date" id="sesTo" class="sesin" value="'+esc(sesQ.to)+'"></label>'
-    +sesSelect('sesWi','All work items',wiItems,sesQ.workItemId)
     +sesSelect('sesBranch','All branches',S.branches.map(function(b){return[b,b];}),sesQ.branch)
     +sesSelect('sesModel','All models',S.models.map(function(m){return[m,m];}),sesQ.model)
     +'<label>Min credits <input type="number" min="0" step="1" id="sesMin" class="sesin" style="width:70px" value="'+(sesQ.minCredits||'')+'"></label>'
@@ -1859,9 +1948,6 @@ function renderSessions(){
 }
 function bindSes(){
   var on=function(id,fn){var n=document.getElementById(id);if(n)n.addEventListener('change',function(){fn(this);sesQ.offset=0;requestSessions();});};
-  on('sesFrom',function(n){sesQ.from=n.value;});
-  on('sesTo',function(n){sesQ.to=n.value;});
-  on('sesWi',function(n){sesQ.workItemId=n.value;});
   on('sesBranch',function(n){sesQ.branch=n.value;});
   on('sesModel',function(n){sesQ.model=n.value;});
   on('sesMin',function(n){sesQ.minCredits=parseFloat(n.value)||0;});
@@ -1905,10 +1991,12 @@ window.addEventListener('message',function(e){
     else if(av&&av.id==='ledger')renderLedger();
     else if(av&&av.id==='timesheet')requestTimesheet();
     else if(av&&av.id==='detail'){var dt=document.getElementById('dtab');if(dt&&dt.dataset.branch)showDetail(dt.dataset.branch);}
+    renderFilterBar();
   }
 });
 
 renderOverview();
+renderFilterBar();
 // Wire up tab buttons (CSP blocks inline onclick — use addEventListener instead)
 document.getElementById('tab-overview').addEventListener('click',function(){showTab('overview');});
 document.getElementById('tab-trends').addEventListener('click',function(){showTab('trends');});
@@ -1934,12 +2022,9 @@ document.addEventListener('click',function(e){
   if(a==='detail')showDetail(v);
   else if(a==='tab'){if(t.dataset.rate)corrFilter='rate';showTab(v);}
   else if(a==='ds')showDS(v,t);
-  else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
   else if(a==='calMetric'){calMetric=v;renderCalendar();}
   else if(a==='calDay'){calSel=v||null;renderCalendar();}
-  else if(a==='optDays'){optDays=parseInt(v,10)||30;requestOptimize();}
   else if(a==='optRefresh')requestOptimize();
-  else if(a==='sesDays'){sesQ.days=parseInt(v,10)||30;sesQ.from='';sesQ.to='';sesQ.offset=0;requestSessions();}
   else if(a==='sesRefresh')requestSessions();
   else if(a==='sesCsv')vscode.postMessage(sesMsg('sessionsCsv'));
   else if(a==='sesSort'){if(sesQ.sort===v)sesQ.descending=!sesQ.descending;else{sesQ.sort=v;sesQ.descending=true;}sesQ.offset=0;requestSessions();}
@@ -1949,8 +2034,8 @@ document.addEventListener('click',function(e){
   else if(a==='wi'){selWi=v;projView='workitem';renderProjectsView();}
   else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
-  else if(a==='ovRange'){ovRange=v;ovSave();renderOverview();}
-  else if(a==='ovBd'){ovBd=v;ovSave();renderOverview();}
+  else if(a==='gfRange'){gfSet({range:v});}
+  else if(a==='gfClear'){if(v==='all')gfSet({range:'30',projectId:'',workItemId:''});else{var gp={};gp[v]='';gfSet(gp);}}
   else if(a==='ovWi'){selWi=String(v);projView='workitem';showTab('projects');}
   else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
@@ -2026,6 +2111,7 @@ vscode.postMessage({type:'ready'});`;
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
     '</div>',
+    '<div id="gf" class="gf"></div>',
     '<div id="overview" class="view active"></div>',
     '<div id="trends" class="view"></div>',
     '<div id="focus" class="view"></div>',
