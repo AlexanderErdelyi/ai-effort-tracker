@@ -37,6 +37,7 @@ import { GitHubService, BillingUsage } from './services/githubService';
 import { registerUsageInsightsMcp } from './mcp/provider';
 import { handleSessionsMessage } from './ui/sessionsPanel';
 import { handleSettingsMessage } from './ui/settingsPanel';
+import { maybeShowWalkthrough, runSetup, runStep, updateSetupContext, type SetupDeps } from './ui/setupWizard';
 import { SENIORITY_PRESETS } from './util/settingsModel';
 import { BudgetMonitor } from './ui/budgetMonitor';
 import { AwayController } from './ui/awayPrompt';
@@ -60,6 +61,7 @@ let chatSessionUsageTracker: ChatSessionUsageTracker;
 let creditImportTracker: CreditImportTracker;
 let debugLogUsageTracker: DebugLogUsageTracker;
 let db: Database;
+let setupDeps: SetupDeps | undefined;
 let statusBar: StatusBarManager;
 let dashboardPanel: vscode.WebviewPanel | undefined;
 let pendingOpenWorkItem: string | undefined;
@@ -167,6 +169,8 @@ const KNOWN_MODELS = [
 export function activate(context: vscode.ExtensionContext) {
   db = new Database(context.globalStorageUri.fsPath);
   ghService.useSecrets(context.secrets);
+  const setup: SetupDeps = { context, db, gh: ghService, getRepoId: () => GitTracker.getRepoId(), refresh: () => refreshDashboard() };
+  setupDeps = setup;
   statusBar = new StatusBarManager();
   timeTracker = new TimeTracker(db, statusBar);
   gitTracker = new GitTracker(db, timeTracker);
@@ -464,6 +468,18 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand('aiEffortTracker.createProject', () => createProject()),
     vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
+    // #144: guided setup hub + the walkthrough's step commands.
+    vscode.commands.registerCommand('aiEffortTracker.runSetup', () => runSetup(setup)),
+    vscode.commands.registerCommand('aiEffortTracker.setup.rates', () => runStep(setup, 'rates')),
+    vscode.commands.registerCommand('aiEffortTracker.setup.credits', () => runStep(setup, 'credits')),
+    vscode.commands.registerCommand('aiEffortTracker.setup.categoryRules', () => runStep(setup, 'categories')),
+    vscode.commands.registerCommand('aiEffortTracker.setup.project', () => runStep(setup, 'project')),
+    vscode.commands.registerCommand('aiEffortTracker.setup.githubToken', async () => {
+      if (await runStep(setup, 'token')) {
+        try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
+        refreshDashboard();
+      }
+    }),
     vscode.commands.registerCommand('aiEffortTracker.createWorkItem', () => createWorkItem()),
     vscode.commands.registerCommand('aiEffortTracker.editWorkItem', () => editWorkItem()),
     vscode.commands.registerCommand('aiEffortTracker.assignWorkItemToProject', (workItemId?: string) => assignWorkItemToProject(workItemId)),
@@ -559,6 +575,11 @@ export function activate(context: vscode.ExtensionContext) {
   try { registerUsageInsightsMcp(context); } catch (error) {
     console.error('AI Effort Tracker: MCP server registration failed', error);
   }
+  // #144: walkthrough check marks follow the real configuration.
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+    if (e.affectsConfiguration('aiEffortTracker')) void updateSetupContext(setup);
+  }));
+  void updateSetupContext(setup).then(() => maybeShowWalkthrough(setup));
 }
 
 export function deactivate() {
@@ -1559,6 +1580,7 @@ async function createProject() {
   } else {
     vscode.window.showInformationMessage(`Project "${project.name}" created. (No repository detected to link.)`);
   }
+  if (setupDeps) void updateSetupContext(setupDeps);
   refreshDashboard();
 }
 
@@ -1590,6 +1612,7 @@ async function linkRepoToProject() {
   if (!picked) return;
   db.linkRepoToProject(picked.id, repoId);
   vscode.window.showInformationMessage(`Linked this repo to "${db.getProject(picked.id)?.name ?? picked.id}".`);
+  if (setupDeps) void updateSetupContext(setupDeps);
   refreshDashboard();
 }
 

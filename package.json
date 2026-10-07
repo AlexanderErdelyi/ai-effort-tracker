@@ -208,6 +208,30 @@
         "title": "AI Effort Tracker: Link Current Repo to Project"
       },
       {
+        "command": "aiEffortTracker.runSetup",
+        "title": "AI Effort Tracker: Run Setup"
+      },
+      {
+        "command": "aiEffortTracker.setup.rates",
+        "title": "AI Effort Tracker: Setup – Currency and Hourly Rates"
+      },
+      {
+        "command": "aiEffortTracker.setup.credits",
+        "title": "AI Effort Tracker: Setup – Copilot Plan and Credit Budget"
+      },
+      {
+        "command": "aiEffortTracker.setup.categoryRules",
+        "title": "AI Effort Tracker: Setup – Detect Category Rules"
+      },
+      {
+        "command": "aiEffortTracker.setup.project",
+        "title": "AI Effort Tracker: Setup – Project and Repository"
+      },
+      {
+        "command": "aiEffortTracker.setup.githubToken",
+        "title": "AI Effort Tracker: Set GitHub Token (Secure Storage)"
+      },
+      {
         "command": "aiEffortTracker.createWorkItem",
         "title": "AI Effort Tracker: Create Work Item"
       },
@@ -357,6 +381,110 @@
         "command": "aiEffortTracker.review.openRange",
         "title": "Review: Open Lines",
         "category": "AI Effort Tracker"
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "aiEffortTracker.setup",
+        "title": "Set up AI Effort Tracker",
+        "description": "Profile, rates, Copilot credits, category rules and your first project in about two minutes.",
+        "steps": [
+          {
+            "id": "restore",
+            "title": "Restore from a backup (optional)",
+            "description": "Moving to a new machine? Bring back projects, work items, credits and settings from a backup file. Skip this on a fresh start.\n[Restore backup](command:aiEffortTracker.restoreBackup)",
+            "media": {
+              "markdown": "media/walkthrough/restore.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.restoreBackup",
+              "onContext:aiEffortTracker.setup.restoreDone"
+            ]
+          },
+          {
+            "id": "profile",
+            "title": "Developer profile",
+            "description": "Pick junior, mid or senior. The level pre-fills your hand-coding baseline (lines per minute), which values the time AI saves. You can adjust the number.\n[Set profile](command:aiEffortTracker.setDeveloperProfile)",
+            "media": {
+              "markdown": "media/walkthrough/profile.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.setDeveloperProfile",
+              "onContext:aiEffortTracker.setup.profileDone"
+            ]
+          },
+          {
+            "id": "rates",
+            "title": "Currency and hourly rates",
+            "description": "Set what an hour costs you and what it is sold for. Projects can override these later.\n[Set rates](command:aiEffortTracker.setup.rates)",
+            "media": {
+              "markdown": "media/walkthrough/rates.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.setup.rates",
+              "onContext:aiEffortTracker.setup.ratesDone"
+            ]
+          },
+          {
+            "id": "credits",
+            "title": "Copilot plan and credit budget",
+            "description": "Your Copilot plan pre-fills the monthly AI credit budget, renewal day and cost per credit.\n[Set plan and budget](command:aiEffortTracker.setup.credits)",
+            "media": {
+              "markdown": "media/walkthrough/credits.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.setup.credits",
+              "onContext:aiEffortTracker.setup.creditsDone"
+            ]
+          },
+          {
+            "id": "categories",
+            "title": "Category rules",
+            "description": "Scan this workspace and map file types and folders to programming, specification, documentation, deployment or translation.\n[Detect rules](command:aiEffortTracker.setup.categoryRules)",
+            "media": {
+              "markdown": "media/walkthrough/categories.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.setup.categoryRules",
+              "onContext:aiEffortTracker.setup.categoriesDone"
+            ]
+          },
+          {
+            "id": "project",
+            "title": "Project and repository",
+            "description": "Create a project and link this repository, so effort on every branch rolls up to the project and its work items.\n[Set up project](command:aiEffortTracker.setup.project)",
+            "media": {
+              "markdown": "media/walkthrough/project.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.setup.project",
+              "onContext:aiEffortTracker.setup.projectDone"
+            ]
+          },
+          {
+            "id": "token",
+            "title": "GitHub token (optional)",
+            "description": "Needed for real Copilot billing and metrics. Kept in VS Code secure storage.\n[Set token](command:aiEffortTracker.setup.githubToken)",
+            "media": {
+              "markdown": "media/walkthrough/token.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.setup.githubToken",
+              "onContext:aiEffortTracker.setup.tokenDone"
+            ]
+          },
+          {
+            "id": "finish",
+            "title": "Open the dashboard",
+            "description": "All done. Everything here can be changed later in Dashboard → ⚙ Settings, or by running **AI Effort Tracker: Run Setup**.\n[Open dashboard](command:aiEffortTracker.showSummary)\n[Run guided setup](command:aiEffortTracker.runSetup)",
+            "media": {
+              "markdown": "media/walkthrough/finish.md"
+            },
+            "completionEvents": [
+              "onCommand:aiEffortTracker.showSummary"
+            ]
+          }
+        ]
       }
     ],
     "mcpServerDefinitionProviders": [

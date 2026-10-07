@@ -18,7 +18,7 @@
 
 ## Usage
 
-1. Install the extension in VS Code
+1. Install the extension in VS Code. On a fresh install the **Get Started** walkthrough opens (see [Setup wizard](#setup-wizard))
 2. It auto-starts tracking on launch
 3. Click the status bar item (`⌨️ Coding`) or run **AI Effort Tracker: Show Session Summary**
 4. At end of a feature branch, export the report via **AI Effort Tracker: Export Report (JSON)**
@@ -28,6 +28,7 @@
 | Command | Description |
 |---------|-------------|
 | `AI Effort Tracker: Show Session Summary` | Open webview summary for current branch |
+| `AI Effort Tracker: Run Setup` | Guided setup: profile, rates, Copilot plan, category rules, project and token (see [Setup wizard](#setup-wizard)) |
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
@@ -55,6 +56,22 @@ Every setting can be changed in the dashboard's **⚙ Settings** tab (see [Setti
 | `aiEffortTracker.credits.monthlyBudget` | `0` | Monthly Copilot credit budget for the Overview pace card (0 = off) |
 | `aiEffortTracker.credits.renewalDay` | `1` | Day of the month the credit budget period renews (1–31) |
 | `aiEffortTracker.lessons.*` | | Thresholds for repeated lessons, export folder and review skill (see [Rules for Copilot](#rules-for-copilot)) |
+
+## Setup wizard
+
+Run **AI Effort Tracker: Run Setup** (or **🧭 Run setup** on the dashboard's Settings tab). A list of steps opens; pick one, finish it, and you come back to the list. Every step can be skipped and run again later, and the list shows which ones are done.
+
+| Step | What it does |
+|------|--------------|
+| Restore from a backup *(optional)* | For a new machine: restores a backup file |
+| Developer profile | Junior, mid or senior preset for lines per minute, which you can override |
+| Currency and hourly rates | Currency, hourly cost and hourly sell rate (projects can override them) |
+| Copilot plan and credit budget | Your plan pre-fills the monthly AI credit budget and the cost per credit (plan price ÷ credits, e.g. Pro $10 ÷ 1,000 = $0.01). Also asks for the renewal day |
+| Category rules | Scans the workspace and proposes rules for file types counted as *Other* and for folders such as `docs/`, `specs/`, `infra/`, `translations/` |
+| Project and repository | Creates a project (or picks one) and links the open repository |
+| GitHub token *(optional)* | Stores a token in VS Code secure storage |
+
+The same steps make up the **Get Started → Set up AI Effort Tracker** walkthrough. It opens once on a fresh install, and its check marks follow your settings. Open it again with **Help → Welcome** or the wizard's *Open the Get Started walkthrough* entry. The wizard never deletes data; it only writes settings, creates projects and links repos.
 
 ## Settings tab
 

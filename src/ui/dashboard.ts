@@ -1738,7 +1738,7 @@ function renderSettings(){
   }).join('');
   var mod=all.filter(function(s){return !s.isDefault&&s.kind!=='secret';}).length,ovr=all.filter(function(s){return s.overriddenBy;}).length;
   var ctl='<div class="rng"><input id="set-q" class="sesin" type="search" placeholder="Search settings\u2026" aria-label="Search settings" value="'+esc(setQ)+'" style="min-width:220px">'+chips
-    +'<span style="flex:1"></span><button class="dtab btn-sm" data-action="setOpenUi" title="Open the same settings in the VS Code Settings editor">Open in VS Code Settings</button></div>';
+    +'<span style="flex:1"></span><button class="dtab btn-sm" data-action="cmd" data-value="runSetup" title="Guided setup: profile, rates, Copilot plan, category rules, project and token">\u{1F9ED} Run setup</button><button class="dtab btn-sm" data-action="setOpenUi" title="Open the same settings in the VS Code Settings editor">Open in VS Code Settings</button></div>';
   var note='<p class="t-md muted mb3">Changes are saved to your <strong>user</strong> settings and apply immediately. '+mod+' changed from the default'+(ovr?' \u00b7 <span class="c-cost">'+ovr+' overridden by this workspace</span>':'')+'.</p>';
   var shown=list.filter(function(s){return !setGrp||s.group===setGrp;});
   var body=groups.filter(function(g){return !setGrp||g===setGrp;}).map(function(g){
