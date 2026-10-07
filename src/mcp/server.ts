@@ -19,6 +19,7 @@ import { DEFAULT_LESSON_CATEGORIES, labelDelta, NON_LESSON_CATEGORIES } from '..
 import { CorrectionStore } from '../store/correctionStore';
 import { decodeLessonStore, emptyLessonStore, findRules, lessonGroups, LESSONS_FILE, proposeRuleDelta } from '../analysis/lessons';
 import { LessonStore } from '../store/lessonStore';
+import { correctionRateReport, correctionTrackingSince, rateInputsFromStore } from '../analysis/correctionRate';
 import { changedFilesSync, contentAtSync, resolveReviewBaseSync } from '../review/reviewGit';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
@@ -254,6 +255,23 @@ export const TOOLS = [
         repo: { type: 'string', description: 'Workspace folder name; rules of other repositories are left out.' },
         includeProposed: { type: 'boolean', description: 'Also rules still waiting for the developer\'s approval.' },
         includeCandidates: { type: 'boolean', description: 'Also repeated lessons without a rule.' }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'correction_rate',
+    title: 'Correction rate of AI-written code',
+    description: 'Is the AI getting better? Share of AI-written lines that were corrected later (by the developer or a rework prompt), as corrected lines per 100 AI lines: per week, category (with trend), work item and project, '
+      + 'plus every approved rule\'s rate before vs after approval and the estimated rework time. Requirement changes, progress updates and "not a lesson" do not count; unlabelled corrections do. '
+      + 'Use it to see which kinds of mistakes keep coming back and whether the rules from get_lessons work.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        weeks: { type: 'integer', minimum: 1, maximum: 104, description: 'Weeks in the weekly series (default 12).' },
+        trendWeeks: { type: 'integer', minimum: 1, maximum: 26, description: 'Recent weeks compared with the same span before (default 4).' },
+        workItemId: { type: 'string', description: 'Only this work item.' },
+        projectId: { type: 'string', description: 'Only work items of this project.' }
       },
       additionalProperties: false
     }
@@ -569,6 +587,25 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       if (!rules.length) out.note = lessons.rules.length
         ? 'No approved rules match. Rules are approved by the developer in the Corrections tab (Rules).'
         : 'No rules yet. They are created from labelled corrections in the dashboard\'s Corrections tab, or proposed with propose_rule.';
+      return out;
+    }
+    case 'correction_rate': {
+      const int = (v: unknown, lo: number, hi: number) => {
+        if (v === undefined) return undefined;
+        if (typeof v !== 'number' || !Number.isInteger(v) || v < lo || v > hi) throw new Error(`Expected an integer from ${lo} to ${hi}.`);
+        return v;
+      };
+      const str = (v: unknown) => typeof v === 'string' && v.trim() ? v.trim() : undefined;
+      const corrections = loadCorrectionStore();
+      const catRules = sanitizeRules(record(loadSnapshotFile(CATEGORY_RULES_SNAPSHOT_FILE)?.rules) as never);
+      const inputs = rateInputsFromStore(data.branches as never, data.workItems as never, rel => categorizeWith(rel, catRules) === 'translation');
+      const report = correctionRateReport(corrections.corrections, inputs.aiDays, loadLessonStore().rules, {
+        ...inputs, since: correctionTrackingSince(corrections),
+        weeks: int(args.weeks, 1, 104), trendWeeks: int(args.trendWeeks, 1, 26),
+        workItemId: str(args.workItemId), projectId: str(args.projectId)
+      });
+      const out: Json = { ...report, since: report.since ? new Date(report.since).toISOString() : null } as unknown as Json;
+      if (!report.total.corrections) out.note = 'No corrections captured yet (or none for this filter). They are recorded when AI-written code is changed later.';
       return out;
     }
     case 'propose_rule': {

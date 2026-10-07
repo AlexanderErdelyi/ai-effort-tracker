@@ -15,6 +15,7 @@ import { CorrectionStore } from './store/correctionStore';
 import { LessonStore } from './store/lessonStore';
 import { createRule, GENERATED_MARKER, lessonGroups, updateRule, writeLessonExport, rulesForRepo, type LessonRule, type RulePatch, type RuleStatus } from './analysis/lessons';
 import { correctionsMarkdown, listCorrections } from './analysis/corrections';
+import { correctionRateReport, correctionTrackingSince, type CorrectionRateReport } from './analysis/correctionRate';
 import { acceptSuggestionsDelta, correctionsView, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta } from './analysis/correctionLabels';
 import { Database } from './store/database';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
@@ -94,6 +95,7 @@ function getAnalytics() {
     topFiles: db.getTopFiles(12),
     timeline: db.getTodayTimeline(),
     credits: getCreditOverview(),
+    corrections: correctionRateOverview(),
   };
 }
 
@@ -548,7 +550,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
   const initialNet = await GitTracker.getNetLineChange();
   if (initialNet) db.seedEffectiveLinesFromGit(initialNet.branch, initialNet.byCategory);
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withReview(db.getAllWorkItemSummaries()), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(), db.getManualEffort(), db.getReassignments(), initialNet);
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
@@ -626,7 +628,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       analytics: getAnalytics(),
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
-      workItemSummaries: withReview(db.getAllWorkItemSummaries()),
+      workItemSummaries: withRework(withReview(db.getAllWorkItemSummaries())),
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
       reassignments: db.getReassignments(),
@@ -2565,6 +2567,44 @@ async function assignWorkItemToProject(workItemId?: string) {
   refreshDashboard();
 }
 
+/** Correction rate (#130), recomputed at most every 30 seconds or when corrections/rules change. */
+let rateMemo: { key: unknown[]; report: CorrectionRateReport } | undefined;
+function correctionRate(): CorrectionRateReport | undefined {
+  if (!correctionStore) return undefined;
+  const data = correctionStore.load();
+  const lessons = lessonStore?.load();
+  const key = [data, lessons, Math.floor(Date.now() / 30_000)];
+  if (rateMemo && rateMemo.key.every((k, i) => k === key[i])) return rateMemo.report;
+  const inputs = db.getCorrectionRateInputs();
+  const report = correctionRateReport(data.corrections, inputs.aiDays, lessons?.rules ?? [], {
+    ...inputs, since: correctionTrackingSince(data)
+  });
+  rateMemo = { key, report };
+  return report;
+}
+
+/** Overview card (#130): headline rate, trend and top categories; undefined until something was corrected. */
+function correctionRateOverview() {
+  const r = correctionRate();
+  if (!r || !r.total.corrections) return undefined;
+  return {
+    since: r.since, total: r.total, recent: r.recent, previous: r.previous, trendWeeks: r.trendWeeks,
+    weeks: r.weeks.slice(-8).map(w => ({ week: w.week, rate: w.rate, aiLines: w.aiLines, correctedLines: w.correctedLines })),
+    categories: r.categories.slice(0, 6)
+  };
+}
+
+/** Work item ROI (#130): estimated rework time and corrected AI lines per work item. */
+function withRework<T extends { workItemId: string }>(list: T[]): (T & { rework?: unknown })[] {
+  const r = correctionRate();
+  if (!r) return list;
+  const by = new Map(r.workItems.map(g => [g.key, g]));
+  return list.map(w => {
+    const g = by.get(w.workItemId);
+    return g ? { ...w, rework: { ms: g.reworkMs, episodes: g.episodes, corrections: g.corrections, correctedLines: g.correctedLines, aiLines: g.aiLines, rate: g.rate } } : w;
+  });
+}
+
 /** Corrections tab (#132): captured corrections with labels and suggestions, plus rules (#133). */
 function correctionsPayload() {
   const cfg = vscode.workspace.getConfiguration('aiEffortTracker.corrections');
@@ -2585,7 +2625,8 @@ function correctionsPayload() {
       groups: lessonGroups(data.corrections, lessonRules, { minOccurrences: lcfg.get<number>('minOccurrences'), minWorkItems: lcfg.get<number>('minWorkItems') }),
       minOccurrences: lcfg.get<number>('minOccurrences') ?? 3,
       minWorkItems: lcfg.get<number>('minWorkItems') ?? 2
-    }
+    },
+    rate: correctionRate()
   };
 }
 
@@ -2842,7 +2883,7 @@ function refreshDashboard() {
       analytics: getAnalytics(),
       billing: lastBilling,
       projectSummaries: db.getAllProjectSummaries(),
-      workItemSummaries: withReview(db.getAllWorkItemSummaries()),
+      workItemSummaries: withRework(withReview(db.getAllWorkItemSummaries())),
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
       reassignments: db.getReassignments(),

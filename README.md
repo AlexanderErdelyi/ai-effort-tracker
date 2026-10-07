@@ -258,6 +258,7 @@ or *"Analyse my usage for work item 1987"*. All tools are read-only except
 | `label_correction` | Labels corrections (by `ids` or a whole `episodeId`) with a category, an optional `scope` glob and a `note`, only when you ask; an empty category removes the label (writes corrections only) |
 | `get_lessons` | Approved rules learned from corrections, filtered by `path` (rules whose scope matches the file) and `repo`; `includeProposed`, and `includeCandidates` for repeated lessons without a rule |
 | `propose_rule` | Proposes a rule (`category`, `scope`, `text`, optional `correctionIds`, `repo`) that waits for your approval in the Rules view (writes lessons only) |
+| `correction_rate` | Correction rate of AI code per week, category, work item and project, and each approved rule's effect; optional `weeks`, `trendWeeks`, `workItemId`, `projectId` (see [Correction rate](#correction-rate-is-copilot-getting-better)) |
 
 All tools accept `days`, `from`, `to`, `branch`, `workItemId`, `projectId` and
 `sessionId` filters. The server only reads the tracker's store. Prompt excerpts
@@ -561,6 +562,33 @@ The export also writes the agent skill **lessons-review** (`aiEffortTracker.less
 `personal` = `~/.copilot/skills`, `workspace` = `.github/skills`, or `off`). Ask
 Copilot to "review my changes against the lessons": it reads the rules for each changed
 file with `get_lessons` and reports violations (and flags them as review issues if you ask).
+
+### Correction rate: is Copilot getting better?
+
+The **📈 Rate** filter of the Corrections tab shows the correction rate: AI-written
+lines that you or a rework prompt changed later, per 100 AI lines written. Lower is
+better. Requirement changes, progress updates and "not a lesson" do not count;
+unlabelled corrections do. AI lines leave out translation files, like the productivity
+metrics, and include short lines that corrections do not follow, so the rate is a lower
+bound.
+
+- KPIs for the last 4 weeks, the 4 weeks before, everything since capture started, and
+  the rework time.
+- Per week: AI lines, corrected lines, rate, your own corrections, episodes, rework
+  time and top categories.
+- Per category with a trend (up, down, flat, new, gone) between the last 4 weeks and
+  the 4 weeks before.
+- Rules before vs after approval: the rate of corrections in each rule's category and
+  scope since approval vs the same span before. Wait at least a week before judging, and
+  label the corrections in its scope to keep the comparison fair. The same line is shown
+  under each approved rule.
+- Per work item and per project.
+
+Rework time is estimated per correction episode: from the rework prompt (or first edit)
+to the last edit, 1 to 30 minutes. The work item ROI shows it as **Rework** with its
+cost (hours × the project's cost rate, or the sell rate). The Overview has a collapsible
+**🔁 Corrections of AI code** section with the same summary. Copilot can read the
+report through the MCP tool `correction_rate`.
 
 ## Development
 
