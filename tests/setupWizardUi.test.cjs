@@ -17,7 +17,7 @@ const vscodeMock = {
   ConfigurationTarget: T,
   QuickPickItemKind: { Separator: -1 },
   ProgressLocation: { Notification: 15 },
-  workspace: { getConfiguration: () => cfg, workspaceFolders: [{ uri: { fsPath: 'C:\\src\\My App' } }] },
+  workspace: { getConfiguration: () => cfg, workspaceFolders: [{ uri: { fsPath: '/src/My App' } }] },
   window: {
     showInputBox: async o => { const v = inputs.shift(); if (typeof v === 'function') return v(o); return v; },
     showQuickPick: async (items) => { const f = picks.shift(); return f ? f(items) : undefined; },
