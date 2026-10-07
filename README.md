@@ -1,5 +1,7 @@
 # AI Effort Tracker
 
+[![CI](https://github.com/AlexanderErdelyi/ai-effort-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderErdelyi/ai-effort-tracker/actions/workflows/ci.yml)
+
 > VS Code extension that tracks **human vs AI effort**, time, and estimated cost per branch / work item.
 
 ## What it tracks
@@ -633,6 +635,17 @@ npm install
 npm run watch
 # Press F5 in VS Code to launch Extension Development Host
 ```
+
+Checks (the same ones CI runs on Ubuntu and Windows for every push and pull request):
+
+```bash
+npm run compile
+npm run lint
+npm test              # compiles, then runs every tests/*.test.cjs
+npm test -- backup    # only test files whose name contains "backup"
+```
+
+CI also packages the extension and keeps the `.vsix` as a build artifact for 14 days.
 
 ## Roadmap
 
