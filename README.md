@@ -406,6 +406,25 @@ category (Code, Docs, Specs, …), and every branch and work item you touched, w
 links to their details. Step to the previous or next active day from there.
 Per-category lines are recorded from version 0.36.0 on; older days show totals only.
 
+## How sure is each number?
+
+Totals mix figures captured in different ways, so key numbers carry a small
+marker. Hover it to see the split behind the number.
+
+| Marker | Meaning |
+| --- | --- |
+| ● Exact | Measured: tracked time, lines counted edit by edit, or the real per-request credit charge. |
+| ◐ Mixed | Part measured, part estimated or entered by hand. |
+| ○ Estimated | Estimated: credits from token counts, credits from a debug log with unpriced calls (a lower bound), or lines inferred from history recorded before line-level tracking. |
+| ✎ Manual | Entered or corrected by hand: manual credits, manual effort, time log entries and time corrections. |
+
+A number is Exact, Estimated or Manual when at least 98% of it is that kind;
+otherwise it is Mixed. ROI, invoice value and profit inherit the markers of the
+time and credits they are computed from. Moving a branch to another work item
+does not change the marker, but the tooltip notes the move because the branch's
+tracked time moves with it. Markers appear on the Overview (credits and the
+activity totals), on project and work item details, and on every Credit Ledger row.
+
 ## Away detection
 
 When you come back to VS Code after being away (idle, another app, a meeting,

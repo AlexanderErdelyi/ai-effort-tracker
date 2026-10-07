@@ -93,6 +93,13 @@ export function renderDashboardHtml(
   .st.tip{cursor:help;}
   .st .lbl .ti{opacity:.55;text-transform:none;}
   .st .val{font-size:1.4em;font-weight:700;letter-spacing:-.02em;}
+  .cf{display:inline-block;margin-left:4px;cursor:help;text-transform:none;font-weight:400;letter-spacing:0;}
+  .cf-exact{color:var(--added);}
+  .cf-mixed{color:var(--cost);}
+  .cf-estimated{color:var(--vscode-descriptionForeground);}
+  .cf-manual{color:var(--review);}
+  .cfl{font-size:.78em;color:var(--vscode-descriptionForeground);margin:4px 0 12px;}
+  .cfl .cf{margin:0 2px 0 0;}
   .ovh{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px;}
   .ovt{font-size:1.25em;font-weight:600;}
   .ovb{display:flex;gap:6px;flex-wrap:wrap;}
@@ -237,6 +244,25 @@ function insights(d){
 function fmtMin(m){if(m>=60)return(m/60).toFixed(1)+'h';if(m<=0)return'0m';return m.toFixed(0)+'m';}
 function sc(lbl,val,color,tip){return'<div class="st'+(tip?' tip':'')+'"'+(tip?' title="'+esc(tip)+'"':'')+'><div class="lbl">'+lbl+(tip?' <span class="ti">\\u24D8</span>':'')+'</div><div class="val" style="color:'+(color||'inherit')+'">'+val+'</div></div>';}
 function tH(x){return x==null?'\\u2014':(Math.round(x*100)/100)+'h';}
+// Data confidence markers (issue #143). Levels and splits are computed in
+// analysis/confidence.ts; these only render them.
+var CF_SYM={exact:'\\u25CF',mixed:'\\u25D0',estimated:'\\u25CB',manual:'\\u270E'};
+var CF_NAME={exact:'Exact',mixed:'Mixed',estimated:'Estimated',manual:'Manual'};
+var CF_HINT={exact:'measured',mixed:'part measured, part estimated or entered by hand',estimated:'estimated, not measured',manual:'entered or corrected by hand'};
+function cfVal(v,unit){if(unit==='ms')return fmt(v);if(unit==='credits')return cr(v)+' credits';return Math.round(v).toLocaleString()+' lines';}
+function cfTip(c,what,unit){
+  var t=what+': '+CF_NAME[c.level]+' ('+CF_HINT[c.level]+')';
+  if(c.inputs&&c.inputs.length)t+='\\nBased on: '+c.inputs.map(function(i){return i.label+' '+CF_NAME[i.level].toLowerCase();}).join(', ');
+  (c.parts||[]).forEach(function(p){t+='\\n\\u2022 '+p.label+': '+cfVal(p.value,unit)+(c.total>0?' ('+Math.round(p.value/c.total*100)+'%)':'');});
+  if(c.note)t+='\\n'+c.note;
+  return t;
+}
+function confBadge(c,what,unit){if(!c||!c.level||c.level==='none')return'';return'<span class="cf cf-'+c.level+'" title="'+esc(cfTip(c,what,unit))+'">'+CF_SYM[c.level]+'</span>';}
+function cfLegend(){return'<div class="cfl">'+['exact','mixed','estimated','manual'].map(function(k){return'<span class="cf cf-'+k+'">'+CF_SYM[k]+'</span>'+CF_NAME[k].toLowerCase();}).join(' \\u00b7 ')+' \\u2014 hover a marker to see how the number was captured</div>';}
+// Mirrors creditKind() in analysis/confidence.ts for single ledger rows.
+function cfKind(e){var d=e.debugUsage;if(e.source==='manual'||(d&&d.creditsOverridden))return'manual';if(e.exact===true)return'exact';if(d)return(d.unpricedRequests>0||d.logWarnings>0)?'partial':'exact';return'estimated';}
+var CF_ROW={exact:['exact','Exact: the real per-request charge'],partial:['estimated','Partial: some model calls had no charge, so this is a lower bound'],estimated:['estimated','Estimated from token counts and model rates'],manual:['manual','Entered or adjusted by hand']};
+function cfRowBadge(e){var r=CF_ROW[cfKind(e)];return'<span class="cf cf-'+r[0]+'" title="'+esc(r[1])+'">'+CF_SYM[r[0]]+'</span>';}
 function tR(v,cur){return v==null?'not set':fmtMoney(v,cur)+'/h';}
 var RATES_HINT='Rates come from the project (\\u270E Edit Rates).';
 function aiSpendTip(R,credits,cur){
@@ -525,7 +551,7 @@ function ovCreditsHtml(){
   var head='<div class="kpis">'
     +kpi('Today',cr(C.today)+'<small>credits</small>',usd(C.today)+' \\u00b7 '+dSpend(C.today,C.yesterday,'yesterday'))
     +kpi('Last 7 days',cr(C.last7)+'<small>credits</small>',usd(C.last7)+' \\u00b7 '+dSpend(C.last7,C.prev7,'prior 7 days'))
-    +kpi('This period',cr(P.credits)+'<small>credits</small>',periodLbl+' \\u00b7 '+dSpend(P.credits,P.prevCredits,'same point last period'))
+    +kpi('This period'+confBadge(C.breakdown.period&&C.breakdown.period.confidence,'Credits this period','credits'),cr(P.credits)+'<small>credits</small>',periodLbl+' \\u00b7 '+dSpend(P.credits,P.prevCredits,'same point last period'))
     +kpi('Avg per active day',cr(C.avgPerActiveDay)+'<small>credits</small>',C.activeDays30+' active day'+(C.activeDays30===1?'':'s')+' in the last 30')
     +'</div>';
   var ins=(C.insights||[]).length?'<div class="insights">'+C.insights.map(function(i){return'<div class="ins ins-'+i.level+'"><div class="it">'+esc(i.title)+'</div><div class="ib">'+esc(i.body)+'</div></div>';}).join('')+'</div>':'';
@@ -536,7 +562,7 @@ function ovCreditsHtml(){
   var srcLbl={auto:'Automatic capture',manual:'Manual entry',import:'Imported'};
   var wiRows=B.byWorkItem.slice(0,6);
   if(B.unattributed>0)wiRows=wiRows.concat([{key:'',credits:B.unattributed,entries:0}]);
-  var bd='<div class="chd"><span style="font-size:.85em;color:var(--vscode-descriptionForeground)">'+cr(B.total)+' credits \\u00b7 '+usd(B.total)+' \\u00b7 '+B.entries+' entries</span>'+pills('ovBd',ovBd,[['period','Period'],['7','7d'],['30','30d'],['90','90d']])+'</div>'
+  var bd='<div class="chd"><span style="font-size:.85em;color:var(--vscode-descriptionForeground)">'+cr(B.total)+' credits \\u00b7 '+usd(B.total)+' \\u00b7 '+B.entries+' entries'+confBadge(B.confidence,'Credits','credits')+'</span>'+pills('ovBd',ovBd,[['period','Period'],['7','7d'],['30','30d'],['90','90d']])+'</div>'
     +'<div class="bdg">'
     +'<div class="bdc"><h4>By model</h4>'+ovBars(B.byModel,B.total,function(r){var i=C.models.indexOf(r.key);return{text:r.key,color:i>=0&&i<5?OV_COLORS[i]:OV_COLORS[5]};},6)+'</div>'
     +'<div class="bdc"><h4>By work item</h4>'+ovBars(wiRows,B.total,function(r){if(!r.key)return{text:'No work item',muted:true,color:'rgba(128,128,128,.5)'};var t=wiTitle(r.key);return{text:'#'+r.key+(t?' \\u2013 '+t:''),action:'ovWi'};})+'</div>'
@@ -569,6 +595,10 @@ function renderOvChart(){
         y2:{beginAtZero:true,position:'right',ticks:{color:dfg()},grid:{drawOnChartArea:false},title:{display:true,text:'cumulative',color:dfg()}}}}});
 }
 var ovSig='';
+function ovConfHtml(){
+  var A=AN&&AN.confidence;if(!A)return'';
+  return'<div class="cfl">Data confidence: time '+(confBadge(A.time,'Active time','ms')||'\\u2014')+' \\u00b7 lines '+(confBadge(A.lines,'Lines','lines')||'\\u2014')+' \\u00b7 credits '+(confBadge(A.credits,'Credits','credits')||'\\u2014')+' \\u2014 \\u25CF exact \\u00b7 \\u25D0 mixed \\u00b7 \\u25CB estimated \\u00b7 \\u270E manual; hover a marker for the split</div>';
+}
 function renderOverview(){
   const el=document.getElementById('overview');
   var sig=JSON.stringify([allData,AN,CFG,currentBranch,ovRange,ovBd,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
@@ -619,7 +649,7 @@ function renderOverview(){
     +'</div>'
     +aiSplitHtml()
     +'<p style="margin-top:8px;font-size:.78em;color:var(--vscode-descriptionForeground)">Token estimates use a ~'+CPT+'-chars-per-token heuristic on inserted text \\u2014 a rough proxy for prompt/output size, not billed credits.</p>';
-  var timeK='<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div>';
+  var timeK='<div class="sg"><div class="st"><div class="lbl">\\u2328\\ufe0f Human Coding</div><div class="val" style="color:var(--human)">'+fmt(T.human)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI Generating</div><div class="val" style="color:var(--ai)">'+fmt(T.ai)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDC40 Reviewing</div><div class="val" style="color:var(--review)">'+fmt(T.review)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCB0 Est. Cost</div><div class="val" style="color:var(--cost)">$'+T.cost.toFixed(4)+'</div></div></div>'+ovConfHtml();
   var top='<div class="ovh"><div><div class="ovt">Overview</div><div class="sub" style="margin:2px 0 0">Copilot credits, time and code across every branch</div></div>'
     +'<div class="ovb"><button class="dtab" data-action="cmd" data-value="assignBranchToWorkItem">\\uD83D\\uDD17 Assign Work Item</button><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>';
   el.innerHTML=top+ovCreditsHtml()
@@ -973,12 +1003,14 @@ function renderProjectDetail(){
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
   var roi=(!isNone&&p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
   var repos=(!isNone&&p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+  var PCF=(!isNone&&p.confidence)||null;
+  function PC(k,what,unit){return PCF?confBadge(PCF[k],what,unit):'';}
   var setRates=isNone?'':'<button class="dtab" data-action="ratesSet" data-id="'+esc(p.projectId)+'" title="Edit this project\\u2019s rates">\\u270E Edit Rates</button>';
   el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'
     +'<div class="sg"><div class="st"><div class="lbl">Project</div><div class="val" style="font-size:.95em;word-break:break-word">'+name+'</div></div>'
-    +'<div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(act)+'</div></div>'
-    +'<div class="st"><div class="lbl">Credits</div><div class="val" style="color:var(--cost)">'+credits.toFixed(1)+'</div></div>'
-    +'<div class="st"><div class="lbl">ROI Net</div><div class="val">'+roi+'</div></div></div>'
+    +'<div class="st"><div class="lbl">Active Time'+PC('time','Time','ms')+'</div><div class="val">'+fmt(act)+'</div></div>'
+    +'<div class="st"><div class="lbl">Credits'+PC('credits','Credits','credits')+'</div><div class="val" style="color:var(--cost)">'+credits.toFixed(1)+'</div></div>'
+    +'<div class="st"><div class="lbl">ROI Net'+PC('roi','ROI','ms')+'</div><div class="val">'+roi+'</div></div></div>'+(PCF?cfLegend():'')
     +translationSummaryHtml(p)
     +'<p class="sub" style="margin:12px 0 6px">Repos: '+repos+'</p>'
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
@@ -1071,6 +1103,7 @@ function renderWorkItemDetail(){
   var I=insights(w);
   var T=wiTips(w,I);
   var G=w.generated||{};
+  var WC=w.confidence||{};
   var genH=(typeof G.equivalentHours==='number')?(Math.round(G.equivalentHours*100)/100):null;
   var genNote=(genH==null)?'':' <span style="color:var(--vscode-descriptionForeground);font-size:.75em">\\u2248 '+genH+'h generated</span>';
   var est=w.estimate!=null?(w.estimate+' '+(w.estimateUnit||'hours')):ROI_NONE;
@@ -1084,22 +1117,23 @@ function renderWorkItemDetail(){
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
     +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div style="font-size:.78em;color:var(--vscode-descriptionForeground)">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
     +'<div class="st tip" title="'+esc(T.estimate)+'"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
-    +sc('Actual',fmt(activeMsOf(w)),'inherit',T.actual)
-    +sc('Net ROI / AI gain',fmtMoney(I.netGain,I.currency),moneyColor(I.netGain),T.netGain)+'</div>'
+    +sc('Actual'+confBadge(WC.time,'Time','ms'),fmt(activeMsOf(w)),'inherit',T.actual)
+    +sc('Net ROI / AI gain'+confBadge(WC.roi,'ROI','ms'),fmtMoney(I.netGain,I.currency),moneyColor(I.netGain),T.netGain)+'</div>'
     +'<div class="sg" style="margin-top:4px">'
-    +sc('Invoice value',fmtMoney(I.invoiceValue,I.currency),moneyColor(I.invoiceValue),T.invoice)
-    +sc('Profit',fmtMoney(I.profit,I.currency),moneyColor(I.profit),T.profit)
-    +sc('Actual hrs',(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h')+genNote,'var(--human)',T.actualHrs)
+    +sc('Invoice value'+confBadge(WC.roi,'Invoice value','ms'),fmtMoney(I.invoiceValue,I.currency),moneyColor(I.invoiceValue),T.invoice)
+    +sc('Profit'+confBadge(WC.roi,'Profit','ms'),fmtMoney(I.profit,I.currency),moneyColor(I.profit),T.profit)
+    +sc('Actual hrs'+confBadge(WC.time,'Time','ms'),(I.actualHours==null?ROI_NONE:(Math.round(I.actualHours*100)/100)+'h')+genNote,'var(--human)',T.actualHrs)
     +sc('Billable hrs',(I.billableHours==null?ROI_NONE:(Math.round(I.billableHours*100)/100)+'h'),'var(--ai)',T.billable)
-    +sc('Generated value',fmtMoney(G.generatedValue,I.currency),moneyColor(G.generatedValue),T.generated)
+    +sc('Generated value'+confBadge(WC.lines,'Lines','lines'),fmtMoney(G.generatedValue,I.currency),moneyColor(G.generatedValue),T.generated)
     +'</div>'
     +'<div class="sg" style="margin-top:4px">'
     +sc('AI Share',aiPctOf(w)+'%','var(--ai)',T.aiShare)
-    +sc('Credits',(w.creditsTotal||0).toFixed(1),'var(--cost)',T.credits)
-    +sc('AI Spend',fmtMoney(I.aiCost,I.currency),'var(--cost)',T.aiSpend)
+    +sc('Credits'+confBadge(WC.credits,'Credits','credits'),(w.creditsTotal||0).toFixed(1),'var(--cost)',T.credits)
+    +sc('AI Spend'+confBadge(WC.credits,'AI spend (from credits)','credits'),fmtMoney(I.aiCost,I.currency),'var(--cost)',T.aiSpend)
     +sc('Time Saved',fmtMin(I.timeSavedMin),I.timeSavedMin>=0?'var(--added)':'var(--deleted)',T.timeSaved)
     +reworkStat(w,I)
     +'</div>'
+    +(w.confidence?cfLegend():'')
     +manualSplitHtml(w,T)
     +budgetCardHtml(w,I.currency)
     +reviewCardHtml(w)
@@ -1141,10 +1175,10 @@ function renderLedger(){
     if(e.debugUsage)src+='<span class="badge bp" title="'+Number(e.credits).toFixed(6)+' ledger credits">'+(e.debugUsage.creditsOverridden?'manually adjusted':e.debugUsage.unpricedRequests?'partial: '+e.debugUsage.unpricedRequests+' unpriced':'recorded')+'</span>';
     if(e.debugUsage&&e.debugUsage.logWarnings)src+='<span class="badge bd">log warnings</span>';
     var dbtn=e.analysis?'<button class="dtab" data-action="ledDetail" data-id="'+esc(e.id)+'" title="Deep analysis \\u2014 lines, tools, token cost">\\uD83D\\uDD0D</button> ':'';
-    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td>'+Number(e.credits).toFixed(1)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
+    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td style="white-space:nowrap">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td style="white-space:nowrap">'+Number(e.credits).toFixed(1)+cfRowBadge(e)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td style="white-space:nowrap">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
   var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'
-    +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.</p>'
+    +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.</p>'+cfLegend()
     +'<div class="card"><table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
   if(html===ledHtml&&el.querySelector('table'))return;
   ledHtml=html;

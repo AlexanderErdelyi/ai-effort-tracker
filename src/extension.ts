@@ -100,6 +100,7 @@ function getAnalytics() {
     topFiles: db.getTopFiles(12),
     timeline: db.getTodayTimeline(),
     credits: getCreditOverview(),
+    confidence: db.getConfidence(),
     corrections: correctionRateOverview(),
   };
 }
