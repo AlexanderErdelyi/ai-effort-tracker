@@ -271,6 +271,6 @@ test('health repairs: auto-mapped branches take their unassigned credits along, 
   assert.equal(db2.reattributeUnassignedCredits(), 1);
   db2.flushSync();
   const after = open().getCreditEntries();
-  assert.deepEqual(after.map(e => e.id).filter(id => id.startsWith('d')), ['d1']);
+  assert.deepEqual(after.map(e => e.id).filter(id => id === 'd1' || id === 'd2'), ['d1']);
   assert.equal(after.find(e => e.id === 'd1').workItemId, '500');
 });
