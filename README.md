@@ -695,6 +695,12 @@ npm test -- backup    # only test files whose name contains "backup"
 
 CI also packages the extension and keeps the `.vsix` as a build artifact for 14 days.
 
+Dashboard styling (`src/ui/dashboard.ts`) uses a small design system so every tab looks the same in light, dark and high-contrast themes:
+
+- **Tokens** in `:root`: `--muted`, `--border`, `--surface`, `--good`/`--warn`/`--bad`/`--info`, spacing `--sp1..5`, radii `--r-sm/--r/--r-lg` and font sizes `--fs-xs..lg`. They map onto VS Code theme variables, so prefer them over raw `--vscode-*` names.
+- **Classes** instead of inline styles: `muted`, `t-sm`, `mt2`, `hbar`, `c-ai`/`c-human`/`c-cost`, buttons `dtab` (`btn-sm`, `primary`) and badges `b-good`/`b-warn`/`b-bad`/`b-info`/`b-muted`.
+- **States**: `emptyState(title, hint)` and `loadingState(label)` in the webview script, and `<tr class="empty-row">` for empty tables. Columns where every cell is a number are right-aligned automatically.
+
 ## Roadmap
 
 - [ ] Azure DevOps work item API integration (fetch title, story points)
