@@ -92,6 +92,7 @@ function getAnalytics() {
   return {
     daily: db.getDailySeries(90),
     heatmap: db.getHourHeatmap(),
+    calendar: db.getCalendar(),
     focus: db.getFocusStats(goal),
     streak: db.getStreak(),
     week: db.getWeekComparison(),

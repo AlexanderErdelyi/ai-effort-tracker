@@ -3,6 +3,7 @@ import { CATEGORY_LABELS } from '../util/fileTypes';
 import type { CopilotMetrics, BillingUsage } from '../services/githubService';
 import type { NetLineChange } from '../trackers/gitTracker';
 import type { CreditOverview } from '../analysis/creditOverview';
+import type { CalendarData } from '../analysis/calendar';
 
 export interface InsightsConfig {
   baselineLocPerMinute: number;
@@ -25,6 +26,7 @@ export interface DashboardAnalytics {
   topFiles?: { path: string; human: number; ai: number; edits: number; total: number; aiShare: number; lastTs: number }[];
   timeline?: { humanCoding: number[]; aiGenerating: number[]; reviewing: number[] };
   credits?: CreditOverview;
+  calendar?: CalendarData;
 }
 
 export function renderDashboardHtml(
@@ -154,6 +156,22 @@ export function renderDashboardHtml(
   .sesin{background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-dropdown-border);padding:2px 6px;}
   select.sesin{max-width:240px;text-overflow:ellipsis;}
   .hm{display:grid;grid-template-columns:auto repeat(24,1fr);gap:2px;font-size:.7em;}
+  .calw{overflow-x:auto;padding-bottom:4px;}
+  .cal{display:grid;gap:3px;font-size:.68em;min-width:640px;}
+  .cal .cml{color:var(--vscode-descriptionForeground);white-space:nowrap;overflow:visible;}
+  .cal .cwl{color:var(--vscode-descriptionForeground);padding-right:4px;line-height:1;align-self:center;}
+  .cal-c{aspect-ratio:1;border-radius:2px;cursor:pointer;background:rgba(128,128,128,.12);border:1px solid transparent;padding:0;}
+  .cal-c.l1{background:color-mix(in srgb,var(--calc) 30%,transparent);}
+  .cal-c.l2{background:color-mix(in srgb,var(--calc) 52%,transparent);}
+  .cal-c.l3{background:color-mix(in srgb,var(--calc) 75%,transparent);}
+  .cal-c.l4{background:var(--calc);}
+  .cal-c:hover{border-color:var(--vscode-foreground);}
+  .cal-c.sel{border-color:var(--vscode-focusBorder);outline:1px solid var(--vscode-focusBorder);}
+  .cal-c:focus-visible{outline:2px solid var(--vscode-focusBorder);}
+  body.vscode-high-contrast .cal-c,body.vscode-high-contrast-light .cal-c{border-color:var(--vscode-contrastBorder,#6fc3df);}
+  .calk{display:flex;align-items:center;gap:3px;font-size:.75em;color:var(--vscode-descriptionForeground);}
+  .calk .cal-c{width:10px;cursor:default;}
+  .cald{margin-top:14px;padding-top:12px;border-top:1px solid var(--vscode-panel-border);}
   .hm .hc{width:100%;padding-top:100%;border-radius:2px;position:relative;background:rgba(128,128,128,.08);}
   .hm .hl{color:var(--vscode-descriptionForeground);display:flex;align-items:center;justify-content:flex-end;padding-right:6px;}
   .hm .hh{color:var(--vscode-descriptionForeground);text-align:center;font-size:.9em;}
@@ -630,6 +648,7 @@ function renderTrends(){
   var totLines=sum.lh+sum.la;
   var rngBtns=[7,30,90].map(function(n){return'<button class="dtab '+(n===trendRange?'active':'')+'" data-action="rng" data-value="'+n+'">'+n+'d</button>';}).join('');
   el.innerHTML='<div class="rng">'+rngBtns+'</div>'
+    +'<div class="card" id="calCard" style="margin-bottom:16px"></div>'
     +'<div class="sg">'
     +sc('Active Time ('+trendRange+'d)',fmt(activeMs),'var(--review)')
     +sc('Daily Average',fmt(avgMs),'var(--human)')
@@ -659,6 +678,107 @@ function renderTrends(){
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
       scales:{x:{ticks:{color:dfg()},grid:{color:gc}},y:{ticks:{color:dfg(),callback:function(v){return v+'%';}},grid:{color:gc},min:0,max:100,title:{display:true,text:'AI share',color:dfg()}}}}});
   renderHeatmap();
+  renderCalendar();
+}
+var calMetric='time',calSel=null;
+var CAL_METRICS={time:{label:'Active time',color:'var(--vscode-charts-green,#4ec9b0)'},credits:{label:'AI credits',color:'var(--vscode-charts-purple,#c586c0)'},lines:{label:'Lines',color:'var(--vscode-charts-orange,#f4a261)'}};
+function calDate(s){var p=s.split('-');return new Date(+p[0],+p[1]-1,+p[2],12);}
+function calKey(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function calVal(d,m){if(!d)return 0;return m==='credits'?d.credits:m==='lines'?(d.linesHuman+d.linesAi):d.activeMs;}
+function calFmtCr(n){return(Math.round(n*10)/10).toLocaleString()+' cr';}
+function calTip(key,d){
+  var wd=calDate(key).toLocaleDateString(undefined,{weekday:'short',day:'numeric',month:'short',year:'numeric'});
+  if(!d)return wd+' \\u2014 no activity';
+  return wd+' \\u2014 '+fmt(d.activeMs)+' active \\u00b7 '+calFmtCr(d.credits)+' \\u00b7 +'+(d.linesHuman+d.linesAi)+' lines';
+}
+function renderCalendar(){
+  var el=document.getElementById('calCard');if(!el)return;
+  var C=AN.calendar;
+  if(!C){el.innerHTML='<h3>\\uD83D\\uDCC5 Year at a glance</h3><p class="sub">No calendar data yet.</p>';return;}
+  var byDate={};C.days.forEach(function(d){byDate[d.date]=d;});
+  var vals=C.days.map(function(d){return calVal(d,calMetric);}).filter(function(v){return v>0;}).sort(function(a,b){return a-b;});
+  var q=function(p){return vals.length?vals[Math.min(vals.length-1,Math.floor(p*vals.length))]:0;};
+  var q1=q(.25),q2=q(.5),q3=q(.75);
+  var lvl=function(v){return v<=0?0:v<=q1?1:v<=q2?2:v<=q3?3:4;};
+  var start=calDate(C.start),end=calDate(C.end);
+  var weeks=Math.round((end-start)/86400000/7)+1;
+  var html='<div class="cal" style="grid-template-columns:30px repeat('+weeks+',minmax(9px,1fr))">';
+  var wdl=['','Mon','','Wed','','Fri',''];
+  for(var r=0;r<7;r++)html+='<div class="cwl" style="grid-column:1;grid-row:'+(r+2)+'">'+wdl[r]+'</div>';
+  var lastMonth=-1;
+  for(var w=0;w<weeks;w++){
+    var first=new Date(start.getTime());first.setDate(first.getDate()+w*7);
+    if(first.getMonth()!==lastMonth&&(w>0||first.getDate()<=7)&&w<weeks-2){
+      html+='<div class="cml" style="grid-column:'+(w+2)+'/span 3;grid-row:1">'+first.toLocaleDateString(undefined,{month:'short'})+'</div>';
+    }
+    lastMonth=first.getMonth();
+    for(var k=0;k<7;k++){
+      var day=new Date(first.getTime());day.setDate(day.getDate()+k);
+      if(day>end)break;
+      var key=calKey(day),d=byDate[key];
+      html+='<button class="cal-c l'+lvl(calVal(d,calMetric))+(key===calSel?' sel':'')+'" style="grid-column:'+(w+2)+';grid-row:'+(k+2)+'" data-action="calDay" data-value="'+key+'" title="'+esc(calTip(key,d))+'" aria-label="'+esc(calTip(key,d))+'"></button>';
+    }
+  }
+  html+='</div>';
+  var T=C.totals;
+  var legend='<span class="calk">Less<span class="cal-c l0"></span><span class="cal-c l1"></span><span class="cal-c l2"></span><span class="cal-c l3"></span><span class="cal-c l4"></span>More</span>';
+  el.style.setProperty('--calc',CAL_METRICS[calMetric].color);
+  el.innerHTML='<div class="chd"><h3 style="margin:0">\\uD83D\\uDCC5 Year at a glance</h3>'
+    +pills('calMetric',calMetric,[['time','Active time'],['credits','AI credits'],['lines','Lines']])+'</div>'
+    +'<p class="sub" style="margin-bottom:10px">'+T.activeDays+' active days \\u00b7 '+fmt(T.activeMs)+' \\u00b7 '+calFmtCr(T.credits)+' \\u00b7 +'+T.lines.toLocaleString()+' lines in the last 12 months. Click a day for its breakdown.</p>'
+    +'<div class="calw">'+html+'</div>'
+    +'<div style="display:flex;justify-content:flex-end;margin-top:6px">'+legend+'</div>'
+    +'<div id="calDetail">'+(calSel?calDayHtml(calSel,byDate):'')+'</div>';
+}
+function calBar(label,ms,total,color){
+  var pct=total>0?Math.round(ms/total*100):0;
+  return'<div class="brow"><span class="bl">'+label+'</span><div class="btrack"><div class="bfill" style="width:'+pct+'%;background:'+color+'"></div></div><span class="bv">'+fmt(ms)+'</span></div>';
+}
+function calDayHtml(key,byDate){
+  var d=byDate[key];
+  var C=AN.calendar,keys=C.days.map(function(x){return x.date;});
+  var i=keys.indexOf(key);
+  var prev=i>0?keys[i-1]:null;
+  if(i<0){prev=null;for(var j=keys.length-1;j>=0;j--){if(keys[j]<key){prev=keys[j];break;}}}
+  var next=null;for(var n=0;n<keys.length;n++){if(keys[n]>key){next=keys[n];break;}}
+  var title=calDate(key).toLocaleDateString(undefined,{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+  var nav='<span class="pills">'
+    +(prev?'<button class="pill" data-action="calDay" data-value="'+prev+'" title="Previous active day">\\u2039 '+prev.slice(5)+'</button>':'')
+    +(next?'<button class="pill" data-action="calDay" data-value="'+next+'" title="Next active day">'+next.slice(5)+' \\u203a</button>':'')
+    +'<button class="pill" data-action="calDay" data-value="" title="Close">\\u2715</button></span>';
+  var head='<div class="chd"><strong>'+esc(title)+'</strong>'+nav+'</div>';
+  if(!d)return'<div class="cald">'+head+'<p class="sub">Nothing tracked on this day.</p></div>';
+  var lines=d.linesHuman+d.linesAi;
+  var cost=(CFG.usdPerCredit||0)*d.credits;
+  var k='<div class="kpis">'
+    +'<div class="kpi"><div class="kl">Active time</div><div class="kv">'+fmt(d.activeMs)+'</div>'+(d.manualMs?'<div class="ks">incl. '+fmt(d.manualMs)+' logged manually</div>':'')+'</div>'
+    +'<div class="kpi"><div class="kl">AI credits</div><div class="kv">'+(Math.round(d.credits*10)/10)+'</div><div class="ks">\\u2248 $'+cost.toFixed(2)+'</div></div>'
+    +'<div class="kpi"><div class="kl">Lines added</div><div class="kv">+'+lines+'</div><div class="ks">'+d.linesHuman+' you \\u00b7 '+d.linesAi+' AI'+(lines?' ('+Math.round(d.linesAi/lines*100)+'% AI)':'')+'</div></div>'
+    +'</div>';
+  var tot=d.activeMs;
+  var modes='<div class="bdc"><h4>Time by mode</h4>'
+    +calBar('\\u2328\\ufe0f Coding',d.humanMs,tot,'var(--human)')
+    +calBar('\\uD83E\\uDD16 AI generating',d.aiMs,tot,'var(--ai)')
+    +calBar('\\uD83D\\uDC40 Reviewing',d.reviewMs,tot,'var(--review)')
+    +(d.manualMs?calBar('\\u270D\\ufe0f Logged manually',d.manualMs,tot,'var(--cost)'):'')
+    +'</div>';
+  var cats;
+  if(d.categories){
+    var rows=Object.keys(d.categories).map(function(c){var v=d.categories[c];return{c:c,h:v.human,a:v.ai,t:v.human+v.ai};}).sort(function(a,b){return b.t-a.t;});
+    cats='<div class="bdc"><h4>Lines by category</h4><table><thead><tr><th>Category</th><th>You</th><th>AI</th><th>AI %</th></tr></thead><tbody>'
+      +rows.map(function(r){return'<tr><td>'+esc(CAT[r.c]||r.c)+'</td><td>+'+r.h+'</td><td>+'+r.a+'</td><td>'+(r.t?Math.round(r.a/r.t*100):0)+'%</td></tr>';}).join('')
+      +'</tbody></table></div>';
+  }else{
+    cats='<div class="bdc"><h4>Lines by category</h4><p class="sub" style="margin:0">'+(lines?'This day was tracked before the category split was recorded, so only totals are known.':'No lines on this day.')+'</p></div>';
+  }
+  var items=d.items.map(function(it){
+    var w=it.workItemId?(WI||[]).find(function(x){return String(x.workItemId)===String(it.workItemId);}):null;
+    var wl=it.workItemId?'<a class="lnk" data-action="ovWi" data-value="'+esc(it.workItemId)+'">#'+esc(it.workItemId)+(w&&w.title?' '+esc(w.title):'')+'</a>':'<span class="sub">unassigned</span>';
+    var bl=it.branch?'<span class="lnk" data-action="detail" data-value="'+esc(it.branch)+'">'+esc(it.branch)+'</span>':'<span class="sub">\\u2014</span>';
+    return'<tr><td>'+bl+'</td><td>'+wl+'</td><td>'+fmt(it.activeMs)+'</td><td>+'+it.lines+'</td><td>'+(Math.round(it.credits*10)/10)+'</td></tr>';
+  }).join('');
+  var work='<div class="bdc" style="grid-column:1/-1"><h4>Worked on</h4><div style="overflow-x:auto"><table><thead><tr><th>Branch</th><th>Work item</th><th>Time</th><th>Lines</th><th>Credits</th></tr></thead><tbody>'+items+'</tbody></table></div></div>';
+  return'<div class="cald">'+head+k+'<div class="bdg">'+modes+cats+work+'</div></div>';
 }
 function renderHeatmap(){
   var el=document.getElementById('heat');if(!el)return;
@@ -1781,6 +1901,8 @@ document.addEventListener('click',function(e){
   else if(a==='tab'){if(t.dataset.rate)corrFilter='rate';showTab(v);}
   else if(a==='ds')showDS(v,t);
   else if(a==='rng'){trendRange=parseInt(v,10)||30;renderTrends();}
+  else if(a==='calMetric'){calMetric=v;renderCalendar();}
+  else if(a==='calDay'){calSel=v||null;renderCalendar();}
   else if(a==='optDays'){optDays=parseInt(v,10)||30;requestOptimize();}
   else if(a==='optRefresh')requestOptimize();
   else if(a==='sesDays'){sesQ.days=parseInt(v,10)||30;sesQ.from='';sesQ.to='';sesQ.offset=0;requestSessions();}

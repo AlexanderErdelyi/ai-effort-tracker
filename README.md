@@ -395,6 +395,17 @@ add time for that work item and day; entries appear in the work item's time log.
 Round to exact, ¼ or ½ hours (default `aiEffortTracker.timesheet.rounding`) and
 export the week as CSV (work item, external ref, title, day, hours).
 
+## Year at a glance
+
+The **Trends** tab starts with a calendar of the last 12 months, one square per
+day. Switch the colour between active time, AI credits and lines; the four
+shades are quartiles of your own active days, so a quiet week still stands out.
+Click a day to see its time by mode (coding, AI generating, reviewing, logged
+manually), credits with their dollar value, lines you wrote versus AI lines per
+category (Code, Docs, Specs, …), and every branch and work item you touched, with
+links to their details. Step to the previous or next active day from there.
+Per-category lines are recorded from version 0.36.0 on; older days show totals only.
+
 ## Away detection
 
 When you come back to VS Code after being away (idle, another app, a meeting,

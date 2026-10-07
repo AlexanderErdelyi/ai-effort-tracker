@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
-import { ALL_CATEGORIES, categorize, countsTowardProductivity } from '../util/fileTypes';
+import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
 import type { FileCategory } from '../util/fileTypes';
 import {
   resolveEffectiveRates,
@@ -23,6 +23,7 @@ import { computeBudget, normalizeThresholds, type BudgetDay, type BudgetStatus }
 import { duplicateLedgerIndexes } from '../analysis/dataHealth';
 import type { TimesheetSourceRow } from '../analysis/timesheet';
 import { rateInputsFromStore } from '../analysis/correctionRate';
+import { buildCalendar, type CalendarData } from '../analysis/calendar';
 
 export interface LineStats {
   added: number;
@@ -443,6 +444,8 @@ export interface DailyBucket {
   linesAi: number;
   /** AI lines in translation files (included in linesAi); left out of the correction rate. */
   linesAiTranslation?: number;
+  /** Lines added per file category (#141). Absent on buckets created before this counter existed. */
+  linesByCategory?: Record<string, { human: number; ai: number }>;
   /** Active ms per hour-of-day (0-23) — drives the activity heatmap. */
   hours: number[];
   /** Active ms per hour-of-day split by mode — drives the today timeline. */
@@ -2134,6 +2137,12 @@ export class Database {
       }
     } else {
       bucket.linesHuman += linesAdded;
+    }
+    if (linesAdded > 0) {
+      const category = filePath ? categorize(filePath) : categorizeExt(ext);
+      if (!bucket.linesByCategory) bucket.linesByCategory = {};
+      const counter = bucket.linesByCategory[category] ?? (bucket.linesByCategory[category] = { human: 0, ai: 0 });
+      counter[source] += linesAdded;
     }
 
     if (filePath) {
@@ -3929,6 +3938,18 @@ export class Database {
       out.push(point);
     }
     return out;
+  }
+
+  /** Year calendar of daily activity, credits and lines (issue #141). */
+  getCalendar(today: string = dayKey(), weeks = 53): CalendarData {
+    return buildCalendar({
+      branches: this.store,
+      ledger: this.creditLedger,
+      manualEffort: this.manualEffort,
+      timeEntries: this.timeEntries,
+      today,
+      weeks
+    });
   }
 
   /**
