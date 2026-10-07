@@ -18,6 +18,10 @@ import { correctionsMarkdown, listCorrections } from './analysis/corrections';
 import { correctionRateReport, correctionTrackingSince, type CorrectionRateReport } from './analysis/correctionRate';
 import { acceptSuggestionsDelta, correctionsView, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta } from './analysis/correctionLabels';
 import { Database } from './store/database';
+import {
+  BACKUP_FORMAT, BACKUP_VERSION, buildBundle, DATA_SETS, dataSet, listCheckpoints, listSafetyCopies, parseBackup,
+  restoreSideStore, SECRET_SETTINGS, serializeBundle, writeSafetyCopy, type BackupBundle, type DataSetId
+} from './store/backup';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
 import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
@@ -393,6 +397,11 @@ export function activate(context: vscode.ExtensionContext) {
       if (r.counts.error) void vscode.window.showWarningMessage(msg); else void vscode.window.showInformationMessage(msg);
     }),
     vscode.commands.registerCommand('aiEffortTracker.fixDataHealth', (checkId?: string) => fixDataHealth(checkId)),
+    // #6: full backup, restore and data folder.
+    vscode.commands.registerCommand('aiEffortTracker.revealDataFolder', () =>
+      vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(path.join(context.globalStorageUri.fsPath, 'effort-tracker.json')))),
+    vscode.commands.registerCommand('aiEffortTracker.exportBackup', () => exportBackup(context)),
+    vscode.commands.registerCommand('aiEffortTracker.restoreBackup', () => restoreBackup(context)),
     // #100: continue a large chat in a new one with a summary.
     vscode.commands.registerCommand('aiEffortTracker.newChatWithHandoff', (sessionId?: string) => newChatWithHandoff(db, context, sessionId)),
     // #101: timesheet week grid.
@@ -3012,4 +3021,189 @@ async function exportReport(db: Database, tracker: TimeTracker) {
     await vscode.workspace.fs.writeFile(uri, Buffer.from(json, 'utf8'));
     vscode.window.showInformationMessage(`Report saved to ${uri.fsPath}`);
   }
+}
+
+// ---------- #6: full backup / restore ----------
+
+/** Global (user-level) `aiEffortTracker.*` settings; secrets are never included. */
+function exportableSettings(context: vscode.ExtensionContext): Record<string, unknown> {
+  const props = context.extension.packageJSON?.contributes?.configuration?.properties ?? {};
+  const config = vscode.workspace.getConfiguration();
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(props)) {
+    if (SECRET_SETTINGS.has(key)) continue;
+    const value = config.inspect(key)?.globalValue;
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+function currentBundle(context: vscode.ExtensionContext): BackupBundle {
+  return buildBundle({
+    dir: context.globalStorageUri.fsPath,
+    effort: db.backupSnapshot(),
+    settings: exportableSettings(context),
+    extensionVersion: context.extension.packageJSON?.version
+  });
+}
+
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+async function exportBackup(context: vscode.ExtensionContext) {
+  let bundle: BackupBundle;
+  try { bundle = currentBundle(context); }
+  catch (error) {
+    vscode.window.showErrorMessage(`AI Effort Tracker: cannot read the current data for a backup: ${errorText(error)}`);
+    return;
+  }
+  const uri = await vscode.window.showSaveDialog({
+    title: 'Export full AI Effort Tracker backup',
+    defaultUri: vscode.Uri.file(path.join(os.homedir(), `ai-effort-tracker-backup-${new Date().toISOString().slice(0, 10)}.json`)),
+    filters: { JSON: ['json'] }
+  });
+  if (!uri) return;
+  try {
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(serializeBundle(bundle), 'utf8'));
+  } catch (error) {
+    vscode.window.showErrorMessage(`AI Effort Tracker: could not write the backup: ${errorText(error)}`);
+    return;
+  }
+  const saved = `AI Effort Tracker: full backup saved (${dataSet('effort').summarize(bundle.data.effort)}).`;
+  const choice = bundle.skipped?.length
+    ? await vscode.window.showWarningMessage(`${saved} Not included because unreadable: ${bundle.skipped.join(' | ')}`, 'Reveal in Explorer')
+    : await vscode.window.showInformationMessage(`${saved} Restore it with "Restore Data from Backup".`, 'Reveal in Explorer');
+  if (choice) void vscode.commands.executeCommand('revealFileInOS', uri);
+}
+
+type RestorePick = vscode.QuickPickItem & { action?: 'file' | 'safety' | 'checkpoint'; file?: string; set?: DataSetId };
+
+async function restoreBackup(context: vscode.ExtensionContext) {
+  const dir = context.globalStorageUri.fsPath;
+  const when = (ms: number) => new Date(ms).toLocaleString();
+  const size = (bytes: number) => bytes >= 1_048_576 ? `${(bytes / 1_048_576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  const kinds = { previous: 'previous save', hourly: 'hourly checkpoint', daily: 'daily checkpoint' } as const;
+  const items: RestorePick[] = [{
+    label: '$(folder-opened) Restore from a backup file\u2026', action: 'file',
+    detail: 'A file made with "Export Full Backup", or an effort-tracker.json copied from another machine.'
+  }];
+  const safety = listSafetyCopies(dir);
+  if (safety.length) {
+    items.push({ label: 'Safety copies made before a restore (undo a restore)', kind: vscode.QuickPickItemKind.Separator });
+    for (const s of safety) {
+      items.push({ label: `$(history) ${when(s.mtime)}`, description: `all data \u00b7 ${size(s.size)}`, action: 'safety', file: s.file });
+    }
+  }
+  const checkpoints = listCheckpoints(dir);
+  for (const set of DATA_SETS) {
+    const own = checkpoints.filter(c => c.set === set.id);
+    if (!own.length) continue;
+    items.push({ label: `${set.label}: automatic checkpoints`, kind: vscode.QuickPickItemKind.Separator });
+    for (const c of own) {
+      items.push({ label: `$(clock) ${when(c.mtime)}`, description: `${kinds[c.kind]} \u00b7 ${size(c.size)}`, action: 'checkpoint', file: c.file, set: set.id });
+    }
+  }
+  const pick = await vscode.window.showQuickPick(items, {
+    title: 'Restore AI Effort Tracker data', placeHolder: 'Choose a backup file or a checkpoint', matchOnDescription: true
+  });
+  if (!pick?.action) return;
+
+  let bundle: BackupBundle;
+  let source: string;
+  try {
+    if (pick.action === 'file') {
+      const uris = await vscode.window.showOpenDialog({
+        title: 'Choose an AI Effort Tracker backup', canSelectMany: false, filters: { JSON: ['json'], 'All files': ['*'] }
+      });
+      if (!uris?.[0]) return;
+      const raw = Buffer.from(await vscode.workspace.fs.readFile(uris[0])).toString('utf8');
+      bundle = parseBackup(raw, uris[0].fsPath);
+      source = `"${path.basename(uris[0].fsPath)}"`;
+    } else if (pick.action === 'safety') {
+      bundle = parseBackup(fs.readFileSync(pick.file!, 'utf8'), pick.file);
+      source = `the safety copy of ${pick.label.replace(/^\$\([^)]*\)\s*/, '')}`;
+    } else {
+      const set = dataSet(pick.set!);
+      bundle = { format: BACKUP_FORMAT, version: BACKUP_VERSION, exportedAt: '', data: { [set.id]: set.decode(fs.readFileSync(pick.file!, 'utf8')) } };
+      source = `the ${pick.description?.split(' \u00b7 ')[0]} of ${pick.label.replace(/^\$\([^)]*\)\s*/, '')}`;
+    }
+  } catch (error) {
+    vscode.window.showErrorMessage(`AI Effort Tracker: this backup cannot be restored. ${errorText(error)}`);
+    return;
+  }
+
+  const included = DATA_SETS.filter(s => bundle.data[s.id] !== undefined);
+  let chosen: DataSetId[] = included.map(s => s.id);
+  let withSettings = !!bundle.settings;
+  if (included.length + (bundle.settings ? 1 : 0) > 1) {
+    type Part = vscode.QuickPickItem & { id: DataSetId | 'settings' };
+    const parts: Part[] = included.map(s => ({ label: s.label, detail: s.summarize(bundle.data[s.id]), picked: true, id: s.id }));
+    if (bundle.settings) {
+      parts.push({
+        label: 'Settings', picked: true, id: 'settings',
+        detail: `${Object.keys(bundle.settings).length} user settings (rates, profile, category rules\u2026). The GitHub token is never part of a backup.`
+      });
+    }
+    const selected = await vscode.window.showQuickPick(parts, { title: 'What should be restored?', canPickMany: true });
+    if (!selected?.length) return;
+    chosen = selected.filter(p => p.id !== 'settings').map(p => p.id as DataSetId);
+    withSettings = selected.some(p => p.id === 'settings');
+  }
+
+  let current: BackupBundle;
+  try { current = currentBundle(context); }
+  catch (error) {
+    vscode.window.showErrorMessage(`AI Effort Tracker: cannot read the current data, so nothing was restored. ${errorText(error)}`);
+    return;
+  }
+  const compare = chosen.map(id => {
+    const set = dataSet(id);
+    return `${set.label}\nBackup:  ${set.summarize(bundle.data[id])}\nCurrent: ${current.data[id] !== undefined ? set.summarize(current.data[id]) : 'empty'}`;
+  });
+  if (withSettings) compare.push('Settings: the backup\u2019s values replace your current user settings.');
+  const confirm = await vscode.window.showWarningMessage(
+    `Restore AI Effort Tracker data from ${source}?`,
+    {
+      modal: true,
+      detail: `${compare.join('\n\n')}\n\nThe restored data REPLACES the current data. A safety copy of everything is saved first, so you can undo this with the same command.`
+    },
+    'Restore'
+  );
+  if (confirm !== 'Restore') return;
+
+  let safetyFile: string;
+  try {
+    // Fresh snapshot: include anything tracked while the dialog was open.
+    safetyFile = writeSafetyCopy(dir, currentBundle(context));
+  } catch (error) {
+    vscode.window.showErrorMessage(`AI Effort Tracker: could not save a safety copy, so nothing was restored. ${errorText(error)}`);
+    return;
+  }
+  const failed: string[] = [];
+  for (const id of chosen) {
+    try {
+      if (id === 'effort') db.restoreSnapshot(bundle.data.effort);
+      else restoreSideStore(dir, id, bundle.data[id]);
+    } catch (error) {
+      failed.push(`${dataSet(id).label}: ${errorText(error)}`);
+    }
+  }
+  if (withSettings && bundle.settings) {
+    const known = context.extension.packageJSON?.contributes?.configuration?.properties ?? {};
+    const config = vscode.workspace.getConfiguration();
+    for (const [key, value] of Object.entries(bundle.settings)) {
+      if (!(key in known) || SECRET_SETTINGS.has(key)) continue;
+      try { await config.update(key, value, vscode.ConfigurationTarget.Global); }
+      catch (error) { failed.push(`Setting ${key}: ${errorText(error)}`); }
+    }
+  }
+  refreshDashboard();
+  if (chosen.includes('reviews')) void vscode.commands.executeCommand('aiEffortTracker.review.refresh');
+  const reveal = 'Show Safety Copy';
+  const choice = failed.length
+    ? await vscode.window.showErrorMessage(`AI Effort Tracker: restore incomplete. ${failed.join(' | ')}`, reveal)
+    : await vscode.window.showInformationMessage(
+      `AI Effort Tracker: restored ${chosen.map(id => dataSet(id).label.replace(/ \(.*\)$/, '').toLowerCase()).concat(withSettings ? ['settings'] : []).join(', ')} from ${source}.`,
+      reveal
+    );
+  if (choice === reveal) void vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(safetyFile));
 }

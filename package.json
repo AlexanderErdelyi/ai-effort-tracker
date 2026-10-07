@@ -148,6 +148,18 @@
         "title": "AI Effort Tracker: Check Data Health"
       },
       {
+        "command": "aiEffortTracker.exportBackup",
+        "title": "AI Effort Tracker: Export Full Backup…"
+      },
+      {
+        "command": "aiEffortTracker.restoreBackup",
+        "title": "AI Effort Tracker: Restore Data from Backup…"
+      },
+      {
+        "command": "aiEffortTracker.revealDataFolder",
+        "title": "AI Effort Tracker: Reveal Data Folder"
+      },
+      {
         "command": "aiEffortTracker.newChatWithHandoff",
         "title": "AI Effort Tracker: New Chat with Handoff"
       },
