@@ -36,6 +36,7 @@ export function parseSessionQuery(m: Msg): SessionQuery {
     ...(from !== undefined ? { from } : { days: days && days > 0 ? Math.min(days, 3650) : 30 }),
     ...(to !== undefined ? { to } : {}),
     ...(str(m.workItemId) ? { workItemId: str(m.workItemId) } : {}),
+    ...(str(m.projectId) ? { projectId: str(m.projectId) } : {}),
     ...(str(m.branch) ? { branch: str(m.branch) } : {})
   };
   const sort = SORT_KEYS.includes(m.sort as SessionSortKey) ? m.sort as SessionSortKey : 'end';

@@ -114,7 +114,7 @@ function matches(e: LedgerEntry, f: InsightFilter, from: number, to: number): bo
   if (e.ts < from - DAY || e.ts > to) return false;
   if (f.branch && e.branch !== f.branch) return false;
   if (f.workItemId && e.workItemId !== f.workItemId) return false;
-  if (f.projectId && e.projectId !== f.projectId) return false;
+  if (f.projectId === '__none__' ? !!e.projectId : f.projectId && e.projectId !== f.projectId) return false;
   if (f.sessionId && e.debugUsage.sessionId !== f.sessionId) return false;
   return true;
 }

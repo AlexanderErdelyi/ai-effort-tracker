@@ -62,10 +62,40 @@ export class GitHubService {
   private billingCache: BillingUsage | null = null;
   private billingExpiresAt = 0;
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+  private secrets?: vscode.SecretStorage;
 
-  /** Resolve a token: manual setting first, then VS Code's GitHub session. */
+  static readonly SECRET_KEY = 'aiEffortTracker.githubToken';
+
+  /** Use VS Code SecretStorage for the token set from the Settings tab (#148). */
+  useSecrets(secrets: vscode.SecretStorage): void { this.secrets = secrets; }
+
+  /** Drop cached metrics/billing, e.g. after the token or scope changed. */
+  clearCache(): void {
+    this.cache = null; this.cacheExpiresAt = 0;
+    this.billingCache = null; this.billingExpiresAt = 0;
+  }
+
+  /** Where the token comes from, without revealing it. */
+  async tokenSource(): Promise<'secure' | 'settings' | 'none'> {
+    if (await this.secretToken()) return 'secure';
+    return vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ? 'settings' : 'none';
+  }
+
+  async setSecretToken(token: string | undefined): Promise<void> {
+    if (!this.secrets) throw new Error('Secure storage is not available.');
+    if (token) await this.secrets.store(GitHubService.SECRET_KEY, token);
+    else await this.secrets.delete(GitHubService.SECRET_KEY);
+    this.clearCache();
+  }
+
+  private async secretToken(): Promise<string> {
+    try { return (await this.secrets?.get(GitHubService.SECRET_KEY)) ?? ''; } catch { return ''; }
+  }
+
+  /** Resolve a token: secure storage, then the legacy setting, then VS Code's GitHub session. */
   private async resolveToken(): Promise<string> {
-    let token = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ?? '';
+    let token = await this.secretToken();
+    if (!token) token = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ?? '';
     if (!token) {
       try {
         const session = await vscode.authentication.getSession(
@@ -196,18 +226,7 @@ export class GitHubService {
       return this.cache;
     }
 
-    // 1. Try manual token setting first
-    let token = vscode.workspace.getConfiguration('aiEffortTracker').get<string>('githubToken') ?? '';
-
-    // 2. Fall back to VS Code's built-in GitHub authentication (same account as Copilot)
-    if (!token) {
-      try {
-        const session = await vscode.authentication.getSession(
-          'github', ['read:org', 'repo'], { createIfNone: false }
-        );
-        token = session?.accessToken ?? '';
-      } catch { /* auth extension not available */ }
-    }
+    const token = await this.resolveToken();
 
     if (!token) return null;
 

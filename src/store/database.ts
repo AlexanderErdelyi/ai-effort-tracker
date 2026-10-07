@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
-import { ALL_CATEGORIES, categorize, countsTowardProductivity } from '../util/fileTypes';
+import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
 import type { FileCategory } from '../util/fileTypes';
 import {
   resolveEffectiveRates,
@@ -23,6 +23,20 @@ import { computeBudget, normalizeThresholds, type BudgetDay, type BudgetStatus }
 import { duplicateLedgerIndexes } from '../analysis/dataHealth';
 import type { TimesheetSourceRow } from '../analysis/timesheet';
 import { rateInputsFromStore } from '../analysis/correctionRate';
+import { buildCalendar, type CalendarData } from '../analysis/calendar';
+import {
+  addCredit,
+  creditConfidence,
+  emptyCreditSplit,
+  linesConfidence,
+  subjectConfidence,
+  timeConfidence,
+  type Confidence,
+  type CreditSplit,
+  type LinesConfidenceInput,
+  type SubjectConfidence,
+  type TimeConfidenceInput
+} from '../analysis/confidence';
 
 export interface LineStats {
   added: number;
@@ -431,6 +445,8 @@ export interface CreditTotals {
   entries: number;
   byModel: { model: string; credits: number; turns: number }[];
   bySource: { manual: number; auto: number; import: number };
+  /** Credits by how they were captured: exact, partial, estimated or manual (#143). */
+  byConfidence: CreditSplit;
 }
 
 /** One calendar day of activity for a branch (key = YYYY-MM-DD, local time). */
@@ -443,6 +459,8 @@ export interface DailyBucket {
   linesAi: number;
   /** AI lines in translation files (included in linesAi); left out of the correction rate. */
   linesAiTranslation?: number;
+  /** Lines added per file category (#141). Absent on buckets created before this counter existed. */
+  linesByCategory?: Record<string, { human: number; ai: number }>;
   /** Active ms per hour-of-day (0-23) — drives the activity heatmap. */
   hours: number[];
   /** Active ms per hour-of-day split by mode — drives the today timeline. */
@@ -836,6 +854,8 @@ export interface WorkItemSummary {
   /** Explicit budgets as entered (issue #94), for editing. */
   creditBudget?: number | null;
   costBudget?: number | null;
+  /** How much of credits, time, lines and ROI was measured vs estimated vs manual (#143). */
+  confidence?: SubjectConfidence;
 }
 
 /** The numeric/breakdown portion of a {@link WorkItemSummary} (identity omitted). */
@@ -844,6 +864,7 @@ export type BranchRollup = Omit<
   | 'workItemId' | 'title' | 'projectId' | 'estimate' | 'estimateBreakdown'
   | 'estimateUnit' | 'externalRef' | 'createdAt' | 'branches' | 'manual' | 'roi'
   | 'generated' | 'timeEntries' | 'budget' | 'creditBudget' | 'costBudget' | 'status' | 'doneAt' | 'activity'
+  | 'confidence'
 >;
 
 /** One category's estimate vs tracked actual for a work item (issue #16). */
@@ -895,6 +916,8 @@ export interface ProjectSummary extends BranchRollup {
    * for the ROI report (M7 / #29), not the report itself.
    */
   roi: ProjectRoi;
+  /** How much of credits, time, lines and ROI was measured vs estimated vs manual (#143). */
+  confidence?: SubjectConfidence;
 }
 
 /**
@@ -2134,6 +2157,12 @@ export class Database {
       }
     } else {
       bucket.linesHuman += linesAdded;
+    }
+    if (linesAdded > 0) {
+      const category = filePath ? categorize(filePath) : categorizeExt(ext);
+      if (!bucket.linesByCategory) bucket.linesByCategory = {};
+      const counter = bucket.linesByCategory[category] ?? (bucket.linesByCategory[category] = { human: 0, ai: 0 });
+      counter[source] += linesAdded;
     }
 
     if (filePath) {
@@ -3439,7 +3468,8 @@ export class Database {
       budget: this.budgetFor(wi, actualHours, credits.credits, roi, rollup.effectiveByCategory, branchSummaries, daily),
       activity: activityOf(daily),
       creditBudget: wi.creditBudget ?? null,
-      costBudget: wi.costBudget ?? null
+      costBudget: wi.costBudget ?? null,
+      confidence: this.confidenceFor(branches, [workItemId], null, credits)
     };
   }
 
@@ -3931,6 +3961,18 @@ export class Database {
     return out;
   }
 
+  /** Year calendar of daily activity, credits and lines (issue #141). */
+  getCalendar(today: string = dayKey(), weeks = 53): CalendarData {
+    return buildCalendar({
+      branches: this.store,
+      ledger: this.creditLedger,
+      manualEffort: this.manualEffort,
+      timeEntries: this.timeEntries,
+      today,
+      weeks
+    });
+  }
+
   /**
    * Activity heatmap: 7 weekdays x 24 hours of active ms, aggregated across all
    * branches and all history. weekday 0 = Sunday.
@@ -4104,7 +4146,8 @@ export class Database {
       cost: 0,
       entries: 0,
       byModel: [],
-      bySource: { manual: 0, auto: 0, import: 0 }
+      bySource: { manual: 0, auto: 0, import: 0 },
+      byConfidence: emptyCreditSplit()
     };
     for (const e of this.creditLedger) {
       if (!this.matchesCreditQuery(e, query)) continue;
@@ -4112,6 +4155,7 @@ export class Database {
       totals.cost += e.cost ?? 0;
       totals.entries += 1;
       totals.bySource[e.source] += e.credits;
+      addCredit(totals.byConfidence, e);
       if (!byModel[e.model]) byModel[e.model] = { credits: 0, turns: 0 };
       byModel[e.model].credits += e.credits;
       byModel[e.model].turns += 1;
@@ -4305,6 +4349,7 @@ export class Database {
       branches,
       credits,
       roi: this.computeProjectRoi(projectId, rollup, credits),
+      confidence: this.confidenceFor(branches, workItemIds, projectId, credits),
       ...rollup
     };
   }
@@ -4435,4 +4480,124 @@ export class Database {
     addModeMsToRollup(rollup, this.timeEntryMsForProjectDirect(projectId));
     return rollup;
   }
+
+  // ---------------------------------------------------------------------------
+  // Data confidence (issue #143): how much of each total was measured,
+  // estimated or entered by hand. Only active time (not idle) is considered,
+  // matching what the dashboard shows and what ROI bills.
+  // ---------------------------------------------------------------------------
+
+  /** Tracked vs corrected time and tracked vs inferred lines for some branches. */
+  private branchConfidenceInputs(branches: string[]): {
+    trackedMs: number; adjustedMs: number; timeLogMs: number; trackedLines: number; inferredLines: number;
+  } {
+    const out = { trackedMs: 0, adjustedMs: 0, timeLogMs: 0, trackedLines: 0, inferredLines: 0 };
+    for (const b of branches) {
+      const data = this.store[b];
+      if (!data) continue;
+      const raw = (data.time.humanCoding ?? 0) + (data.time.aiGenerating ?? 0) + (data.time.reviewing ?? 0);
+      const e = this.effectiveTime(data);
+      const eff = e.humanCoding + e.aiGenerating + e.reviewing;
+      out.trackedMs += Math.min(raw, eff);
+      out.adjustedMs += Math.abs(eff - raw);
+      out.timeLogMs += activeModeMs(this.timeEntryMsForBranch(b));
+      if (data.effectiveLines) {
+        for (const cat of ALL_CATEGORIES as string[]) {
+          if (!countsTowardProductivity(cat)) continue;
+          const cur = data.effectiveLines[cat];
+          const leg = data.effectiveLegacyBaseline?.[cat];
+          out.trackedLines += (cur?.human ?? 0) + (cur?.ai ?? 0);
+          out.inferredLines += (leg?.human ?? 0) + (leg?.ai ?? 0);
+        }
+      } else {
+        // Pre-v11 branches only have raw added lines standing in for the real metric.
+        const s = this.getSummaryForBranch(b);
+        out.inferredLines += s.effectiveLinesHuman + s.effectiveLinesAi;
+      }
+    }
+    return out;
+  }
+
+  /** Manual effort time and lines for some work items. */
+  private manualConfidenceInputs(workItemIds: string[]): { manualMs: number; manualLines: number; timeLogMs: number } {
+    const out = { manualMs: 0, manualLines: 0, timeLogMs: 0 };
+    for (const id of workItemIds) {
+      const m = this.manualRollupForWorkItem(id);
+      out.manualMs += m.humanCodingMs + m.aiGeneratingMs + m.reviewingMs;
+      out.manualLines += manualEffectiveLines(m);
+      out.timeLogMs += activeModeMs(this.timeEntryMsForWorkItemDirect(id));
+    }
+    return out;
+  }
+
+  private confidenceFor(
+    branches: string[],
+    workItemIds: string[],
+    projectId: string | null,
+    credits: CreditTotals
+  ): SubjectConfidence {
+    const b = this.branchConfidenceInputs(branches);
+    const m = this.manualConfidenceInputs(workItemIds);
+    const projectLogMs = projectId ? activeModeMs(this.timeEntryMsForProjectDirect(projectId)) : 0;
+    const ids = new Set(workItemIds);
+    const reassignments = this.reassignments.filter(
+      r => ids.has(r.toWorkItemId) || (r.fromWorkItemId !== null && r.fromWorkItemId !== undefined && ids.has(r.fromWorkItemId))
+    ).length;
+    const time: TimeConfidenceInput = {
+      trackedMs: b.trackedMs,
+      adjustedMs: b.adjustedMs,
+      manualMs: m.manualMs,
+      timeLogMs: b.timeLogMs + m.timeLogMs + projectLogMs,
+      reassignments
+    };
+    const lines: LinesConfidenceInput = {
+      trackedLines: b.trackedLines,
+      inferredLines: b.inferredLines,
+      manualLines: m.manualLines
+    };
+    return subjectConfidence(credits.byConfidence, time, lines);
+  }
+
+  /**
+   * Confidence across ALL data (issue #143) for the Overview: every branch,
+   * every manual effort and time log entry, and the whole ledger.
+   */
+  getConfidence(): { credits: Confidence; time: Confidence; lines: Confidence } {
+    const b = this.branchConfidenceInputs(this.getAllBranches());
+    let manualMs = 0, manualLines = 0;
+    for (const e of this.manualEffort) {
+      const roll = emptyManualRollup();
+      accumulateManualEntry(roll, e);
+      manualMs += roll.humanCodingMs + roll.aiGeneratingMs + roll.reviewingMs;
+      manualLines += manualEffectiveLines(roll);
+    }
+    const log = emptyModeMs();
+    for (const e of this.timeEntries) {
+      if (e.source !== 'manual' || e.branch) continue;
+      accumulateTimeEntryMs(log, e);
+    }
+    const split = emptyCreditSplit();
+    for (const e of this.creditLedger) addCredit(split, e);
+    return {
+      credits: creditConfidence(split),
+      time: timeConfidence({
+        trackedMs: b.trackedMs,
+        adjustedMs: b.adjustedMs,
+        manualMs,
+        timeLogMs: b.timeLogMs + activeModeMs(log)
+      }),
+      lines: linesConfidence({ trackedLines: b.trackedLines, inferredLines: b.inferredLines, manualLines })
+    };
+  }
+}
+
+function activeModeMs(m: ModeMs): number {
+  return m.humanCoding + m.aiGenerating + m.reviewing;
+}
+
+/** The effective (meaningful) lines a manual rollup adds, mirroring {@link mergeManualRollup}. */
+function manualEffectiveLines(m: ManualRollup): number {
+  const t = m.byCategory.translation;
+  return m.linesHumanAdded + m.linesHumanDeleted + m.linesAiAdded + m.linesAiDeleted -
+    (t ? t.human.added + t.human.deleted + t.ai.added + t.ai.deleted : 0);
 }

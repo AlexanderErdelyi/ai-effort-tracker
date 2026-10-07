@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: node scripts/test.cjs
+
+      - name: Package VSIX
+        if: matrix.os == 'ubuntu-latest'
+        run: npx --yes @vscode/vsce package --out ai-effort-tracker.vsix
+
+      - name: Upload VSIX
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-effort-tracker-vsix
+          path: ai-effort-tracker.vsix
+          retention-days: 14

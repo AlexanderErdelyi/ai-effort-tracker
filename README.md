@@ -1,5 +1,7 @@
 # AI Effort Tracker
 
+[![CI](https://github.com/AlexanderErdelyi/ai-effort-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexanderErdelyi/ai-effort-tracker/actions/workflows/ci.yml)
+
 > VS Code extension that tracks **human vs AI effort**, time, and estimated cost per branch / work item.
 
 ## What it tracks
@@ -16,7 +18,7 @@
 
 ## Usage
 
-1. Install the extension in VS Code
+1. Install the extension in VS Code. On a fresh install the **Get Started** walkthrough opens (see [Setup wizard](#setup-wizard))
 2. It auto-starts tracking on launch
 3. Click the status bar item (`⌨️ Coding`) or run **AI Effort Tracker: Show Session Summary**
 4. At end of a feature branch, export the report via **AI Effort Tracker: Export Report (JSON)**
@@ -26,6 +28,7 @@
 | Command | Description |
 |---------|-------------|
 | `AI Effort Tracker: Show Session Summary` | Open webview summary for current branch |
+| `AI Effort Tracker: Run Setup` | Guided setup: profile, rates, Copilot plan, category rules, project and token (see [Setup wizard](#setup-wizard)) |
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
@@ -38,12 +41,14 @@
 
 ## Configuration
 
+Every setting can be changed in the dashboard's **⚙ Settings** tab (see [Settings tab](#settings-tab)) or in the VS Code Settings editor. The most used ones:
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `aiEffortTracker.idleThresholdSeconds` | `120` | Seconds before switching to idle |
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
-| `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
+| `aiEffortTracker.githubToken` | `""` | Legacy plain-text GitHub PAT. Prefer **⚙ Settings → Integrations → Set token**, which keeps it in VS Code secure storage |
 | `aiEffortTracker.mcpServer.enabled` | `true` | Offer the usage-insights MCP server to Copilot (read-only except review marks, correction labels and rule proposals) |
 | `aiEffortTracker.sessions.showTitles` | `true` | Show chat titles in the Sessions tab |
 | `aiEffortTracker.budget.*` | | Budget alerts, status bar, thresholds, credits per estimated hour (see [Work item budgets](#work-item-budgets)) |
@@ -51,6 +56,33 @@
 | `aiEffortTracker.credits.monthlyBudget` | `0` | Monthly Copilot credit budget for the Overview pace card (0 = off) |
 | `aiEffortTracker.credits.renewalDay` | `1` | Day of the month the credit budget period renews (1–31) |
 | `aiEffortTracker.lessons.*` | | Thresholds for repeated lessons, export folder and review skill (see [Rules for Copilot](#rules-for-copilot)) |
+
+## Setup wizard
+
+Run **AI Effort Tracker: Run Setup** (or **🧭 Run setup** on the dashboard's Settings tab). A list of steps opens; pick one, finish it, and you come back to the list. Every step can be skipped and run again later, and the list shows which ones are done.
+
+| Step | What it does |
+|------|--------------|
+| Restore from a backup *(optional)* | For a new machine: restores a backup file |
+| Developer profile | Junior, mid or senior preset for lines per minute, which you can override |
+| Currency and hourly rates | Currency, hourly cost and hourly sell rate (projects can override them) |
+| Copilot plan and credit budget | Your plan pre-fills the monthly AI credit budget and the cost per credit (plan price ÷ credits, e.g. Pro $10 ÷ 1,000 = $0.01). Also asks for the renewal day |
+| Category rules | Scans the workspace and proposes rules for file types counted as *Other* and for folders such as `docs/`, `specs/`, `infra/`, `translations/` |
+| Project and repository | Creates a project (or picks one) and links the open repository |
+| GitHub token *(optional)* | Stores a token in VS Code secure storage |
+
+The same steps make up the **Get Started → Set up AI Effort Tracker** walkthrough. It opens once on a fresh install, and its check marks follow your settings. Open it again with **Help → Welcome** or the wizard's *Open the Get Started walkthrough* entry. The wizard never deletes data; it only writes settings, creates projects and links repos.
+
+## Settings tab
+
+The **⚙ Settings** tab in the dashboard shows every setting, grouped as Profile & baselines, Rates & ROI, Credits & budget, Categories, Tracking, Nudges, Review, Corrections & rules and Integrations. Search across all of them or pick a group.
+
+- **Proper editors.** Numbers show their unit (lines/min, minutes, your currency per hour). Choices are dropdowns, and the currency field suggests common ISO codes. Category rules, per-category baselines and keyword rules are editable tables. Lists such as budget thresholds take one entry per line.
+- **Validation.** A value is checked before it is saved. If it is out of range, a duplicate row, an invalid regular expression, malformed JSON or a wrong `owner/repo` format, it is rejected with a message next to the field. Numbers accept a decimal comma.
+- **Live.** Changes go to your *user* settings and apply right away. Picking a seniority level also fills in its default baseline, which you can still change.
+- **Reset and overrides.** Changed values have a *modified* badge and a ↺ Reset button that restores the default. If this workspace's `.vscode/settings.json` overrides a value, the tab shows the value that wins and a *Remove override* button.
+- **Secure GitHub token.** *Set token* asks for the token in a password box and keeps it in VS Code secure storage (SecretStorage), never in `settings.json`. The tab only shows where the token comes from, never its value. A token already in the plain-text setting can be moved with *Move to secure storage*. Without a token, your VS Code GitHub sign-in is used.
+- Legacy estimator settings are grouped under *Advanced / legacy* in each group.
 
 ## Overview dashboard
 
@@ -62,14 +94,32 @@ The Overview tab opens with a credit summary:
   spend and the date it will run out at the current pace. Set it with
   **AI Effort Tracker: Set Monthly Credit Budget** (budget and renewal day).
 - A daily spend chart, stacked by model with a cumulative line (and the budget
-  line in the "This period" view), for this period, 30 or 90 days.
+  line in the "This period" view), for the range picked in the filter bar.
 - Insights: budget pace, spend spikes, credits not linked to a work item,
   one dominant model, and big week-on-week changes.
 - "Where the credits went": model, work item, weekday and source breakdowns
-  for the period, 7, 30 or 90 days. Click a work item to open it in Projects.
+  for the filter range. Click a work item to open it in Projects.
 
 Activity, branches, hotspots and keystrokes sit in collapsible sections below;
-which sections are open and the chosen ranges are remembered.
+which sections are open is remembered.
+
+### Filter everything at once
+
+A filter bar above the tabs sets one date range (7, 30 or 90 days, this
+billing period, all time, or custom dates), one project (or "No project") and
+one work item. Every tab reads the same filter, so switching tabs keeps your
+selection, and it survives reloads. Chips show what is active; **Clear** goes
+back to 30 days, all projects.
+
+Some tabs use only part of it, and a short note on the bar says so:
+
+- Overview: the KPI cards keep their fixed windows (today, 7 days, period) and
+  branch totals are all-time, but both follow the project and work item. The
+  budget always covers all projects.
+- Trends is not split by project; only the date range applies.
+- Estimates ignore the date range; accuracy uses every finished work item.
+- Timesheet keeps its week buttons and only applies the project and work item.
+- Correction episodes without a work item count as "No project".
 
 ## Branch changes and tracked time
 
@@ -393,6 +443,36 @@ add time for that work item and day; entries appear in the work item's time log.
 Round to exact, ¼ or ½ hours (default `aiEffortTracker.timesheet.rounding`) and
 export the week as CSV (work item, external ref, title, day, hours).
 
+## Year at a glance
+
+The **Trends** tab starts with a calendar of the last 12 months, one square per
+day. Switch the colour between active time, AI credits and lines; the four
+shades are quartiles of your own active days, so a quiet week still stands out.
+Click a day to see its time by mode (coding, AI generating, reviewing, logged
+manually), credits with their dollar value, lines you wrote versus AI lines per
+category (Code, Docs, Specs, …), and every branch and work item you touched, with
+links to their details. Step to the previous or next active day from there.
+Per-category lines are recorded from version 0.36.0 on; older days show totals only.
+
+## How sure is each number?
+
+Totals mix figures captured in different ways, so key numbers carry a small
+marker. Hover it to see the split behind the number.
+
+| Marker | Meaning |
+| --- | --- |
+| ● Exact | Measured: tracked time, lines counted edit by edit, or the real per-request credit charge. |
+| ◐ Mixed | Part measured, part estimated or entered by hand. |
+| ○ Estimated | Estimated: credits from token counts, credits from a debug log with unpriced calls (a lower bound), or lines inferred from history recorded before line-level tracking. |
+| ✎ Manual | Entered or corrected by hand: manual credits, manual effort, time log entries and time corrections. |
+
+A number is Exact, Estimated or Manual when at least 98% of it is that kind;
+otherwise it is Mixed. ROI, invoice value and profit inherit the markers of the
+time and credits they are computed from. Moving a branch to another work item
+does not change the marker, but the tooltip notes the move because the branch's
+tracked time moves with it. Markers appear on the Overview (credits and the
+activity totals), on project and work item details, and on every Credit Ledger row.
+
 ## Away detection
 
 When you come back to VS Code after being away (idle, another app, a meeting,
@@ -633,6 +713,23 @@ npm install
 npm run watch
 # Press F5 in VS Code to launch Extension Development Host
 ```
+
+Checks (the same ones CI runs on Ubuntu and Windows for every push and pull request):
+
+```bash
+npm run compile
+npm run lint
+npm test              # compiles, then runs every tests/*.test.cjs
+npm test -- backup    # only test files whose name contains "backup"
+```
+
+CI also packages the extension and keeps the `.vsix` as a build artifact for 14 days.
+
+Dashboard styling (`src/ui/dashboard.ts`) uses a small design system so every tab looks the same in light, dark and high-contrast themes:
+
+- **Tokens** in `:root`: `--muted`, `--border`, `--surface`, `--good`/`--warn`/`--bad`/`--info`, spacing `--sp1..5`, radii `--r-sm/--r/--r-lg` and font sizes `--fs-xs..lg`. They map onto VS Code theme variables, so prefer them over raw `--vscode-*` names.
+- **Classes** instead of inline styles: `muted`, `t-sm`, `mt2`, `hbar`, `c-ai`/`c-human`/`c-cost`, buttons `dtab` (`btn-sm`, `primary`) and badges `b-good`/`b-warn`/`b-bad`/`b-info`/`b-muted`.
+- **States**: `emptyState(title, hint)` and `loadingState(label)` in the webview script, and `<tr class="empty-row">` for empty tables. Columns where every cell is a number are right-aligned automatically.
 
 ## Roadmap
 

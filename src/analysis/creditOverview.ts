@@ -6,12 +6,16 @@
  * Pure: no vscode import, all dates are local calendar days, `now` is injected.
  */
 
+import { addCredit, creditConfidence, emptyCreditSplit, type Confidence, type CreditKindInput, type CreditSplit } from './confidence';
+
 export interface CreditOverviewEntry {
   ts: number;
   credits: number;
   model: string;
   source?: string;
   workItemId?: string | null;
+  exact?: boolean;
+  debugUsage?: CreditKindInput['debugUsage'];
 }
 
 export interface CreditOverviewOptions {
@@ -22,6 +26,8 @@ export interface CreditOverviewOptions {
   renewalDay?: number;
   /** Days of daily history to return (default 90). */
   days?: number;
+  /** Extra `[from, to)` window (epoch ms) returned as `breakdown.custom` (#146). */
+  window?: { from?: number; to?: number };
 }
 
 export interface CreditRow { key: string; credits: number; entries: number }
@@ -35,6 +41,9 @@ export interface CreditBreakdown {
   bySource: CreditRow[];
   /** Credits not linked to any work item. */
   unattributed: number;
+  /** Credits by capture quality (#143). */
+  byConfidence: CreditSplit;
+  confidence: Confidence;
 }
 
 export type BreakdownWindow = 'period' | '7' | '30' | '90';
@@ -68,7 +77,7 @@ export interface CreditOverview {
   daily: { date: string; credits: number; byModel: Record<string, number> }[];
   /** Models shown as separate series in `daily` (top 5); the rest are 'other'. */
   models: string[];
-  breakdown: Record<BreakdownWindow, CreditBreakdown>;
+  breakdown: Record<BreakdownWindow, CreditBreakdown> & { custom?: CreditBreakdown };
   budget: BudgetPace | null;
   insights: CreditInsight[];
 }
@@ -134,12 +143,14 @@ function breakdown(entries: CreditOverviewEntry[]): CreditBreakdown {
   const src = new Map<string, { credits: number; entries: number }>();
   const dow = WEEKDAYS.map(() => ({ credits: 0, entries: 0 }));
   let total = 0, unattributed = 0;
+  const conf = emptyCreditSplit();
   const bump = (m: Map<string, { credits: number; entries: number }>, k: string, c: number) => {
     const v = m.get(k) ?? { credits: 0, entries: 0 };
     v.credits += c; v.entries += 1; m.set(k, v);
   };
   for (const e of entries) {
     total += e.credits;
+    addCredit(conf, e);
     bump(model, e.model || 'unknown', e.credits);
     bump(src, e.source || 'unknown', e.credits);
     if (e.workItemId) bump(wi, e.workItemId, e.credits);
@@ -157,6 +168,8 @@ function breakdown(entries: CreditOverviewEntry[]): CreditBreakdown {
     byDayOfWeek: order.map(i => ({ key: WEEKDAYS[i], credits: round(dow[i].credits), entries: dow[i].entries })),
     bySource: rows(src),
     unattributed: round(unattributed),
+    byConfidence: conf,
+    confidence: creditConfidence(conf),
   };
 }
 
@@ -259,6 +272,8 @@ export function buildCreditOverview(ledger: CreditOverviewEntry[], opts: CreditO
   const credits30 = last30.reduce((s, e) => s + e.credits, 0);
 
   const budgetValue = opts.monthlyBudget ?? 0;
+  const w = opts.window;
+  const custom = w ? breakdown(entries.filter(e => (w.from === undefined || e.ts >= w.from) && (w.to === undefined || e.ts < w.to))) : undefined;
   const base = {
     today: round(sumBetween(today0, tomorrow0)),
     yesterday: round(sumBetween(addDays(today0, -1), today0)),
@@ -274,6 +289,7 @@ export function buildCreditOverview(ledger: CreditOverviewEntry[], opts: CreditO
       '7': breakdown(within(addDays(today0, -6))),
       '30': breakdown(last30),
       '90': breakdown(within(addDays(today0, -89))),
+      ...(custom ? { custom } : {}),
     },
     budget: budgetValue > 0 ? pace(budgetValue, periodCredits, per.start, per.end, now) : null,
   };

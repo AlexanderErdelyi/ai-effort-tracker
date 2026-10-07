@@ -294,7 +294,7 @@ test('stdio MCP server answers tool calls from a read-only store', async t => {
 test('session list aggregates, flags, filters, sorts and pages sessions', () => {
   const data = fixture();
   // Make s2 the expensive, low-output one: plenty of credits, no lines.
-  data.creditLedger.push(entry('s2', 'u2', [call('g', 61 * MIN, 'claude-opus-5.5', 190000, 0, 30000)], { workItemId: 'WI-2', branch: 'main' }));
+  data.creditLedger.push(entry('s2', 'u2', [call('g', 61 * MIN, 'claude-opus-5.5', 190000, 0, 30000)], { workItemId: 'WI-2', branch: 'main', projectId: null }));
   const rows = ui.sessionRows(data, {}, NOW);
   assert.deepEqual(rows.map(r => r.sessionId), ['s2', 's1']);
   const [s2, s1] = rows;
@@ -319,6 +319,8 @@ test('session list aggregates, flags, filters, sorts and pages sessions', () => 
   assert.equal(ui.querySessions(data, { lowOutputOnly: true }, NOW).rows[0].sessionId, 's2');
   assert.equal(ui.querySessions(data, { minCredits: 1e9 }, NOW).total, 0);
   assert.equal(ui.querySessions(data, { filter: { workItemId: 'WI-1' } }, NOW).total, 1);
+  assert.deepEqual(ui.querySessions(data, { filter: { projectId: 'p1' } }, NOW).rows.map(r => r.sessionId).sort(), ['s1', 's2']);
+  assert.deepEqual(ui.querySessions(data, { filter: { projectId: '__none__' } }, NOW).rows.map(r => r.sessionId), ['s2']);
   const page = ui.querySessions(data, { limit: 1, offset: 1 }, NOW);
   assert.equal(page.total, 2);
   assert.deepEqual(page.rows.map(r => r.sessionId), ['s1']);
