@@ -36,6 +36,8 @@ import { renderDashboardHtml } from './ui/dashboard';
 import { GitHubService, BillingUsage } from './services/githubService';
 import { registerUsageInsightsMcp } from './mcp/provider';
 import { handleSessionsMessage } from './ui/sessionsPanel';
+import { handleSettingsMessage } from './ui/settingsPanel';
+import { SENIORITY_PRESETS } from './util/settingsModel';
 import { BudgetMonitor } from './ui/budgetMonitor';
 import { AwayController } from './ui/awayPrompt';
 import { newChatWithHandoff } from './ui/handoff';
@@ -164,6 +166,7 @@ const KNOWN_MODELS = [
 
 export function activate(context: vscode.ExtensionContext) {
   db = new Database(context.globalStorageUri.fsPath);
+  ghService.useSecrets(context.secrets);
   statusBar = new StatusBarManager();
   timeTracker = new TimeTracker(db, statusBar);
   gitTracker = new GitTracker(db, timeTracker);
@@ -478,7 +481,7 @@ export function activate(context: vscode.ExtensionContext) {
           `Copilot usage (${lastBilling.period}, ${lastBilling.scope}): ${lastBilling.premiumRequests} premium requests · $${lastBilling.netUsd.toFixed(2)} net.`
         );
       } else if (lastBilling?.error === 'no-token') {
-        vscode.window.showWarningMessage('No GitHub token. Set aiEffortTracker.githubToken or sign in to GitHub in VS Code.');
+        vscode.window.showWarningMessage('No GitHub token. Set one in Dashboard → ⚙ Settings → Integrations (kept in secure storage) or sign in to GitHub in VS Code.');
       } else if (lastBilling?.error === 'no-copilot') {
         vscode.window.showInformationMessage('No Copilot premium-request usage found for this billing period.');
       } else {
@@ -636,6 +639,12 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
     }
     if (m?.type === 'estimates') {
       dashboardPanel?.webview.postMessage({ type: 'estimatesData', ...estimatesPayload(m.projectId, m.workItemId) });
+      return;
+    }
+    if (m && typeof m === 'object' && await handleSettingsMessage(m, context, ghService, msg => dashboardPanel?.webview.postMessage(msg))) {
+      if (m.type === 'setToken' || m.type === 'clearToken' || m.type === 'moveTokenToSecure') {
+        try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
+      }
       return;
     }
     if (m && typeof m === 'object' && await handleSessionsMessage(m, db, context, msg => dashboardPanel?.webview.postMessage(msg))) return;
@@ -1289,12 +1298,6 @@ async function resetTrackedTime(arg?: string) {
  * starting point and the user's adjusted value always wins and persists. `custom`
  * intentionally has no preset: it means "leave the baseline as-is, don't auto-fill".
  */
-const SENIORITY_PRESETS: Record<'junior' | 'mid' | 'senior', number> = {
-  junior: 3,
-  mid: 5,
-  senior: 8,
-};
-
 type Seniority = keyof typeof SENIORITY_PRESETS | 'custom';
 
 /**

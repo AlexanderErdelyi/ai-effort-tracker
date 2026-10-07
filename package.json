@@ -689,7 +689,7 @@
         "aiEffortTracker.githubToken": {
           "type": "string",
           "default": "",
-          "description": "GitHub personal access token (needs 'manage_billing:copilot' scope for Copilot Metrics API)"
+          "description": "GitHub personal access token stored in plain text (needs 'manage_billing:copilot' scope for Copilot Metrics API). Prefer Dashboard → Settings → Integrations → Set token, which keeps it in VS Code secure storage."
         },
         "aiEffortTracker.githubOrg": {
           "type": "string",

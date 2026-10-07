@@ -40,12 +40,14 @@
 
 ## Configuration
 
+Every setting can be changed in the dashboard's **⚙ Settings** tab (see [Settings tab](#settings-tab)) or in the VS Code Settings editor. The most used ones:
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `aiEffortTracker.idleThresholdSeconds` | `120` | Seconds before switching to idle |
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
-| `aiEffortTracker.githubToken` | `""` | GitHub PAT for issue metadata |
+| `aiEffortTracker.githubToken` | `""` | Legacy plain-text GitHub PAT. Prefer **⚙ Settings → Integrations → Set token**, which keeps it in VS Code secure storage |
 | `aiEffortTracker.mcpServer.enabled` | `true` | Offer the usage-insights MCP server to Copilot (read-only except review marks, correction labels and rule proposals) |
 | `aiEffortTracker.sessions.showTitles` | `true` | Show chat titles in the Sessions tab |
 | `aiEffortTracker.budget.*` | | Budget alerts, status bar, thresholds, credits per estimated hour (see [Work item budgets](#work-item-budgets)) |
@@ -53,6 +55,17 @@
 | `aiEffortTracker.credits.monthlyBudget` | `0` | Monthly Copilot credit budget for the Overview pace card (0 = off) |
 | `aiEffortTracker.credits.renewalDay` | `1` | Day of the month the credit budget period renews (1–31) |
 | `aiEffortTracker.lessons.*` | | Thresholds for repeated lessons, export folder and review skill (see [Rules for Copilot](#rules-for-copilot)) |
+
+## Settings tab
+
+The **⚙ Settings** tab in the dashboard shows every setting, grouped as Profile & baselines, Rates & ROI, Credits & budget, Categories, Tracking, Nudges, Review, Corrections & rules and Integrations. Search across all of them or pick a group.
+
+- **Proper editors.** Numbers show their unit (lines/min, minutes, your currency per hour). Choices are dropdowns, and the currency field suggests common ISO codes. Category rules, per-category baselines and keyword rules are editable tables. Lists such as budget thresholds take one entry per line.
+- **Validation.** A value is checked before it is saved. If it is out of range, a duplicate row, an invalid regular expression, malformed JSON or a wrong `owner/repo` format, it is rejected with a message next to the field. Numbers accept a decimal comma.
+- **Live.** Changes go to your *user* settings and apply right away. Picking a seniority level also fills in its default baseline, which you can still change.
+- **Reset and overrides.** Changed values have a *modified* badge and a ↺ Reset button that restores the default. If this workspace's `.vscode/settings.json` overrides a value, the tab shows the value that wins and a *Remove override* button.
+- **Secure GitHub token.** *Set token* asks for the token in a password box and keeps it in VS Code secure storage (SecretStorage), never in `settings.json`. The tab only shows where the token comes from, never its value. A token already in the plain-text setting can be moved with *Move to secure storage*. Without a token, your VS Code GitHub sign-in is used.
+- Legacy estimator settings are grouped under *Advanced / legacy* in each group.
 
 ## Overview dashboard
 

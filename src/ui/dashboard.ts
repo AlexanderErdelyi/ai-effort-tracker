@@ -231,6 +231,18 @@ export function renderDashboardHtml(
   .b-bad{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad);}
   .b-info{background:color-mix(in srgb,var(--info) 18%,transparent);color:var(--info);}
   .b-muted{background:var(--surface-2);color:var(--muted);}
+  .set-row{display:grid;grid-template-columns:minmax(200px,300px) 1fr;gap:var(--sp2) var(--sp4);padding:var(--sp3) 0;border-top:1px solid var(--border);}
+  .card>h3+.set-row{border-top:none;padding-top:0;}
+  .set-row .sd{font-size:var(--fs-sm);color:var(--muted);margin-top:2px;line-height:1.4;}
+  .set-ed{display:flex;flex-wrap:wrap;align-items:center;gap:6px;}
+  .set-ed textarea{width:100%;min-height:72px;font-family:var(--vscode-editor-font-family,monospace);font-size:var(--fs-md);}
+  .set-rows{display:grid;gap:4px;width:100%;}
+  .set-kv input[type=text]{flex:1;min-width:120px;}
+  .set-msg:empty{display:none;}
+  .set-err{color:var(--bad);font-size:var(--fs-sm);margin-top:4px;}
+  .set-ok{color:var(--good);font-size:var(--fs-sm);margin-top:4px;}
+  .set-adv>summary{cursor:pointer;color:var(--muted);margin-top:var(--sp3);}
+  @media (max-width:700px){.set-row{grid-template-columns:1fr;}}
   body.vscode-high-contrast .badge,body.vscode-high-contrast-light .badge,body.vscode-high-contrast .pill.active,body.vscode-high-contrast-light .pill.active{outline:1px solid var(--border);}
   .tip{cursor:help;}abbr.tip,span.tip{text-decoration:underline dotted;text-underline-offset:2px;}
   .empty{padding:var(--sp5) var(--sp4);text-align:center;border:1px dashed var(--border);border-radius:var(--r-lg);color:var(--muted);}
@@ -515,7 +527,7 @@ function billingHtml(){
     return'<div class="mt4 card"><h3>\\uD83D\\uDCB3 Copilot Premium Requests &mdash; real usage</h3><p class="mt2 muted">Pull your real billed premium-request usage from GitHub\\u2019s billing API.</p>'+imp+'</div>';
   }
   if(!BL.ok){
-    var msg=BL.error==='no-token'?'No GitHub token \\u2014 set <code>aiEffortTracker.githubToken</code> (fine-grained PAT with <strong>Plan: Read-only</strong>) or sign in to GitHub.':BL.error==='no-copilot'?'No Copilot premium-request usage found for '+BL.period+' yet.':(BL.errorDetail||'Could not load billing usage.');
+    var msg=BL.error==='no-token'?'No GitHub token \\u2014 set one in <button class="dtab btn-sm" data-action="tab" data-value="settings">\u2699 Settings \u2192 Integrations</button> (fine-grained PAT with <strong>Plan: Read-only</strong>) or sign in to GitHub.':BL.error==='no-copilot'?'No Copilot premium-request usage found for '+BL.period+' yet.':(BL.errorDetail||'Could not load billing usage.');
     return'<div class="mt4 card"><h3>\\uD83D\\uDCB3 Copilot Premium Requests &mdash; real usage</h3><p class="mt2 muted">'+msg+'</p>'+imp+'</div>';
   }
   var rows=(BL.items||[]).map(function(i){return'<tr><td>'+i.sku+'</td><td>'+i.quantity.toLocaleString()+(i.unit?' '+i.unit:'')+'</td><td>$'+i.grossUsd.toFixed(2)+'</td><td>$'+i.netUsd.toFixed(2)+'</td></tr>';}).join('')||'<tr class="empty-row"><td colspan="4">No line items</td></tr>';
@@ -532,7 +544,7 @@ function renderGhMetrics(){
   const el=document.getElementById('ghview');
   var bh=billingHtml();
   if(!ghMetrics){
-    el.innerHTML=bh+'<div class="mt4 card"><h3>GitHub Copilot Metrics API</h3><p class="muted mt2">Configure your GitHub token in settings to load official Copilot metrics.</p><p class="mt2 t-md muted">Required: <code>aiEffortTracker.githubToken</code> (needs <code>manage_billing:copilot</code> scope)</p></div>';
+    el.innerHTML=bh+'<div class="mt4 card"><h3>GitHub Copilot Metrics API</h3><p class="muted mt2">Configure your GitHub token in settings to load official Copilot metrics.</p><p class="mt2 t-md muted">Set a token in <button class="dtab btn-sm" data-action="tab" data-value="settings">\u2699 Settings \u2192 Integrations</button> (needs <code>manage_billing:copilot</code> scope); it is kept in secure storage.</p></div>';
     return;
   }
   if(ghMetrics.error==='needs-scope-ado'){
@@ -1544,6 +1556,7 @@ function showTab(name){
   else if(name==='timesheet'){document.getElementById('tab-timesheet').classList.add('active');requestTimesheet();}
   else if(name==='health'){document.getElementById('tab-health').classList.add('active');requestHealth();}
   else if(name==='corrections'){document.getElementById('tab-corrections').classList.add('active');requestCorrections();}
+  else if(name==='settings'){document.getElementById('tab-settings').classList.add('active');requestSettings();}
   else{document.getElementById('dtab').classList.add('active');}
   renderFilterBar();
 }
@@ -1659,6 +1672,104 @@ function renderTimesheet(){
     +'<table class="w100"><thead>'+head+'</thead><tbody>'+body+foot+'</tbody></table>'+note;
 }
 
+// #148 Settings tab: every setting with a proper editor, validation, reset and override info.
+var SET=null,setLoading=false,setQ='',setGrp='',setMsg={};
+function requestSettings(){setLoading=true;setMsg={};renderSettings();vscode.postMessage({type:'settings'});}
+function setGet(id){return SET?SET.settings.filter(function(s){return s.id===id;})[0]:null;}
+function setVal(s){return s.userValue!==undefined?s.userValue:s.defaultValue;}
+function setUnit(s){var u=s.unit||'';if(u.indexOf('{currency}')>=0){var c=setGet('currency');u=u.split('{currency}').join(c&&c.value?c.value:'USD');}return u;}
+function setShow(v){if(v===undefined||v===null||v==='')return'(empty)';return typeof v==='object'?JSON.stringify(v):String(v);}
+function setOpts(opts,titles,sel){return opts.map(function(o,i){return'<option value="'+esc(o)+'"'+(titles&&titles[i]?' title="'+esc(titles[i])+'"':'')+(o===sel?' selected':'')+'>'+esc(o)+'</option>';}).join('');}
+function setKvRow(s,k,v){
+  var vi;
+  if(s.kind==='rules')vi='<input class="sesin set-kv-v" type="text" placeholder="category" value="'+esc(v==null?'':v)+'">';
+  else if(s.valueKind==='enum')vi='<select class="sesin set-kv-v">'+setOpts(s.valueOptions||[],null,v)+'</select>';
+  else if(s.valueKind==='number')vi='<input class="sesin set-kv-v" type="number" step="any" min="0" style="width:96px" value="'+esc(v==null?'':String(v))+'">'+(s.unit?' <span class="muted t-sm">'+esc(setUnit(s))+'</span>':'');
+  else vi='<input class="sesin set-kv-v" type="text" value="'+esc(v==null?'':v)+'">';
+  return'<div class="set-kv hrow"><input class="sesin set-kv-k" type="text" placeholder="'+(s.kind==='rules'?'pattern (regex)':'name')+'" value="'+esc(k)+'">'+vi+'<button class="dtab btn-sm" data-action="setRowDel" title="Remove row" aria-label="Remove row">\u2715</button></div>';
+}
+function setEditor(s){
+  var v=setVal(s),k=esc(s.id);
+  if(s.kind==='secret'){
+    var src=SET.tokenSource;
+    var st=src==='secure'?'<span class="badge b-good">\uD83D\uDD12 Stored securely</span>':src==='settings'?'<span class="badge b-warn">Plain text in settings.json</span>':'<span class="badge b-muted">Not set</span>';
+    return st+' <button class="dtab btn-sm primary" data-action="setToken">'+(src==='none'?'Set token\u2026':'Replace token\u2026')+'</button>'
+      +(src==='secure'?' <button class="dtab btn-sm" data-action="clearToken">Remove</button>':'')
+      +(src==='settings'?' <button class="dtab btn-sm" data-action="moveTokenToSecure">Move to secure storage</button>':'')
+      +'<div class="w100 t-sm muted">The token is never shown here. Without one, your VS Code GitHub sign-in is used.</div>';
+  }
+  if(s.kind==='boolean')return'<label class="hrow"><input type="checkbox" class="set-in" data-key="'+k+'"'+(v?' checked':'')+'> '+(v?'On':'Off')+'</label>';
+  if(s.kind==='number')return'<input type="number" class="sesin set-in" data-key="'+k+'" style="width:110px" step="'+(s.integer?'1':'any')+'"'+(s.min!=null?' min="'+s.min+'"':'')+(s.max!=null?' max="'+s.max+'"':'')+' value="'+esc(v==null?'':String(v))+'">'+(s.unit?'<span class="muted t-sm">'+esc(setUnit(s))+'</span>':'');
+  if(s.kind==='enum')return'<select class="sesin set-in" data-key="'+k+'">'+setOpts(s.options||[],s.optionLabels,v)+'</select>'+(s.optionLabels&&s.options?'<span class="muted t-sm">'+esc(s.optionLabels[(s.options||[]).indexOf(v)]||'')+'</span>':'');
+  if(s.kind==='currency')return'<input type="text" class="sesin set-in" data-key="'+k+'" list="set-cur" maxlength="3" style="width:80px;text-transform:uppercase" value="'+esc(v||'')+'"><span class="muted t-sm">ISO code, e.g. EUR</span>';
+  if(s.kind==='string')return'<input type="text" class="sesin set-in" data-key="'+k+'" style="min-width:260px" value="'+esc(v||'')+'">';
+  var save='<button class="dtab btn-sm primary" data-action="setSave" data-key="'+k+'">Save</button>';
+  if(s.kind==='map'){
+    var o=v&&typeof v==='object'?v:{};
+    return'<div class="set-rows">'+Object.keys(o).map(function(n){return setKvRow(s,n,o[n]);}).join('')+'</div><button class="dtab btn-sm" data-action="setRowAdd" data-key="'+k+'">+ Add row</button>'+save;
+  }
+  if(s.kind==='rules'){
+    var r=Array.isArray(v)?v:[];
+    return'<div class="set-rows">'+r.map(function(x){return setKvRow(s,x.pattern,x.category);}).join('')+'</div><button class="dtab btn-sm" data-action="setRowAdd" data-key="'+k+'">+ Add rule</button>'+save;
+  }
+  if(s.kind==='list')return'<textarea class="sesin set-ta" data-key="'+k+'" rows="3" placeholder="One entry per line">'+esc((Array.isArray(v)?v:[]).join('\\n'))+'</textarea>'+(s.unit?'<span class="muted t-sm">'+esc(setUnit(s))+'</span>':'')+save;
+  return'<textarea class="sesin set-ta" data-key="'+k+'" rows="4">'+esc(JSON.stringify(v===undefined?null:v,null,2))+'</textarea>'+save;
+}
+function setRow(s){
+  var m=setMsg[s.id];
+  var head='<div><div><strong>'+esc(s.label)+'</strong>'+(!s.isDefault&&s.kind!=='secret'?' <span class="badge b-info" title="Changed from the default">modified</span>':'')+'</div>'
+    +(s.description?'<div class="sd">'+esc(s.description)+'</div>':'')
+    +'<div class="hrow mt1"><span class="t-xs muted mono">'+esc(s.id)+'</span>'
+    +(s.kind!=='secret'?'<button class="dtab btn-sm" data-action="setReset" data-key="'+esc(s.id)+'" title="Default: '+esc(setShow(s.defaultValue))+'"'+(s.isDefault?' disabled':'')+'>\u21ba Reset</button>':'')+'</div></div>';
+  var ov=s.overriddenBy&&s.kind!=='secret'?'<div class="mt2 t-sm"><span class="badge b-warn">'+(s.overriddenBy==='folder'?'Folder':'Workspace')+' setting wins</span> <span class="mono">'+esc(setShow(s.overrideValue))+'</span> <button class="dtab btn-sm" data-action="setClearWs" data-key="'+esc(s.id)+'">Remove override</button></div>':'';
+  var msg='<div class="set-msg">'+(m?'<div class="'+(m.ok?'set-ok':'set-err')+'" role="'+(m.ok?'status':'alert')+'">'+esc(m.text)+'</div>':'')+'</div>';
+  return'<div class="set-row" data-key="'+esc(s.id)+'">'+head+'<div><div class="set-ed">'+setEditor(s)+'</div>'+ov+msg+'</div></div>';
+}
+function renderSettings(){
+  var el=document.getElementById('settings');if(!el)return;
+  if(!SET){el.innerHTML=setLoading?loadingState('Loading settings\u2026'):emptyState('Settings not loaded','Open the tab again to load them.');return;}
+  var q=setQ.trim().toLowerCase();
+  var all=SET.settings,list=all.filter(function(s){return !q||(s.label+' '+s.description+' '+s.id).toLowerCase().indexOf(q)>=0;});
+  var groups=SET.groups.filter(function(g){return all.some(function(s){return s.group===g;});});
+  if(setGrp&&groups.indexOf(setGrp)<0)setGrp='';
+  var chips='<button class="dtab'+(setGrp===''?' active':'')+'" data-action="setGrp" data-value="">All</button>'+groups.map(function(g){
+    var n=list.filter(function(s){return s.group===g;}).length;
+    return'<button class="dtab'+(setGrp===g?' active':'')+'" data-action="setGrp" data-value="'+esc(g)+'"'+(n?'':' disabled')+'>'+esc(g)+' <span class="muted">'+n+'</span></button>';
+  }).join('');
+  var mod=all.filter(function(s){return !s.isDefault&&s.kind!=='secret';}).length,ovr=all.filter(function(s){return s.overriddenBy;}).length;
+  var ctl='<div class="rng"><input id="set-q" class="sesin" type="search" placeholder="Search settings\u2026" aria-label="Search settings" value="'+esc(setQ)+'" style="min-width:220px">'+chips
+    +'<span style="flex:1"></span><button class="dtab btn-sm" data-action="setOpenUi" title="Open the same settings in the VS Code Settings editor">Open in VS Code Settings</button></div>';
+  var note='<p class="t-md muted mb3">Changes are saved to your <strong>user</strong> settings and apply immediately. '+mod+' changed from the default'+(ovr?' \u00b7 <span class="c-cost">'+ovr+' overridden by this workspace</span>':'')+'.</p>';
+  var shown=list.filter(function(s){return !setGrp||s.group===setGrp;});
+  var body=groups.filter(function(g){return !setGrp||g===setGrp;}).map(function(g){
+    var rows=shown.filter(function(s){return s.group===g;});if(!rows.length)return'';
+    var basic=rows.filter(function(s){return !s.advanced;}),adv=rows.filter(function(s){return s.advanced;});
+    return'<div class="card mb3"><h3>'+esc(g)+'</h3>'+basic.map(setRow).join('')
+      +(adv.length?'<details class="set-adv"'+(q?' open':'')+'><summary>Advanced / legacy ('+adv.length+')</summary>'+adv.map(setRow).join('')+'</details>':'')+'</div>';
+  }).join('');
+  el.innerHTML=ctl+note+(body||emptyState('No settings match','Try another search term.'))
+    +'<datalist id="set-cur">'+(SET.currencies||[]).map(function(c){return'<option value="'+esc(c)+'">';}).join('')+'</datalist>';
+}
+function setSend(key,value){vscode.postMessage({type:'setSetting',key:key,value:value});}
+function setCollect(key){
+  var s=setGet(key),row=document.querySelector('.set-row[data-key="'+key+'"]');if(!s||!row)return;
+  if(s.kind==='map'||s.kind==='rules'){
+    var rows=[].slice.call(row.querySelectorAll('.set-kv')).map(function(r){return[r.querySelector('.set-kv-k').value,r.querySelector('.set-kv-v').value];});
+    setSend(key,s.kind==='rules'?rows.map(function(p){return{pattern:p[0],category:p[1]};}):rows);
+  }else{
+    var ta=row.querySelector('.set-ta');if(!ta)return;
+    setSend(key,s.kind==='list'?ta.value.split(/\\r?\\n/):ta.value);
+  }
+}
+function setResult(r){
+  if(!r||!r.key)return false;
+  setMsg={};setMsg[r.key]={ok:r.ok,text:r.ok?'\u2713 Saved':r.error||'Could not save.'};
+  (r.also||[]).forEach(function(a){setMsg[a]={ok:true,text:'\u2713 Updated to match '+((setGet(r.key)||{}).label||r.key)};});
+  if(r.ok)return false;
+  var slot=document.querySelector('.set-row[data-key="'+r.key+'"] .set-msg');
+  if(slot){slot.innerHTML='<div class="set-err" role="alert">'+esc(setMsg[r.key].text)+'</div>';return true;}
+  return false;
+}
 // #104 Health tab: problems with the tracked data, each with a fix.
 var HEALTH=null,healthLoading=false;
 function requestHealth(){healthLoading=true;renderHealth();vscode.postMessage({type:'health'});}
@@ -1873,6 +1984,7 @@ function corrEpNote(e){var ns=e.items.filter(function(i){return i.category;}).ma
 function corrLabel(ids,category,scope,note){var m={type:'labelCorrections',ids:ids,category:category};if(scope!==undefined)m.scope=scope;if(note!==undefined)m.note=note;corrLoading=true;vscode.postMessage(m);}
 document.addEventListener('change',function(e){
   var t=e.target;if(!t||!t.classList)return;
+  if(t.classList.contains('set-in')){setSend(t.dataset.key,t.type==='checkbox'?t.checked:t.value);return;}
   var row=t.closest?t.closest('.corr-row'):null;
   var rowVal=function(cls){var x=row?row.querySelector(cls):null;return x?x.value:undefined;};
   if(t.classList.contains('corr-cat')){
@@ -2015,9 +2127,10 @@ window.addEventListener('message',function(e){
   if(msg.type==='sessionsData'){sesLoading=false;SES=msg;var sv=document.querySelector('.view.active');if(sv&&sv.id==='sessions')renderSessions();return;}
   if(msg.type==='sessionDetailData'){sesDet[msg.sessionId]=msg;var dv=document.querySelector('.view.active');if(dv&&dv.id==='sessions')renderSessions();return;}
   if(msg.type==='openWorkItem'&&msg.id){selWi=String(msg.id);projView='workitem';showTab('projects');return;}
-  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions','estimates','timesheet','health','corrections'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
+  if(msg.type==='openTab'&&['overview','trends','focus','projects','ledger','optimize','sessions','estimates','timesheet','health','corrections','settings'].indexOf(msg.tab)>=0){showTab(msg.tab);return;}
   if(msg.type==='timesheetData'){tsLoading=false;TS=msg;var tv=document.querySelector('.view.active');if(tv&&tv.id==='timesheet')renderTimesheet();return;}
   if(msg.type==='correctionsData'){corrLoading=false;CORR=msg;var cv=document.querySelector('.view.active');if(cv&&cv.id==='corrections')renderCorrections();return;}
+  if(msg.type==='settingsData'){setLoading=false;SET=msg;var kept=setResult(msg.result);var stv=document.querySelector('.view.active');if(!kept&&stv&&stv.id==='settings')renderSettings();return;}
   if(msg.type==='healthData'){healthLoading=false;HEALTH=msg.report;var hv=document.querySelector('.view.active');if(hv&&hv.id==='health')renderHealth();return;}
   if(msg.type==='estimatesData'){estLoading=false;EST=msg;var ev=document.querySelector('.view.active');if(ev&&ev.id==='estimates')renderEstimates();return;}
   if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
@@ -2046,6 +2159,10 @@ window.addEventListener('message',function(e){
   }
 });
 
+document.addEventListener('input',function(e){
+  var t=e.target;if(!t||t.id!=='set-q')return;
+  setQ=t.value;renderSettings();var q2=document.getElementById('set-q');if(q2){q2.focus();q2.setSelectionRange(q2.value.length,q2.value.length);}
+});
 renderOverview();
 renderFilterBar();
 // Wire up tab buttons (CSP blocks inline onclick — use addEventListener instead)
@@ -2061,6 +2178,7 @@ document.getElementById('tab-estimates').addEventListener('click',function(){sho
 document.getElementById('tab-timesheet').addEventListener('click',function(){showTab('timesheet');});
 document.getElementById('tab-health').addEventListener('click',function(){showTab('health');});
 document.getElementById('tab-corrections').addEventListener('click',function(){showTab('corrections');});
+document.getElementById('tab-settings').addEventListener('click',function(){showTab('settings');});
 document.getElementById('dtab').addEventListener('click',function(){
   var br=this.dataset.branch||currentBranch;showDetail(br);
 });
@@ -2076,6 +2194,14 @@ document.addEventListener('click',function(e){
   else if(a==='calMetric'){calMetric=v;renderCalendar();}
   else if(a==='calDay'){calSel=v||null;renderCalendar();}
   else if(a==='optRefresh')requestOptimize();
+  else if(a==='setGrp'){setGrp=v||'';renderSettings();}
+  else if(a==='setReset')vscode.postMessage({type:'resetSetting',key:t.dataset.key});
+  else if(a==='setClearWs')vscode.postMessage({type:'clearWorkspaceSetting',key:t.dataset.key});
+  else if(a==='setToken'||a==='clearToken'||a==='moveTokenToSecure')vscode.postMessage({type:a});
+  else if(a==='setOpenUi')vscode.postMessage({type:'openSettingsJson'});
+  else if(a==='setSave')setCollect(t.dataset.key);
+  else if(a==='setRowDel'){var kvr=t.closest('.set-kv');if(kvr)kvr.remove();}
+  else if(a==='setRowAdd'){var srs=setGet(t.dataset.key),box=t.closest('.set-ed').querySelector('.set-rows');if(srs&&box){box.insertAdjacentHTML('beforeend',setKvRow(srs,'',srs.kind==='map'&&srs.valueKind==='enum'?(srs.valueOptions||[])[0]:''));var ni=box.lastElementChild.querySelector('input');if(ni)ni.focus();}}
   else if(a==='sesRefresh')requestSessions();
   else if(a==='sesCsv')vscode.postMessage(sesMsg('sessionsCsv'));
   else if(a==='sesSort'){if(sesQ.sort===v)sesQ.descending=!sesQ.descending;else{sesQ.sort=v;sesQ.descending=true;}sesQ.offset=0;requestSessions();}
@@ -2161,6 +2287,7 @@ vscode.postMessage({type:'ready'});`;
     '  <button class="tab" id="tab-corrections">\uD83E\uDDE0 Corrections</button>',
     '  <button class="tab" id="dtab">Branch Detail</button>',
     '  <button class="tab" id="tab-ghview">\uD83D\uDC19 Copilot Metrics</button>',
+    '  <button class="tab" id="tab-settings">\u2699 Settings</button>',
     '</div>',
     '<div id="gf" class="gf"></div>',
     '<div id="overview" class="view active"></div>',
@@ -2176,6 +2303,7 @@ vscode.postMessage({type:'ready'});`;
     '<div id="corrections" class="view"></div>',
     '<div id="detail" class="view"></div>',
     '<div id="ghview" class="view"></div>',
+    '<div id="settings" class="view"></div>',
     `<script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>`,
     `<script nonce="${nonce}">${js}</script>`,
     '</body></html>'
