@@ -5,7 +5,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
-import { branchLabel, branchNameOf, repoLabel, repoOfKey } from './util/branchKey';
+import { branchLabel, branchNameOf, LEGACY_REPO, repoLabel, repoOfKey } from './util/branchKey';
+import { buildRepoOverview } from './analysis/repoOverview';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
@@ -24,7 +25,7 @@ import {
   restoreSideStore, SECRET_SETTINGS, serializeBundle, writeSafetyCopy, type BackupBundle, type DataSetId
 } from './store/backup';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
-import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
+import type { BranchSummary, EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
 import type { TimeEntry, TimeEntryInput, TimeEntryPatch } from './store/database';
 import { TIME_ENTRY_CATEGORIES } from './store/database';
@@ -472,7 +473,8 @@ export function activate(context: vscode.ExtensionContext) {
       setDeveloperProfile()
     ),
     vscode.commands.registerCommand('aiEffortTracker.createProject', () => createProject()),
-    vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
+    vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', (arg?: unknown) => linkRepoToProject(typeof arg === 'string' ? arg : undefined)),
+    vscode.commands.registerCommand('aiEffortTracker.unlinkRepoFromProject', (arg?: unknown) => unlinkRepoFromProject(arg)),
     // #144: guided setup hub + the walkthrough's step commands.
     vscode.commands.registerCommand('aiEffortTracker.runSetup', () => runSetup(setup)),
     vscode.commands.registerCommand('aiEffortTracker.setup.rates', () => runStep(setup, 'rates')),
@@ -682,7 +684,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
   const initialNet = await GitTracker.getNetLineChange();
   if (initialNet) db.seedEffectiveLinesFromGit(initialNet.branch, initialNet.byCategory);
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(),   db.getManualEffort(), db.getReassignments(), initialNet, dashFilter);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(),   db.getManualEffort(), db.getReassignments(), initialNet, dashFilter, repoRows(db.getAllBranchesSummaries()));
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
@@ -693,7 +695,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
         return;
       }
       if (m?.type === 'optimize') {
-        dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId, m.from, m.to) });
+        dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId, m.from, m.to, m.repoId) });
         return;
       }
     if (m?.type === 'health') {
@@ -763,9 +765,11 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
 
     const netChange = await GitTracker.getNetLineChange();
     if (netChange) db.seedEffectiveLinesFromGit(netChange.branch, netChange.byCategory);
+    const summaries = db.getAllBranchesSummaries();
     dashboardPanel.webview.postMessage({
       type: 'update',
-      summaries: db.getAllBranchesSummaries(),
+      summaries,
+      repos: repoRows(summaries),
       currentBranch,
       ghMetrics: ghData,
       config: getInsightsConfig(),
@@ -1659,9 +1663,12 @@ async function createProject() {
   refreshDashboard();
 }
 
-/** Link the current workspace repo to an existing project (issue #27). */
-async function linkRepoToProject() {
-  const repoId = await GitTracker.getRepoId();
+/**
+ * Link a repository to an existing project (issue #27). Defaults to the current
+ * workspace repo; the dashboard's Repositories section passes one (#155).
+ */
+async function linkRepoToProject(target?: string) {
+  const repoId = target && target !== LEGACY_REPO ? target : target ? undefined : await GitTracker.getRepoId();
   if (!repoId) {
     vscode.window.showWarningMessage('No repository detected in the current workspace to link.');
     return;
@@ -1682,11 +1689,47 @@ async function linkRepoToProject() {
     };
   });
   const picked = await vscode.window.showQuickPick(picks, {
-    placeHolder: `Link this repository (${repoId}) to which project?`
+    placeHolder: `Link ${target ? repoLabel(repoId) : 'this repository'} (${repoId}) to which project?`
   });
   if (!picked) return;
   db.linkRepoToProject(picked.id, repoId);
-  vscode.window.showInformationMessage(`Linked this repo to "${db.getProject(picked.id)?.name ?? picked.id}".`);
+  vscode.window.showInformationMessage(`Linked ${target ? repoLabel(repoId) : 'this repo'} to "${db.getProject(picked.id)?.name ?? picked.id}".`);
+  if (setupDeps) void updateSetupContext(setupDeps);
+  refreshDashboard();
+}
+
+/**
+ * Detach a repository from a project (#155). `arg` is `projectId\0repoId` from
+ * the dashboard; without it the user picks the project and the repository.
+ */
+async function unlinkRepoFromProject(arg?: unknown) {
+  let [projectId, repoId] = typeof arg === 'string' ? arg.split('\u0000') : [];
+  if (!projectId) {
+    const linked = db.getAllProjects().filter(p => p.repos.length);
+    if (!linked.length) {
+      vscode.window.showInformationMessage('No project has a linked repository.');
+      return;
+    }
+    const p = await vscode.window.showQuickPick(
+      linked.map(x => ({ label: x.name, description: x.repos.map(repoLabel).join(', '), id: x.id })),
+      { placeHolder: 'Unlink a repository from which project?' });
+    if (!p) return;
+    projectId = p.id;
+  }
+  const project = db.getProject(projectId);
+  if (!project) return;
+  if (!repoId) {
+    const r = await vscode.window.showQuickPick(
+      project.repos.map(x => ({ label: repoLabel(x), description: x, id: x })),
+      { placeHolder: `Unlink which repository from "${project.name}"?` });
+    if (!r) return;
+    repoId = r.id;
+  }
+  const ok = await vscode.window.showWarningMessage(
+    `Unlink ${repoLabel(repoId)} from "${project.name}"? Tracked branches and credits stay as they are.`,
+    { modal: true }, 'Unlink');
+  if (ok !== 'Unlink') return;
+  db.unlinkRepoFromProject(projectId, repoId);
   if (setupDeps) void updateSetupContext(setupDeps);
   refreshDashboard();
 }
@@ -2925,7 +2968,7 @@ async function fixDataHealth(checkId?: string) {
 }
 
 /** Usage-optimization data for the dashboard's Optimize tab (same engine as the MCP server). */
-function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown, from?: unknown, to?: unknown) {
+function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown, from?: unknown, to?: unknown, repoId?: unknown) {
   try {
     const isDay = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(parseDay(v));
     const fromMs = isDay(from) ? parseDay(from) : undefined;
@@ -2934,7 +2977,8 @@ function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown
       ...(fromMs !== undefined ? { from: fromMs } : { days: typeof days === 'number' && days > 0 ? Math.min(days, 3650) : 30 }),
       ...(toMs !== undefined ? { to: toMs } : {}),
       ...(typeof workItemId === 'string' && workItemId ? { workItemId } : {}),
-      ...(typeof projectId === 'string' && projectId ? { projectId } : {})
+      ...(typeof projectId === 'string' && projectId ? { projectId } : {}),
+      ...(typeof repoId === 'string' && repoId ? { repoId } : {})
     };
     const data = db.getUsageData();
     return {
@@ -3037,13 +3081,20 @@ function withReview<T extends { branches: string[] }>(list: T[]): (T & { review?
   });
 }
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */
+/** Tracked branches grouped by repository for the dashboard (#155). */
+function repoRows(summaries: BranchSummary[]) {
+  return buildRepoOverview(summaries, db.getAllProjects());
+}
+
 function refreshDashboard() {
   if (!dashboardPanel) return;
   Promise.all([GitTracker.getCurrentBranch(), GitTracker.getNetLineChange()]).then(([b, netChange]) => {
     if (netChange) db.seedEffectiveLinesFromGit(netChange.branch, netChange.byCategory);
+    const summaries = db.getAllBranchesSummaries();
     dashboardPanel?.webview.postMessage({
       type: 'update',
-      summaries: db.getAllBranchesSummaries(),
+      summaries,
+      repos: repoRows(summaries),
       currentBranch: b ?? 'unknown',
       config: getInsightsConfig(),
       analytics: getAnalytics(),

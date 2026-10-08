@@ -212,6 +212,10 @@
         "title": "AI Effort Tracker: Link Current Repo to Project"
       },
       {
+        "command": "aiEffortTracker.unlinkRepoFromProject",
+        "title": "AI Effort Tracker: Unlink Repository from Project"
+      },
+      {
         "command": "aiEffortTracker.runSetup",
         "title": "AI Effort Tracker: Run Setup"
       },

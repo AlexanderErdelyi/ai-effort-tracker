@@ -25,6 +25,7 @@ import { duplicateLedgerIndexes } from '../analysis/dataHealth';
 import type { TimesheetSourceRow } from '../analysis/timesheet';
 import { rateInputsFromStore } from '../analysis/correctionRate';
 import { buildCalendar, type CalendarData } from '../analysis/calendar';
+import { buildRepoOverview, type RepoRow } from '../analysis/repoOverview';
 import {
   addCredit,
   creditConfidence,
@@ -937,6 +938,11 @@ export interface ProjectSummary extends BranchRollup {
   roi: ProjectRoi;
   /** How much of credits, time, lines and ROI was measured vs estimated vs manual (#143). */
   confidence?: SubjectConfidence;
+  /**
+   * The project's branches grouped by repository (#155), plus every linked
+   * repository even without tracked branches. Repo totals sum their branches.
+   */
+  repoBreakdown: RepoRow[];
 }
 
 /**
@@ -4627,6 +4633,7 @@ export class Database {
       credits,
       roi: this.computeProjectRoi(projectId, rollup, credits),
       confidence: this.confidenceFor(branches, workItemIds, projectId, credits),
+      repoBreakdown: buildRepoOverview(branches.map(b => this.getSummaryForBranch(b)), [], { includeRepos: project?.repos }),
       ...rollup
     };
   }

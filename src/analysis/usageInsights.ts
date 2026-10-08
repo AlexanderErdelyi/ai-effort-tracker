@@ -1,6 +1,6 @@
 import type { LedgerEntry, UsageData } from '../store/database';
 import { listCost, serverOf, type ModelPrice } from '../util/modelCatalog';
-import { branchMatches } from '../util/branchKey';
+import { branchMatches, repoMatches } from '../util/branchKey';
 
 /**
  * Pure, deterministic usage analysis over the effort store. No I/O, no vscode
@@ -17,6 +17,8 @@ export interface InsightFilter {
   branch?: string;
   workItemId?: string;
   projectId?: string;
+  /** Repository id or '__legacy__' (#155). */
+  repoId?: string;
   sessionId?: string;
 }
 
@@ -114,6 +116,7 @@ function matches(e: LedgerEntry, f: InsightFilter, from: number, to: number): bo
   if (!e.debugUsage) return false;
   if (e.ts < from - DAY || e.ts > to) return false;
   if (f.branch && !branchMatches(e.branch, f.branch)) return false;
+  if (f.repoId && !repoMatches(e.branch, f.repoId)) return false;
   if (f.workItemId && e.workItemId !== f.workItemId) return false;
   if (f.projectId === '__none__' ? !!e.projectId : f.projectId && e.projectId !== f.projectId) return false;
   if (f.sessionId && e.debugUsage.sessionId !== f.sessionId) return false;

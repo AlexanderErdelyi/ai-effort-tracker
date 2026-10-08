@@ -29,11 +29,26 @@ export function repoOfKey(key: string): string | null {
   return parseBranchKey(key).repoId;
 }
 
+/** Repo filter value for branches tracked before #154 (repository unknown). */
+export const LEGACY_REPO = '__legacy__';
+
+/**
+ * Whether a stored branch key belongs to the repo filter (#155): '' matches
+ * everything, {@link LEGACY_REPO} matches keys without a repository (and rows
+ * without a branch), any other value matches that repository id exactly.
+ */
+export function repoMatches(key: string | null | undefined, repoFilter: string | null | undefined): boolean {
+  if (!repoFilter) return true;
+  const repo = key ? repoOfKey(key) : null;
+  return repoFilter === LEGACY_REPO ? repo === null : repo === repoFilter;
+}
+
 /** Short repository name: last segment of `host/owner/repo` or of a folder path. */
 export function repoLabel(repoId: string | null | undefined): string {
   if (!repoId) return '';
   const parts = repoId.split(/[\\/]+/).filter(Boolean);
-  return parts[parts.length - 1] ?? repoId;
+  const last = parts[parts.length - 1] ?? repoId;
+  try { return decodeURIComponent(last); } catch { return last; }
 }
 
 /** Readable branch: `main (my-repo)` for keys, the plain name for legacy keys. */

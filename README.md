@@ -32,6 +32,8 @@
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
+| `AI Effort Tracker: Link Current Repo to Project` | Adds the open repository to a project; a project can have several (see [Repositories](#repositories)) |
+| `AI Effort Tracker: Unlink Repository from Project` | Removes a repository from a project after confirmation. Tracked data is kept |
 | `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
 | `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
 | `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
@@ -107,19 +109,22 @@ which sections are open is remembered.
 ### Filter everything at once
 
 A filter bar above the tabs sets one date range (7, 30 or 90 days, this
-billing period, all time, or custom dates), one project (or "No project") and
-one work item. Every tab reads the same filter, so switching tabs keeps your
+billing period, all time, or custom dates), one project (or "No project"),
+one work item and one repository. Every tab reads the same filter, so switching tabs keeps your
 selection, and it survives reloads. Chips show what is active; **Clear** goes
-back to 30 days, all projects.
+back to 30 days, all projects and repositories.
 
 Some tabs use only part of it, and a short note on the bar says so:
 
 - Overview: the KPI cards keep their fixed windows (today, 7 days, period) and
-  branch totals are all-time, but both follow the project and work item. The
-  budget always covers all projects.
-- Trends is not split by project; only the date range applies.
-- Estimates ignore the date range; accuracy uses every finished work item.
+  repository and branch totals are all-time, but they follow the project, work
+  item and repository. The budget always covers all projects.
+- Trends is not split by project or repository; only the date range applies.
+- Estimates ignore the date range and the repository; accuracy uses every
+  finished work item.
 - Timesheet keeps its week buttons and only applies the project and work item.
+- Branches tracked before repositories were recorded are under
+  "Unknown repository" in the repository filter.
 - Correction episodes without a work item count as "No project".
 
 ## Branch changes and tracked time
@@ -147,6 +152,20 @@ current repository; **AI Effort Tracker: Assign Older Branches to a Repository**
 lets you choose branches and the repository at any time. If the repository
 already has that branch, the totals are added together. Credit, time-log and
 reassignment rows move along, and nothing is merged automatically.
+
+### Repositories
+
+The Overview has a **Repositories** section above the branches. Each row is one
+repository with its projects, branch count, active time, lines, credits and
+cost; the totals are the sum of its branches. Click a row to see its branches,
+and click a branch for its details. **Filter** narrows every tab to that
+repository, and **🔗 Project** links it to a project. The "Unknown repository"
+row holds older branches and offers **Assign to a repository…**.
+
+A project can have several repositories. The project page lists each linked
+repository with its totals, plus repositories where the project's branches ran
+but which are not linked yet (marked "not linked", with a **Link** button).
+**Unlink** removes a repository from the project; no tracked data is deleted.
 
 The MCP tools' `branch` filter accepts a plain name (all repositories) or the
 full key shown in tool results.

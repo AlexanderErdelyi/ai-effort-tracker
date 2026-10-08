@@ -5,6 +5,7 @@ import type { NetLineChange } from '../trackers/gitTracker';
 import type { CreditOverview } from '../analysis/creditOverview';
 import type { CalendarData } from '../analysis/calendar';
 import { DEFAULT_FILTER, type DashboardFilter } from '../analysis/dashboardFilter';
+import type { RepoRow } from '../analysis/repoOverview';
 
 export interface InsightsConfig {
   baselineLocPerMinute: number;
@@ -44,7 +45,8 @@ export function renderDashboardHtml(
   manualEffort: ManualEffortEntry[] = [],
   reassignments: ReassignmentRecord[] = [],
   netChange: NetLineChange | null = null,
-  filter: DashboardFilter = DEFAULT_FILTER
+  filter: DashboardFilter = DEFAULT_FILTER,
+  repos: RepoRow[] = []
 ): string {
   const data = JSON.stringify(summaries);
   const gfData = JSON.stringify(filter).replace(/</g, '\\u003c');
@@ -60,6 +62,7 @@ export function renderDashboardHtml(
   const meData = JSON.stringify(manualEffort);
   const reData = JSON.stringify(reassignments);
   const netData = JSON.stringify(netChange);
+  const repoData = JSON.stringify(repos).replace(/</g, '\\u003c');
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -273,18 +276,20 @@ let ME=${meData};
 let RE=${reData};
 let NET=${netData};
 let GF=${gfData};
+let REPOS=${repoData};
+var repoOpen={};
 const charts={};
 
-// #146 Global filter bar: one date range + project + work item for every tab.
+// #146 Global filter bar: one date range + project + work item (+ repository, #155) for every tab.
 var GF_NOTE={
-  overview:'Credits follow the date range, project and work item. Branch totals follow the project and work item but are all-time; streak and week figures are never filtered.',
-  trends:'Follows the date range. Daily activity is not split by project or work item.',
-  ledger:'Follows the date range, project and work item.',
-  optimize:'Follows the date range, project and work item.',
-  sessions:'Follows the date range, project and work item.',
-  estimates:'Follows the project and work item. The date range does not apply: accuracy uses every finished item.',
-  timesheet:'Follows the project and work item. Use the week buttons for dates.',
-  corrections:'Follows the date range, project and work item (episodes without a work item count as \u201cNo project\u201d).'
+  overview:'Credits follow the date range, project, work item and repository. Repository and branch totals follow the project, work item and repository but are all-time; streak and week figures are never filtered.',
+  trends:'Follows the date range. Daily activity is not split by project, work item or repository.',
+  ledger:'Follows the date range, project, work item and repository.',
+  optimize:'Follows the date range, project, work item and repository.',
+  sessions:'Follows the date range, project, work item and repository.',
+  estimates:'Follows the project and work item. The date range and repository do not apply: accuracy uses every finished item.',
+  timesheet:'Follows the project and work item, not the repository. Use the week buttons for dates.',
+  corrections:'Follows the date range, project, work item and repository (episodes without a work item count as \u201cNo project\u201d).'
 };
 function gfIso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function gfDayOf(ts){var d=new Date(ts);return isNaN(d.getTime())?'':gfIso(d);}
@@ -303,8 +308,10 @@ function gfScope(pid,wid){
   var p=pid||gfProjOf(wid);
   return GF.projectId==='__none__'?!p:p===GF.projectId;
 }
-function gfActive(){return GF.range!=='30'||!!GF.projectId||!!GF.workItemId;}
-function gfQuery(){var w=gfWindow(),q={};if(w.from)q.from=w.from;else q.days=3650;if(w.to)q.to=w.to;if(GF.projectId)q.projectId=GF.projectId;if(GF.workItemId)q.workItemId=GF.workItemId;return q;}
+function gfRepoOk(k){if(!GF.repoId)return true;var r=k?bkRepo(k):'';return GF.repoId==='__legacy__'?!r:r===GF.repoId;}
+function gfRepoName(id){if(id==='__legacy__')return'Unknown repository';var r=(REPOS||[]).find(function(x){return x.repoId===id;});return r?r.label:(brepo(id+'::x')||id);}
+function gfActive(){return GF.range!=='30'||!!GF.projectId||!!GF.workItemId||!!GF.repoId;}
+function gfQuery(){var w=gfWindow(),q={};if(w.from)q.from=w.from;else q.days=3650;if(w.to)q.to=w.to;if(GF.projectId)q.projectId=GF.projectId;if(GF.workItemId)q.workItemId=GF.workItemId;if(GF.repoId)q.repoId=GF.repoId;return q;}
 function gfRangeLabel(){
   var L={'7':'Last 7 days','30':'Last 30 days','90':'Last 90 days','period':'This billing period','all':'All time'};
   if(GF.range!=='custom')return L[GF.range]||GF.range;
@@ -324,18 +331,23 @@ function renderFilterBar(){
     .concat(['<option value="__none__"'+(GF.projectId==='__none__'?' selected':'')+'>No project</option>']).join('');
   var wis=(WI||[]).filter(function(w){var p=w.projectId||'';return!GF.projectId||(GF.projectId==='__none__'?!p:p===GF.projectId)||String(w.workItemId)===GF.workItemId;});
   var wo=['<option value="">All work items</option>'].concat(wis.map(function(w){return'<option value="'+esc(w.workItemId)+'"'+(String(w.workItemId)===GF.workItemId?' selected':'')+'>'+esc(gfWiName(w.workItemId))+'</option>';})).join('');
+  var rl=(REPOS||[]).map(function(r){return r.repoId;});if(GF.repoId&&rl.indexOf(GF.repoId)<0)rl.push(GF.repoId);
+  var rdup={};rl.forEach(function(id){var n=gfRepoName(id);rdup[n]=(rdup[n]||0)+1;});
+  var ro=['<option value="">All repositories</option>'].concat(rl.map(function(id){var n=gfRepoName(id);return'<option value="'+esc(id)+'"'+(id===GF.repoId?' selected':'')+' title="'+esc(id==='__legacy__'?'Branches tracked before repositories were recorded':id)+'">'+esc(rdup[n]>1&&id!=='__legacy__'?n+' \\u2013 '+id:n)+'</option>';})).join('');
   var chips=[];
+  if(GF.repoId)chips.push('<span class="gfchip" title="'+esc(GF.repoId==='__legacy__'?'':GF.repoId)+'">\\uD83D\\uDCE6 '+esc(gfRepoName(GF.repoId))+' <button data-action="gfClear" data-value="repoId" title="Remove">\\u00d7</button></span>');
   if(GF.projectId)chips.push('<span class="gfchip">'+esc(gfProjName(GF.projectId))+' <button data-action="gfClear" data-value="projectId" title="Remove">\\u00d7</button></span>');
   if(GF.workItemId)chips.push('<span class="gfchip">'+esc(gfWiName(GF.workItemId))+' <button data-action="gfClear" data-value="workItemId" title="Remove">\\u00d7</button></span>');
   var h='<span class="gfl">\\uD83D\\uDD0E Filter</span>'+rg+cust+'<span class="gfsep"></span>'
-    +'<select id="gfProj" class="sesin" title="Project">'+po+'</select><select id="gfWi" class="sesin" title="Work item">'+wo+'</select>'
-    +chips.join('')+(gfActive()?'<button class="dtab" data-action="gfClear" data-value="all" title="Back to the last 30 days, all projects">Clear</button>':'')
+    +'<select id="gfProj" class="sesin" title="Project">'+po+'</select><select id="gfWi" class="sesin" title="Work item">'+wo+'</select>'+(rl.length?'<select id="gfRepo" class="sesin" title="Repository">'+ro+'</select>':'')
+    +chips.join('')+(gfActive()?'<button class="dtab" data-action="gfClear" data-value="all" title="Back to the last 30 days, all projects and repositories">Clear</button>':'')
     +'<span class="gfnote">'+esc(gfRangeLabel())+' \\u00b7 '+esc(note)+'</span>';
   if(el._h===h)return;
   el._h=h;el.innerHTML=h;
   var on=function(id,fn){var x=document.getElementById(id);if(x)x.addEventListener('change',fn);};
   on('gfProj',function(){gfSet({projectId:this.value});});
   on('gfWi',function(){gfSet({workItemId:this.value});});
+  on('gfRepo',function(){gfSet({repoId:this.value});});
   on('gfFrom',function(){gfSet({from:this.value});});
   on('gfTo',function(){gfSet({to:this.value});});
 }
@@ -500,7 +512,7 @@ var alignQueued=false;if(typeof MutationObserver!=='undefined')new MutationObser
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function bkRepo(k){k=String(k==null?'':k);var i=k.lastIndexOf('::');return i<0?'':k.slice(0,i);}
 function bn(k){k=String(k==null?'':k);var i=k.lastIndexOf('::');return i<0?k:k.slice(i+2);}
-function brepo(k){var p=bkRepo(k).split(/[\\\\/]+/).filter(Boolean);return p.length?p[p.length-1]:'';}
+function brepo(k){var p=bkRepo(k).split(/[\\\\/]+/).filter(Boolean),l=p.length?p[p.length-1]:'';try{return decodeURIComponent(l);}catch(e){return l;}}
 function bl(k){var r=brepo(k);return bn(k)+(r?' ('+r+')':'');}
 function rchip(k){var r=brepo(k);return r?'<span class="badge brepo" title="'+esc(bkRepo(k))+'">'+esc(r)+'</span>':'';}
 function bh(k){return esc(bn(k))+rchip(k);}
@@ -763,16 +775,43 @@ function ovConfHtml(){
   var A=AN&&AN.confidence;if(!A)return'';
   return'<div class="cfl">Data confidence: time '+(confBadge(A.time,'Active time','ms')||'\\u2014')+' \\u00b7 lines '+(confBadge(A.lines,'Lines','lines')||'\\u2014')+' \\u00b7 credits '+(confBadge(A.credits,'Credits','credits')||'\\u2014')+' \\u2014 \\u25CF exact \\u00b7 \\u25D0 mixed \\u00b7 \\u25CB estimated \\u00b7 \\u270E manual; hover a marker for the split</div>';
 }
+// #155 Repositories: REPOS rows (built by the extension) narrowed to the filter and re-summed.
+function repoView(){
+  var scoped=!!(GF.projectId||GF.workItemId);
+  return(REPOS||[]).filter(function(r){return!GF.repoId||r.repoId===GF.repoId;}).map(function(r){
+    var bs=scoped?r.branches.filter(function(b){return gfScope('',b.workItemId);}):r.branches;
+    var t={activeMs:0,humanMs:0,aiMs:0,reviewMs:0,linesHumanAdded:0,linesHumanDeleted:0,linesAiAdded:0,linesAiDeleted:0,costUsd:0,credits:0};
+    bs.forEach(function(b){for(var k in t)t[k]+=b[k]||0;});
+    return Object.assign({},r,t,{branches:bs,all:r.branches.length});
+  }).filter(function(r){return!scoped||r.branches.length||(GF.projectId&&!GF.workItemId&&r.projects.some(function(p){return p.id===GF.projectId;}));});
+}
+function repoSecHtml(RV){
+  if(!RV.length)return emptyState('No repositories yet','Branches are grouped by repository as soon as you work in one.');
+  var rows=RV.map(function(r){
+    var open=!!repoOpen[r.repoId];
+    var proj=r.legacy?'<span class="muted">\\u2014</span>':(r.projects.length?r.projects.map(function(p){return'<span class="badge bh">'+esc(p.name)+'</span>';}).join(' '):'<span class="muted">none</span>');
+    var acts=r.legacy?'<button class="dtab" data-action="cmd" data-value="assignLegacyBranches" title="These branches were tracked before repositories were recorded. Assign them to the repository they belong to.">Assign to a repository\\u2026</button>'
+      :'<button class="dtab" data-action="repoLink" data-id="'+esc(r.repoId)+'" title="Link this repository to a project">\\uD83D\\uDD17 Project</button>';
+    acts+='<button class="dtab'+(GF.repoId===r.repoId?' active':'')+'" data-action="gfRepo" data-value="'+esc(r.repoId)+'" title="'+(GF.repoId===r.repoId?'Show all repositories again':'Filter every tab to this repository')+'">'+(GF.repoId===r.repoId?'Unfilter':'Filter')+'</button>';
+    var head='<tr class="ptr" data-action="repoToggle" data-value="'+esc(r.repoId)+'" aria-expanded="'+open+'"><td><span class="muted">'+(open?'\\u25be':'\\u25b8')+'</span> <strong title="'+esc(r.legacy?'Branches tracked before repositories were recorded':r.repoId)+'">'+esc(r.label)+'</strong></td><td>'+proj+'</td><td>'+(r.branches.length===r.all?r.all:r.branches.length+' of '+r.all)+'</td><td>'+fmt(r.activeMs)+'</td><td class="dc">'+pp(r.linesHumanAdded,'bp')+' '+pm(r.linesHumanDeleted)+'</td><td class="dc">'+pp(r.linesAiAdded,'ba')+' '+pm(r.linesAiDeleted)+'</td><td>'+cr(r.credits)+'</td><td>$'+r.costUsd.toFixed(4)+'</td><td class="nw">'+acts+'</td></tr>';
+    if(!open)return head;
+    var sub=r.branches.map(function(b){var isCur=b.branch===currentBranch;return'<tr class="ptr'+(isCur?' cur':'')+'" data-action="detail" data-value="'+esc(b.branch)+'"><td style="padding-left:22px">'+(isCur?'\\u25b6 ':'')+esc(b.name)+'</td><td>'+(b.workItemId&&b.workItemId!=='__unassigned__'&&b.workItemId!=='unknown'?'<span class="badge ba">#'+esc(b.workItemId)+'</span>':'')+'</td><td></td><td>'+fmt(b.activeMs)+'</td><td class="dc">'+pp(b.linesHumanAdded,'bp')+' '+pm(b.linesHumanDeleted)+'</td><td class="dc">'+pp(b.linesAiAdded,'ba')+' '+pm(b.linesAiDeleted)+'</td><td>'+cr(b.credits)+'</td><td>$'+b.costUsd.toFixed(4)+'</td><td></td></tr>';}).join('');
+    return head+(sub||'<tr class="empty-row"><td colspan="9" style="padding-left:22px">No tracked branches in this repository yet.</td></tr>');
+  }).join('');
+  return'<div class="ox"><table><thead><tr><th>Repository</th><th>Projects</th><th>Branches</th><th>Active</th><th>Human +/-</th><th>AI +/-</th><th>Credits</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +'<p class="mt2 t-sm muted">Click a repository to see its branches. A repository total is the sum of its branches.</p>';
+}
 function renderOverview(){
   const el=document.getElementById('overview');
-  var sig=JSON.stringify([allData,AN,CFG,currentBranch,GF,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
+  var sig=JSON.stringify([allData,AN,CFG,currentBranch,GF,REPOS,repoOpen,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
   if(sig===ovSig&&el.firstChild)return;
   ovSig=sig;
-  var OD=allData.filter(function(d){return gfScope('',d.workItemId);});
+  var OD=allData.filter(function(d){return gfScope('',d.workItemId)&&gfRepoOk(d.branch);});
+  var RV=repoView();
   const T=OD.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
   var rows=OD.map(function(d){
     var tot=tms(d),hp=tot>0?d.humanCodingMs/tot*100:0,ap=tot>0?d.aiGeneratingMs/tot*100:0,rp=tot>0?d.reviewingMs/tot*100:0,isCur=d.branch===currentBranch;
-    return '<tr class="ptr '+(isCur?'cur':'')+'" data-action="detail" data-value="'+esc(d.branch)+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+esc(bn(d.branch))+'</strong>'+rchip(d.branch)+'</td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
+    return '<tr class="ptr '+(isCur?'cur':'')+'" data-action="detail" data-value="'+esc(d.branch)+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+esc(bn(d.branch))+'</strong></td><td'+(brepo(d.branch)?' title="'+esc(bkRepo(d.branch))+'">'+esc(brepo(d.branch)):' class="muted" title="Tracked before repositories were recorded">unknown')+'</td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
   }).join('');
   var AS=AN||{};var stk=AS.streak||{current:0,longest:0};var wk=AS.week||{thisWeek:{activeMs:0,lines:0,aiShare:0},lastWeek:{activeMs:0,lines:0,aiShare:0}};
   function dlt(n,p){if(p===0)return n>0?'<span class="c-add">\\u25b2 new</span>':'';var d=(n-p)/p*100;var up=d>=0;return'<span style="color:'+(up?'var(--added)':'var(--deleted)')+'">'+(up?'\\u25b2':'\\u25bc')+' '+Math.abs(d).toFixed(0)+'%</span>';}
@@ -819,7 +858,8 @@ function renderOverview(){
     +'<div class="ovb"><button class="dtab" data-action="cmd" data-value="assignBranchToWorkItem">\\uD83D\\uDD17 Assign Work Item</button><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>';
   el.innerHTML=top+ovCreditsHtml()
     +ovSec('activity','\\u23F1 Activity','this week vs last week \\u00b7 streak \\u00b7 totals',weekK+timeK+'<div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div>',true)
-    +ovSec('branches','\\uD83C\\uDF3F Branches',(OD.length===allData.length?OD.length:OD.length+' of '+allData.length)+' tracked','<div class="ox"><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
+    +ovSec('repos','\\uD83D\\uDCE6 Repositories',RV.length+' tracked',repoSecHtml(RV),true)
+    +ovSec('branches','\\uD83C\\uDF3F Branches',(OD.length===allData.length?OD.length:OD.length+' of '+allData.length)+' tracked','<div class="ox"><table><thead><tr><th>Branch</th><th>Repository</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
     +ovCorrHtml()
     +ovSec('hotspots','\\uD83D\\uDD25 Most-edited files',tf.length?tf.length+' files':'','<div class="ox">'+hot+'</div>',false)
     +ovSec('keys','\\u2328\\ufe0f Keystrokes vs AI \\u00b7 token estimate','',kt,false);
@@ -1077,7 +1117,7 @@ function projectRowsHtml(){
   var rows=PROJ.map(function(p){
     var act=activeMsOf(p);
     var roi=(p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
-    var reposTxt=(p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+    var reposTxt=(p.repos&&p.repos.length)?'<span title="'+esc(p.repos.join('\\n'))+'">'+esc(p.repos.map(function(r){return brepo(r+'::x');}).join(', '))+'</span>':ROI_NONE;
     return'<tr data-action="proj" data-value="'+esc(p.projectId)+'"><td><strong>'+esc(p.name)+'</strong></td><td class="mono">'+reposTxt+'</td><td>'+p.workItemIds.length+'</td><td>'+fmt(act)+'</td><td>'+((p.credits&&p.credits.credits)||0).toFixed(1)+'</td><td>'+roi+'</td></tr>';
   });
   var none=wiOfProject('__none__');
@@ -1157,6 +1197,17 @@ function wiRowsHtml(items){
   if(!rows.length)return'<tr class="empty-row"><td colspan="7">No work items here yet.</td></tr>';
   return rows.join('');
 }
+function projRepoHtml(p){
+  var RB=p.repoBreakdown||[],linked=p.repos||[];
+  var rows=RB.map(function(r){
+    var isLinked=linked.indexOf(r.repoId)>=0;
+    var act=r.legacy?'':isLinked?'<button class="dtab" data-action="repoUnlink" data-pid="'+esc(p.projectId)+'" data-id="'+esc(r.repoId)+'" title="Unlink this repository from the project">Unlink</button>'
+      :'<button class="dtab" data-action="repoLink" data-id="'+esc(r.repoId)+'" title="Branches of this project ran here, but the repository is not linked">\\uD83D\\uDD17 Link</button>';
+    return'<tr><td><strong title="'+esc(r.legacy?'Branches tracked before repositories were recorded':r.repoId)+'">'+esc(r.label)+'</strong>'+(isLinked||r.legacy?'':' <span class="badge" title="Not linked to this project">not linked</span>')+'</td><td>'+r.branches.length+'</td><td>'+fmt(r.activeMs)+'</td><td class="dc">'+pp(r.linesHumanAdded,'bp')+'</td><td class="dc">'+pp(r.linesAiAdded,'ba')+'</td><td>'+cr(r.credits)+'</td><td>$'+r.costUsd.toFixed(4)+'</td><td class="nw">'+act+'</td></tr>';
+  }).join('')||'<tr class="empty-row"><td colspan="8">No repository linked yet. Open one and use \\u201cLink Current Repo\\u201d.</td></tr>';
+  return'<h3 class="mt4" style="margin-bottom:6px">\\uD83D\\uDCE6 Repositories</h3><div class="ox"><table><thead><tr><th>Repository</th><th>Branches</th><th>Active</th><th>Human +</th><th>AI +</th><th>Credits</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 12px"><button class="dtab" data-action="cmd" data-value="linkRepoToProject" title="Link the repository open in this window">\\uD83D\\uDD17 Link Current Repo</button></div>';
+}
 function renderProjectDetail(){
   var el=document.getElementById('projects');
   var p=PROJ.find(function(x){return x.projectId===selProj;});
@@ -1167,7 +1218,7 @@ function renderProjectDetail(){
   var act=isNone?items.reduce(function(a,w){return a+activeMsOf(w);},0):activeMsOf(p);
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
   var roi=(!isNone&&p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
-  var repos=(!isNone&&p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+  var repos=isNone?'':projRepoHtml(p);
   var PCF=(!isNone&&p.confidence)||null;
   function PC(k,what,unit){return PCF?confBadge(PCF[k],what,unit):'';}
   var setRates=isNone?'':'<button class="dtab" data-action="ratesSet" data-id="'+esc(p.projectId)+'" title="Edit this project\\u2019s rates">\\u270E Edit Rates</button>';
@@ -1177,7 +1228,7 @@ function renderProjectDetail(){
     +'<div class="st"><div class="lbl">Credits'+PC('credits','Credits','credits')+'</div><div class="c-cost val">'+credits.toFixed(1)+'</div></div>'
     +'<div class="st"><div class="lbl">ROI Net'+PC('roi','ROI','ms')+'</div><div class="val">'+roi+'</div></div></div>'+(PCF?cfLegend():'')
     +translationSummaryHtml(p)
-    +'<p class="sub" style="margin:12px 0 6px">Repos: '+repos+'</p>'
+    +repos
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
     +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th title="Worst budget dimension (time, credits or cost); sorted by risk">Budget</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
 }
@@ -1329,7 +1380,7 @@ function renderLedger(){
     el.innerHTML='<div class="hbar mb3"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'+emptyState('No credit entries yet','Credits are captured from the chat debug log as you use Copilot. Use \\u201cAdd Entry\\u201d to record one by hand.');
     return;
   }
-  var LV=LEDGER.filter(function(e){return gfInTs(e.ts)&&gfScope(e.projectId,e.workItemId);});
+  var LV=LEDGER.filter(function(e){return gfInTs(e.ts)&&gfScope(e.projectId,e.workItemId)&&gfRepoOk(e.branch);});
   var rows=(LV.length?LV:[]).map(function(e){
     var when=new Date(e.ts).toLocaleString();
     var attr=e.branch?bh(e.branch):'\\u2014';
@@ -1840,6 +1891,7 @@ function corrVisible(e){
   if(!gfInTs(e.start))return false;
   if(GF.workItemId&&String(e.workItemId||'')!==GF.workItemId)return false;
   if(GF.projectId&&!GF.workItemId&&!gfScope('',e.workItemId))return false;
+  if(!gfRepoOk(e.branch))return false;
   if(corrSrc!=='all'&&e.source!==corrSrc)return false;
   if(corrFilter==='todo')return e.items.some(function(i){return!i.category;});
   if(corrFilter==='lessons')return e.items.some(function(i){return corrIsLesson(i.category);});
@@ -2168,6 +2220,7 @@ window.addEventListener('message',function(e){
     if(msg.manualEffort!==undefined&&msg.manualEffort)ME=msg.manualEffort;
     if(msg.reassignments!==undefined&&msg.reassignments)RE=msg.reassignments;
     if(msg.netChange!==undefined)NET=msg.netChange;
+    if(msg.repos!==undefined&&msg.repos)REPOS=msg.repos;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
@@ -2234,7 +2287,11 @@ document.addEventListener('click',function(e){
   else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
   else if(a==='gfRange'){gfSet({range:v});}
-  else if(a==='gfClear'){if(v==='all')gfSet({range:'30',projectId:'',workItemId:''});else{var gp={};gp[v]='';gfSet(gp);}}
+  else if(a==='gfClear'){if(v==='all')gfSet({range:'30',projectId:'',workItemId:'',repoId:''});else{var gp={};gp[v]='';gfSet(gp);}}
+  else if(a==='gfRepo'){e.stopPropagation();gfSet({repoId:GF.repoId===v?'':v});}
+  else if(a==='repoToggle'){repoOpen[v]=!repoOpen[v];ovSig='';renderOverview();}
+  else if(a==='repoLink'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'linkRepoToProject',arg:t.dataset.id});}
+  else if(a==='repoUnlink'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'unlinkRepoFromProject',arg:t.dataset.pid+'\\u0000'+t.dataset.id});}
   else if(a==='ovWi'){selWi=String(v);projView='workitem';showTab('projects');}
   else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
