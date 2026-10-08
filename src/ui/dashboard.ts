@@ -277,6 +277,7 @@ let RE=${reData};
 let NET=${netData};
 let GF=${gfData};
 let REPOS=${repoData};
+let PP=null;
 var repoOpen={};
 const charts={};
 
@@ -289,7 +290,8 @@ var GF_NOTE={
   sessions:'Follows the date range, project, work item and repository.',
   estimates:'Follows the project and work item. The date range and repository do not apply: accuracy uses every finished item.',
   timesheet:'Follows the project and work item, not the repository. Use the week buttons for dates.',
-  corrections:'Follows the date range, project, work item and repository (episodes without a work item count as \u201cNo project\u201d).'
+  corrections:'Follows the date range, project, work item and repository (episodes without a work item count as \u201cNo project\u201d).',
+  projects:'Project and work-item lists follow the date range (time, lines, credits, cost, ROI, repositories); budgets, estimates and the work-item detail page are all-time. The project, work item and repository selectors do not apply here.'
 };
 function gfIso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function gfDayOf(ts){var d=new Date(ts);return isNaN(d.getTime())?'':gfIso(d);}
@@ -1090,6 +1092,23 @@ function wiOfProject(pid){
   if(pid==='__none__')return WI.filter(function(w){return!w.projectId;});
   return WI.filter(function(w){return w.projectId===pid;});
 }
+// #163: the project list and project detail follow the global date range. "All"
+// keeps the all-time summaries untouched; any other range overlays the period
+// figures computed server-side (db.getProjectPeriod). Budgets and estimates stay all-time.
+var ppReq='';
+function ppOn(){return GF.range!=='all';}
+function ppKey(){return GF.range+'|'+(GF.from||'')+'|'+(GF.to||'');}
+function ppReady(){if(!ppOn())return true;if(PP&&PP.key===ppKey())return true;var k=ppKey();if(ppReq!==k){ppReq=k;vscode.postMessage({type:'projectPeriod'});}return false;}
+var PP_ZERO={humanCodingMs:0,aiGeneratingMs:0,reviewingMs:0,linesHumanAdded:0,linesAiAdded:0,creditsTotal:0,creditCost:0};
+var PP_CLEAR={effectiveLinesHuman:undefined,effectiveLinesAi:undefined,effectiveByCategory:null,confidence:null};
+function ppWi(w){if(!ppOn()||!PP)return w;return Object.assign({},w,PP_ZERO,PP.workItems[w.workItemId]||{},PP_CLEAR);}
+function ppProj(p){
+  if(!ppOn()||!PP)return p;
+  var f=PP.projects[p.projectId]||Object.assign({repoBreakdown:[]},PP_ZERO);
+  return Object.assign({},p,f,{credits:Object.assign({},p.credits||{},{credits:f.creditsTotal||0})},PP_CLEAR,f.roi?{}:{roi:null});
+}
+function ppHead(){return'<div class="t-sm muted" style="margin-bottom:8px">\\uD83D\\uDCC5 <strong>'+esc(gfRangeLabel())+'</strong>'+(ppOn()?' \\u00b7 time, lines, credits, cost and ROI in this range; budgets and estimates are all-time':'')+'</div>';}
+function ppLoading(el){el.innerHTML=projToolbar()+ppHead()+'<p class="muted">Loading project figures for '+esc(gfRangeLabel())+'\\u2026</p>';}
 var CUR_SYM={USD:'$',EUR:'\\u20ac',GBP:'\\u00a3',JPY:'\\u00a5',CHF:'CHF ',CAD:'CA$',AUD:'A$',INR:'\\u20b9',CNY:'\\u00a5',SEK:'kr ',NOK:'kr ',DKK:'kr ',PLN:'z\\u0142 '};
 function curSym(cur){return CUR_SYM[String(cur||'USD').toUpperCase()]||null;}
 // Format money in the subject's effective currency (issue #45): symbol when known,
@@ -1114,13 +1133,14 @@ function projToolbar(){
     +'</div>';
 }
 function projectRowsHtml(){
-  var rows=PROJ.map(function(p){
+  var rows=PROJ.map(function(p0){
+    var p=ppProj(p0);
     var act=activeMsOf(p);
     var roi=(p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
     var reposTxt=(p.repos&&p.repos.length)?'<span title="'+esc(p.repos.join('\\n'))+'">'+esc(p.repos.map(function(r){return brepo(r+'::x');}).join(', '))+'</span>':ROI_NONE;
     return'<tr data-action="proj" data-value="'+esc(p.projectId)+'"><td><strong>'+esc(p.name)+'</strong></td><td class="mono">'+reposTxt+'</td><td>'+p.workItemIds.length+'</td><td>'+fmt(act)+'</td><td>'+((p.credits&&p.credits.credits)||0).toFixed(1)+'</td><td>'+roi+'</td></tr>';
   });
-  var none=wiOfProject('__none__');
+  var none=wiOfProject('__none__').map(ppWi);
   if(none.length){
     var act=none.reduce(function(a,w){return a+activeMsOf(w);},0);
     var cr=none.reduce(function(a,w){return a+(w.creditsTotal||0);},0);
@@ -1131,7 +1151,8 @@ function projectRowsHtml(){
 }
 function renderProjectList(){
   var el=document.getElementById('projects');
-  el.innerHTML=projToolbar()
+  if(!ppReady())return ppLoading(el);
+  el.innerHTML=projToolbar()+ppHead()
     +'<table><thead><tr><th>Project</th><th>Repos</th><th>Work Items</th><th>Active</th><th>Credits</th><th>ROI Net</th></tr></thead><tbody>'+projectRowsHtml()+'</tbody></table>'
     +'<p class="mt3 t-sm muted">Project ROI net = value produced \\u2212 cost from the project\\u2019s effective rates. \\u201c\\u2014\\u201d means a required rate is not configured (set it with \\u201cSet Rates\\u201d).</p>';
 }
@@ -1210,10 +1231,12 @@ function projRepoHtml(p){
 }
 function renderProjectDetail(){
   var el=document.getElementById('projects');
-  var p=PROJ.find(function(x){return x.projectId===selProj;});
+  var p0=PROJ.find(function(x){return x.projectId===selProj;});
   var isNone=selProj==='__none__';
-  if(!p&&!isNone){projView='list';return renderProjectList();}
-  var items=wiOfProject(selProj).slice().sort(function(a,b){return budRisk(b)-budRisk(a);});
+  if(!p0&&!isNone){projView='list';return renderProjectList();}
+  if(!ppReady())return ppLoading(el);
+  var p=p0?ppProj(p0):p0;
+  var items=wiOfProject(selProj).map(ppWi).sort(function(a,b){return budRisk(b)-budRisk(a);});
   var name=isNone?'\\uD83D\\uDCE5 Unassigned':esc(p.name);
   var act=isNone?items.reduce(function(a,w){return a+activeMsOf(w);},0):activeMsOf(p);
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
@@ -1222,7 +1245,7 @@ function renderProjectDetail(){
   var PCF=(!isNone&&p.confidence)||null;
   function PC(k,what,unit){return PCF?confBadge(PCF[k],what,unit):'';}
   var setRates=isNone?'':'<button class="dtab" data-action="ratesSet" data-id="'+esc(p.projectId)+'" title="Edit this project\\u2019s rates">\\u270E Edit Rates</button>';
-  el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'
+  el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'+ppHead()
     +'<div class="sg"><div class="st"><div class="lbl">Project</div><div class="val" style="font-size:.95em;word-break:break-word">'+name+'</div></div>'
     +'<div class="st"><div class="lbl">Active Time'+PC('time','Time','ms')+'</div><div class="val">'+fmt(act)+'</div></div>'
     +'<div class="st"><div class="lbl">Credits'+PC('credits','Credits','credits')+'</div><div class="c-cost val">'+credits.toFixed(1)+'</div></div>'
@@ -1230,7 +1253,7 @@ function renderProjectDetail(){
     +translationSummaryHtml(p)
     +repos
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
-    +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th title="Worst budget dimension (time, credits or cost); sorted by risk">Budget</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
+    +'<table><thead><tr><th>Work Item</th><th>Estimate'+(ppOn()?' <span class="t-xs muted">(all-time)</span>':'')+'</th><th title="Worst budget dimension (time, credits or cost); sorted by risk. Budgets always cover the whole work item">Budget'+(ppOn()?' <span class="t-xs muted">(all-time)</span>':'')+'</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
 }
 function meModeLabel(m){return {humanCoding:'Human coding',aiGenerating:'AI generating',reviewing:'Reviewing',idle:'Idle'}[m]||m;}
 function meFor(wid){return (ME||[]).filter(function(e){return e.workItemId===wid;});}
@@ -2234,6 +2257,7 @@ window.addEventListener('message',function(e){
   if(msg.type==='settingsData'){setLoading=false;SET=msg;var kept=setResult(msg.result);var stv=document.querySelector('.view.active');if(!kept&&stv&&stv.id==='settings')renderSettings();return;}
   if(msg.type==='healthData'){healthLoading=false;HEALTH=msg.report;var hv=document.querySelector('.view.active');if(hv&&hv.id==='health')renderHealth();return;}
   if(msg.type==='estimatesData'){estLoading=false;EST=msg;var ev=document.querySelector('.view.active');if(ev&&ev.id==='estimates')renderEstimates();return;}
+  if(msg.type==='projectPeriodData'){PP=msg.data;ppReq='';var pv=document.querySelector('.view.active');if(pv&&pv.id==='projects'&&projView!=='workitem')renderProjectsView();return;}
   if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
   if(msg.type==='update'){
     allData=msg.summaries;currentBranch=msg.currentBranch;
@@ -2248,6 +2272,7 @@ window.addEventListener('message',function(e){
     if(msg.reassignments!==undefined&&msg.reassignments)RE=msg.reassignments;
     if(msg.netChange!==undefined)NET=msg.netChange;
     if(msg.repos!==undefined&&msg.repos)REPOS=msg.repos;
+    if(msg.projectPeriod!==undefined)PP=msg.projectPeriod;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();

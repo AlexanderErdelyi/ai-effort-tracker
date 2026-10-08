@@ -1054,6 +1054,10 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
         refreshDashboard();
         return;
       }
+      if (m?.type === 'projectPeriod') {
+        dashboardPanel?.webview.postMessage({ type: 'projectPeriodData', data: projectPeriodPayload() });
+        return;
+      }
       if (m?.type === 'optimize') {
         dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId, m.from, m.to, m.repoId) });
         return;
@@ -1140,6 +1144,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
       reassignments: db.getReassignments(),
+      projectPeriod: projectPeriodPayload(),
       netChange
     });
   }, 5000);
@@ -3460,6 +3465,16 @@ function repoRows(summaries: BranchSummary[]) {
   return buildRepoOverview(summaries, db.getAllProjects());
 }
 
+/** Projects view limited to the global date range (#163); null for "All", where the all-time summaries apply. */
+function projectPeriodPayload() {
+  if (dashFilter.range === 'all') return null;
+  try {
+    return { key: `${dashFilter.range}|${dashFilter.from}|${dashFilter.to}`, ...db.getProjectPeriod(filterWindow(dashFilter, Date.now(), renewalDay())) };
+  } catch {
+    return null;
+  }
+}
+
 function refreshDashboard() {
   if (!dashboardPanel) return;
   Promise.all([GitTracker.getCurrentBranch(), GitTracker.getNetLineChange()]).then(([b, netChange]) => {
@@ -3478,6 +3493,7 @@ function refreshDashboard() {
       ledger: db.getCreditEntries(),
       manualEffort: db.getManualEffort(),
       reassignments: db.getReassignments(),
+      projectPeriod: projectPeriodPayload(),
       netChange
     });
   });

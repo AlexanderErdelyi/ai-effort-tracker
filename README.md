@@ -132,6 +132,12 @@ Some tabs use only part of it, and a short note on the bar says so:
 - Branches tracked before repositories were recorded are under
   "Unknown repository" in the repository filter.
 - Correction episodes without a work item count as "No project".
+- Projects: the project list and project detail (work items and
+  repositories) show time, lines, credits, cost and ROI for the date range;
+  "All" shows the all-time totals. Budgets, estimates and the work-item detail
+  page stay all-time. Range figures come from the daily records, so time
+  corrections without a date are only in "All". The project, work item and
+  repository selectors do not apply here.
 
 ## Branch changes and tracked time
 

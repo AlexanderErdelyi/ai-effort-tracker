@@ -984,6 +984,33 @@ export interface ProjectSummary extends BranchRollup {
 }
 
 /**
+ * Date-scoped figures of one work item or project (#163). Built from daily
+ * buckets, ledger rows, manual effort and manual time entries inside a window.
+ */
+export interface PeriodFigures {
+  humanCodingMs: number;
+  aiGeneratingMs: number;
+  reviewingMs: number;
+  linesHumanAdded: number;
+  linesAiAdded: number;
+  /** Ledger credits in the window. */
+  creditsTotal: number;
+  /** Recorded ledger cost in the window. */
+  creditCost: number;
+  /** ROI at the subject's effective rates on the window's actual hours. */
+  roi: RoiFigures;
+}
+
+/** Date-scoped Projects view (#163): figures per work item and per project. */
+export interface ProjectPeriod {
+  /** Window as `[from, to)` epoch ms; null means open-ended. */
+  from: number | null;
+  to: number | null;
+  workItems: Record<string, PeriodFigures>;
+  projects: Record<string, PeriodFigures & { repoBreakdown: RepoRow[] }>;
+}
+
+/**
  * A project's resolved rates + ROI economic figures (issue #15). Extends the
  * pure {@link RoiFigures} with the owning project id so callers can carry it
  * around standalone (see {@link Database.getProjectRoi}).
@@ -5416,6 +5443,117 @@ export class Database {
 
   getAllProjectSummaries(): ProjectSummary[] {
     return this.getAllProjects().map(p => this.getProjectSummary(p.id));
+  }
+
+  /**
+   * Projects and work items limited to a time window (#163). Uses the same
+   * attribution as the all-time rollups (branch → work item → project, manual
+   * effort and time entries at exactly one level, credits from the ledger), but
+   * reads daily buckets, so time corrections without a date and the effective
+   * line counters are not part of it. Work-item ROI uses the hours worked in the
+   * window, not billable-hour overrides or estimates (those cover the whole item).
+   */
+  getProjectPeriod(window: { from?: number; to?: number } = {}): ProjectPeriod {
+    const fromDay = window.from !== undefined ? dayKey(window.from) : undefined;
+    const toDay = window.to !== undefined ? dayKey(window.to) : undefined;
+    const dayIn = (d: string) => (fromDay === undefined || d >= fromDay) && (toDay === undefined || d < toDay);
+    const tsIn = (ts: number) => Number.isFinite(ts) && (window.from === undefined || ts >= window.from) && (window.to === undefined || ts < window.to);
+    type Acc = { h: number; a: number; r: number; lh: number; la: number };
+    const zero = (): Acc => ({ h: 0, a: 0, r: 0, lh: 0, la: 0 });
+    const addMs = (acc: Acc, m: ModeMs) => { acc.h += m.humanCoding; acc.a += m.aiGenerating; acc.r += m.reviewing; };
+    const sum = (t: Acc, s: Acc) => { t.h += s.h; t.a += s.a; t.r += s.r; t.lh += s.lh; t.la += s.la; };
+
+    const branches = liveBranchKeys(this.store);
+    const live = new Set(branches);
+    const byBranch = new Map<string, Acc>();
+    for (const b of branches) {
+      const acc = zero();
+      for (const [date, bucket] of Object.entries(this.store[b]?.daily ?? {})) {
+        if (!dayIn(date)) continue;
+        acc.h += bucket.humanCoding ?? 0;
+        acc.a += bucket.aiGenerating ?? 0;
+        acc.r += bucket.reviewing ?? 0;
+        acc.lh += bucket.linesHuman ?? 0;
+        acc.la += bucket.linesAi ?? 0;
+      }
+      byBranch.set(b, acc);
+    }
+    const wiDirect = new Map<string, Acc>();
+    const projDirect = new Map<string, Acc>();
+    const at = (m: Map<string, Acc>, k: string) => { let v = m.get(k); if (!v) { v = zero(); m.set(k, v); } return v; };
+    for (const e of this.timeEntries) {
+      if (e.source !== 'manual' || !tsIn(timeEntryTs(e))) continue;
+      const ms = emptyModeMs();
+      accumulateTimeEntryMs(ms, e);
+      if (typeof e.branch === 'string' && e.branch) { if (live.has(e.branch)) addMs(byBranch.get(e.branch)!, ms); }
+      else if (e.workItemId) addMs(at(wiDirect, e.workItemId), ms);
+      else if (e.projectId) addMs(at(projDirect, e.projectId), ms);
+    }
+    for (const e of this.manualEffort) {
+      if (!tsIn(e.ts)) continue;
+      const roll = emptyManualRollup();
+      accumulateManualEntry(roll, e);
+      const acc = at(wiDirect, e.workItemId);
+      acc.h += roll.humanCodingMs; acc.a += roll.aiGeneratingMs; acc.r += roll.reviewingMs;
+      acc.lh += roll.linesHumanAdded; acc.la += roll.linesAiAdded;
+    }
+    const credit = { branch: new Map<string, { c: number; cost: number }>(), wi: new Map<string, { c: number; cost: number }>(), proj: new Map<string, { c: number; cost: number }>() };
+    const bump = (m: Map<string, { c: number; cost: number }>, k: string | null | undefined, e: LedgerEntry) => {
+      if (!k) return;
+      const v = m.get(k) ?? { c: 0, cost: 0 };
+      v.c += Number.isFinite(e.credits) ? e.credits : 0;
+      v.cost += Number.isFinite(e.cost) ? e.cost! : 0;
+      m.set(k, v);
+    };
+    for (const e of this.creditLedger) {
+      if (!tsIn(e.ts)) continue;
+      bump(credit.branch, e.branch, e);
+      bump(credit.wi, e.workItemId, e);
+      bump(credit.proj, e.projectId, e);
+    }
+    const figures = (acc: Acc, cr: { c: number; cost: number } | undefined, projectId: string | null | undefined): PeriodFigures => {
+      const credits = cr?.c ?? 0, cost = cr?.cost ?? 0;
+      return {
+        humanCodingMs: acc.h, aiGeneratingMs: acc.a, reviewingMs: acc.r,
+        linesHumanAdded: acc.lh, linesAiAdded: acc.la,
+        creditsTotal: credits, creditCost: cost,
+        roi: computeRoiFigures({ billableMs: acc.h + acc.a + acc.r, credits, ledgerCost: cost, rates: this.getEffectiveRates(projectId ?? undefined) })
+      };
+    };
+
+    const wiAcc = new Map<string, Acc>();
+    for (const id of this.getAllWorkItemIds()) {
+      const acc = zero();
+      for (const b of branches) if (this.store[b].workItemId === id) sum(acc, byBranch.get(b)!);
+      const d = wiDirect.get(id);
+      if (d) sum(acc, d);
+      wiAcc.set(id, acc);
+    }
+    const workItems: Record<string, PeriodFigures> = {};
+    for (const [id, acc] of wiAcc) workItems[id] = figures(acc, credit.wi.get(id), this.workItems[id]?.projectId);
+
+    const projects: ProjectPeriod['projects'] = {};
+    for (const p of this.getAllProjects()) {
+      const acc = zero();
+      for (const id of this.getWorkItemIdsForProject(p.id)) sum(acc, wiAcc.get(id) ?? zero());
+      const d = projDirect.get(p.id);
+      if (d) sum(acc, d);
+      const repoInputs = this.getBranchesForProject(p.id).map(b => {
+        const x = byBranch.get(b)!;
+        return {
+          branch: b, ...parseBranchKey(b), workItemId: this.store[b].workItemId ?? null,
+          humanCodingMs: x.h, aiGeneratingMs: x.a, reviewingMs: x.r,
+          linesHumanAdded: x.lh, linesHumanDeleted: 0, linesAiAdded: x.la, linesAiDeleted: 0,
+          estimatedCostUsd: x.la * COST_PER_AI_LINE_USD,
+          creditsTotal: credit.branch.get(b)?.c ?? 0
+        };
+      });
+      projects[p.id] = {
+        ...figures(acc, credit.proj.get(p.id), p.id),
+        repoBreakdown: buildRepoOverview(repoInputs, [], { includeRepos: p.repos })
+      };
+    }
+    return { from: window.from ?? null, to: window.to ?? null, workItems, projects };
   }
 
   // ---------------------------------------------------------------------------
