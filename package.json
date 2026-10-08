@@ -112,6 +112,10 @@
         "title": "AI Effort Tracker: Undo Entry Move"
       },
       {
+        "command": "aiEffortTracker.mergeBranches",
+        "title": "AI Effort Tracker: Merge Branch Into Another…"
+      },
+      {
         "command": "aiEffortTracker.reassignBranch",
         "title": "AI Effort Tracker: Reassign Branch to a Different Work Item"
       },

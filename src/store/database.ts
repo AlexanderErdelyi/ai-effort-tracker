@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
 import type { FileCategory } from '../util/fileTypes';
-import { branchKey, branchNameOf, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
+import { branchKey, branchNameOf, caseVariantBranchGroups, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
 import {
   resolveEffectiveRates,
   computeRoiFigures,
@@ -279,11 +279,13 @@ export interface ReassignmentRecord {
    * `move`: entries of `branch` moved to `toBranch` (#156); `move-undo`: such a
    * move reverted (`undoOf`). Absent on plain work item reassignments.
    */
-  kind?: 'move' | 'move-undo';
+  kind?: 'move' | 'merge' | 'move-undo';
   toBranch?: string;
   range?: { fromTs: number; toTs?: number };
   undoOf?: string;
   move?: EntryMovePayload;
+  /** Extra undo data of a branch merge (#159). */
+  merge?: BranchMergePayload;
 }
 
 /**
@@ -1369,13 +1371,17 @@ export function foldBranchTombstones(store: Pick<PersistedStore, 'branches' | 'c
 
 function rewriteMovedBranchRows(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>): void {
   const target = (b: string | null | undefined) => b && store.branches[b]?.movedTo ? resolveMovedBranch(store.branches, b) : undefined;
-  for (const rows of [store.creditLedger, store.timeEntries, store.reassignments] as { branch?: string | null }[][]) {
+  for (const rows of [store.creditLedger, store.timeEntries] as { branch?: string | null }[][]) {
     for (const row of rows ?? []) {
       const to = target(row.branch);
       if (to) row.branch = to;
     }
   }
+  // A merge row (#159) keeps naming its source so it can be undone.
   for (const r of store.reassignments ?? []) {
+    if (r.kind === 'merge') continue;
+    const from = target(r.branch);
+    if (from) r.branch = from;
     const to = target(r.toBranch);
     if (to) r.toBranch = to;
   }
@@ -1413,6 +1419,17 @@ export interface EntryMovePayload {
   ledger: { id: string; workItemId: string | null; projectId: string | null }[];
   timeEntries: { id: string; workItemId: string | null }[];
   stats: EntryMoveStats;
+}
+
+/** What a branch merge (#159) moved besides the {@link EntryMovePayload}. */
+export interface BranchMergePayload {
+  timeAdjustment?: Partial<Record<TrackingMode, number>>;
+  effectiveLegacyBaseline?: Record<string, { human: number; ai: number }>;
+  creditsLog?: CreditEntry[];
+  /** Work item of the source before the merge. */
+  source: { workItemId: string | null; manual: boolean };
+  /** Work item of the target before the merge (it may adopt the source's). */
+  target: { workItemId: string | null; manual: boolean };
 }
 
 const ACTIVE_MODES = ['humanCoding', 'aiGenerating', 'reviewing'] as const;
@@ -1912,7 +1929,7 @@ export function sanitizeReassignments(input: unknown): ReassignmentRecord[] {
     };
     if (typeof r.note === 'string') rec.note = r.note;
     if (typeof r.batchId === 'string') rec.batchId = r.batchId;
-    if (r.kind === 'move' || r.kind === 'move-undo') rec.kind = r.kind;
+    if (r.kind === 'move' || r.kind === 'merge' || r.kind === 'move-undo') rec.kind = r.kind;
     if (typeof r.toBranch === 'string' && r.toBranch) rec.toBranch = r.toBranch;
     if (r.range && typeof r.range === 'object' && typeof r.range.fromTs === 'number') {
       rec.range = { fromTs: r.range.fromTs };
@@ -1925,9 +1942,17 @@ export function sanitizeReassignments(input: unknown): ReassignmentRecord[] {
         ledger: Array.isArray(r.move.ledger) ? r.move.ledger.filter(x => x && typeof x.id === 'string') : [],
         timeEntries: Array.isArray(r.move.timeEntries) ? r.move.timeEntries.filter(x => x && typeof x.id === 'string') : [],
         stats: plainObject(r.move.stats) ? r.move.stats : { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false }
-              };
-            }
-            out.push(rec);
+      };
+    }
+    if (r.merge && typeof r.merge === 'object' && plainObject(r.merge.source) && plainObject(r.merge.target)) {
+      const m = r.merge;
+      const wi = (x: { workItemId?: unknown; manual?: unknown }) => ({ workItemId: typeof x.workItemId === 'string' ? x.workItemId : null, manual: x.manual === true });
+      rec.merge = { source: wi(m.source), target: wi(m.target) };
+      if (plainObject(m.timeAdjustment)) rec.merge.timeAdjustment = m.timeAdjustment;
+      if (plainObject(m.effectiveLegacyBaseline)) rec.merge.effectiveLegacyBaseline = m.effectiveLegacyBaseline;
+      if (Array.isArray(m.creditsLog)) rec.merge.creditsLog = m.creditsLog;
+    }
+    out.push(rec);
   }
   return out;
 }
@@ -3778,6 +3803,14 @@ export class Database {
     const plan = this.planEntryMove(from, to, opts);
     if (!plan) return undefined;
     if (!Object.keys(plan.delta).length && !plan.ledger.length && !plan.timeEntries.length) return undefined;
+    const rec = this.applyEntryMove(plan, 'move', note);
+    autoTitleWorkItems(this.store, this.workItems);
+    this.save();
+    return rec;
+  }
+
+  /** Transfer a planned move and push its audit row; the caller saves. */
+  private applyEntryMove(plan: NonNullable<ReturnType<Database['planEntryMove']>>, kind: 'move' | 'merge', note?: string): ReassignmentRecord {
     const target = this.ensureBranch(plan.to);
     const srcWi = plan.src.workItemId ?? null;
     const dstWi = target.workItemId ?? null;
@@ -3805,13 +3838,62 @@ export class Database {
       branch: plan.from,
       fromWorkItemId: srcWi,
       toWorkItemId: dstWi ?? UNASSIGNED_WORK_ITEM_ID,
-      kind: 'move',
+      kind,
       toBranch: plan.to,
       move: { delta: removed, ledger, timeEntries, stats: plan.stats }
     };
     if (plan.fromTs !== undefined) rec.range = plan.toTs === Infinity ? { fromTs: plan.fromTs } : { fromTs: plan.fromTs, toTs: plan.toTs };
     if (note && note.trim()) rec.note = note.trim();
     this.reassignments.push(rec);
+    return rec;
+  }
+
+  /** What {@link mergeBranches} would move (#159), or undefined when not possible. */
+  previewBranchMerge(from: string, to: string): EntryMoveStats | undefined {
+    return this.planEntryMove(from, to, { fromTs: 0 })?.stats;
+  }
+
+  /**
+   * Merge branch `from` into `to` (#159): every entry moves (like
+   * {@link moveEntries} with everything), time adjustments follow, and `from`
+   * becomes a tombstone so later writes to that key land on `to`. The target
+   * adopts the source's work item when it has none. Undo with {@link undoEntryMove}.
+   */
+  mergeBranches(from: string, to: string, note?: string): ReassignmentRecord | undefined {
+    const plan = this.planEntryMove(from, to, { fromTs: 0 });
+    if (!plan) return undefined;
+    const src = plan.src;
+    const target = this.ensureBranch(plan.to);
+    const merge: BranchMergePayload = {
+      source: { workItemId: src.workItemId ?? null, manual: !!src.workItemIdManual },
+      target: { workItemId: target.workItemId ?? null, manual: !!target.workItemIdManual }
+    };
+    const parked = (wi: string | null | undefined, manual?: boolean) => wi == null || (wi === UNASSIGNED_WORK_ITEM_ID && !manual);
+    if (parked(target.workItemId, target.workItemIdManual) && !parked(src.workItemId, src.workItemIdManual)) {
+      target.workItemId = src.workItemId;
+      if (src.workItemIdManual) target.workItemIdManual = true;
+    }
+    const rec = this.applyEntryMove(plan, 'merge', note);
+    const adj = src.timeAdjustment ?? {};
+    if (Object.keys(adj).length) {
+      merge.timeAdjustment = { ...adj };
+      const t = target.timeAdjustment ??= {};
+      for (const [m, v] of Object.entries(adj) as [TrackingMode, number][]) {
+        const sum = (t[m] ?? 0) + (Number(v) || 0);
+        if (sum) t[m] = sum; else delete t[m];
+      }
+      if (!Object.keys(t).length) delete target.timeAdjustment;
+    }
+    if (src.effectiveLegacyBaseline && Object.keys(src.effectiveLegacyBaseline).length) {
+      merge.effectiveLegacyBaseline = JSON.parse(JSON.stringify(src.effectiveLegacyBaseline));
+      target.effectiveLegacyBaseline = foldValue(target.effectiveLegacyBaseline, src.effectiveLegacyBaseline, '') as BranchData['effectiveLegacyBaseline'];
+    }
+    if (src.creditsLog?.length) {
+      merge.creditsLog = JSON.parse(JSON.stringify(src.creditsLog));
+      target.creditsLog = [...(target.creditsLog ?? []), ...JSON.parse(JSON.stringify(src.creditsLog))];
+    }
+    rec.merge = merge;
+    this.store[plan.from] = branchTombstone(src, plan.to);
     autoTitleWorkItems(this.store, this.workItems);
     this.save();
     return rec;
@@ -3823,14 +3905,52 @@ export class Database {
    * get their branch and work item back. Returns the `move-undo` audit row.
    */
   undoEntryMove(id: string): ReassignmentRecord | undefined {
-    const rec = this.reassignments.find(r => r.id === id && r.kind === 'move');
+    const rec = this.reassignments.find(r => r.id === id && (r.kind === 'move' || r.kind === 'merge'));
     if (!rec?.move || !rec.toBranch) return undefined;
     if (this.reassignments.some(r => r.kind === 'move-undo' && r.undoOf === id)) return undefined;
+    // An undone merge (#159) brings its source branch back to life first.
+    const tomb = rec.kind === 'merge' ? this.store[rec.branch] : undefined;
+    const tombTarget = tomb?.movedTo;
+    if (tomb) delete tomb.movedTo;
     const from = this.liveKey(rec.branch), to = this.liveKey(rec.toBranch);
     const target = this.store[to];
-    if (!target || from === to) return undefined;
+    if (!target || from === to) {
+      if (tomb && tombTarget) tomb.movedTo = tombTarget;
+      return undefined;
+    }
     const source = this.ensureBranch(from);
     transferBranchDelta(target, source, rec.move.delta);
+    const m = rec.merge;
+    if (m) {
+      if (m.timeAdjustment && Object.keys(m.timeAdjustment).length) {
+        const t = target.timeAdjustment ?? {};
+        for (const [mode, v] of Object.entries(m.timeAdjustment) as [TrackingMode, number][]) {
+          const rest = (t[mode] ?? 0) - (Number(v) || 0);
+          if (rest) t[mode] = rest; else delete t[mode];
+        }
+        if (Object.keys(t).length) target.timeAdjustment = t; else delete target.timeAdjustment;
+        source.timeAdjustment = { ...m.timeAdjustment };
+      }
+      if (m.effectiveLegacyBaseline) {
+        if (target.effectiveLegacyBaseline) subtractBranchDelta(target.effectiveLegacyBaseline, m.effectiveLegacyBaseline);
+        source.effectiveLegacyBaseline = JSON.parse(JSON.stringify(m.effectiveLegacyBaseline));
+      }
+      if (m.creditsLog?.length) {
+        const log = target.creditsLog ?? [];
+        for (const c of m.creditsLog) {
+          const i = log.findIndex(x => isDeepStrictEqual(x, c));
+          if (i >= 0) log.splice(i, 1);
+        }
+        if (log.length) target.creditsLog = log; else delete target.creditsLog;
+        source.creditsLog = JSON.parse(JSON.stringify(m.creditsLog));
+      }
+      source.workItemId = m.source.workItemId;
+      if (m.source.manual) source.workItemIdManual = true; else delete source.workItemIdManual;
+      if (target.workItemId !== m.target.workItemId && target.workItemId === m.source.workItemId) {
+        target.workItemId = m.target.workItemId;
+        if (m.target.manual) target.workItemIdManual = true; else delete target.workItemIdManual;
+      }
+    }
     for (const prev of rec.move.ledger) {
       const e = this.creditLedger.find(x => x.id === prev.id);
       if (!e || e.branch !== to) continue;
@@ -3861,12 +3981,35 @@ export class Database {
     return undo;
   }
 
-  /** Entry moves (#156), newest first, with whether each was undone. */
+  /** Entry moves (#156) and branch merges (#159), newest first, with whether each was undone. */
   getEntryMoves(): (ReassignmentRecord & { undone: boolean })[] {
     const undone = new Set(this.reassignments.filter(r => r.kind === 'move-undo' && r.undoOf).map(r => r.undoOf));
     return this.getReassignments()
-      .filter(r => r.kind === 'move')
+      .filter(r => r.kind === 'move' || r.kind === 'merge')
       .map(r => ({ ...r, undone: undone.has(r.id) }));
+  }
+
+  /** Live branches of the same repository whose names differ only by case (#159). */
+  getCaseVariantBranches(): string[][] {
+    return caseVariantBranchGroups(liveBranchKeys(this.store));
+  }
+
+  /**
+   * The store key to record a checked-out branch under: a merged/folded key
+   * resolves to where its data lives now, and with `caseInsensitive` (Windows
+   * and macOS file systems) an unknown key adopts the casing of an existing
+   * branch of the same repository (#159).
+   */
+  canonicalBranchKey(key: string, caseInsensitive = false): string {
+    const live = this.liveKey(key);
+    if (!caseInsensitive || this.store[live]) return live;
+    const { repoId, name } = parseBranchKey(live);
+    const lower = name.toLowerCase();
+    const match = liveBranchKeys(this.store).find(k => {
+      const p = parseBranchKey(k);
+      return p.repoId === repoId && p.name.toLowerCase() === lower;
+    });
+    return match ?? live;
   }
 
   /** The work item id currently mapped to a branch (or null). */

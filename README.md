@@ -36,7 +36,8 @@
 | `AI Effort Tracker: Unlink Repository from Project` | Removes a repository from a project after confirmation. Tracked data is kept |
 | `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
 | `AI Effort Tracker: Move Entries to Another Branch` | Moves time, lines and credits of a time range (or chosen ledger rows) from one branch to another, e.g. work done on `main` before the feature branch existed (see [Moving entries between branches](#moving-entries-between-branches)) |
-| `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back |
+| `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back, or splits a merged branch out again |
+| `AI Effort Tracker: Merge Branch Into Another…` | Merges all data of a duplicate branch (e.g. same name, different case) into another branch (see [Merging duplicate branches](#merging-duplicate-branches)) |
 | `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
 | `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
 | `AI Effort Tracker: Reveal Data Folder` | Open the folder where the data is stored |
@@ -177,6 +178,27 @@ shows the active time, lines, credits and time-log rows before anything moves.
 - Every move is listed under **Entry moves** on the branch page and in the work
   item's Reassignment History. **↺ Undo** (or **AI Effort Tracker: Undo Entry
   Move**) moves exactly the same amounts back.
+
+### Merging duplicate branches
+
+Git branch names are case-sensitive, but on Windows and macOS the same branch
+can show up as `UAT-Integration` and `UAT-integration`. **Data health** flags
+branches of the same repository whose names differ only in case (branches with
+the same name in different repositories are never flagged) and offers
+**Merge**. You can also use **AI Effort Tracker: Merge Branch Into Another…** or
+**⧉ Merge into another branch…** on a branch's detail page.
+
+- Everything of the source branch moves to the target: daily time, lines,
+  credits, counters, focus sessions, ledger and time-log rows, manual time
+  adjustments and the credit log. The source disappears from the branch list.
+- If the target has no work item yet, it takes over the source's work item.
+- Activity that arrives later under the old name (for example from another
+  VS Code window) is added to the target.
+- On Windows and macOS, switching to a branch whose name only differs in case
+  from a tracked branch of the same repository keeps tracking on the existing
+  branch instead of creating a duplicate.
+- Merges are listed under **Entry moves**. **↺ Undo** (or **AI Effort Tracker:
+  Undo Entry Move**) splits the branch out again, including its work item.
 
 ### Repositories
 

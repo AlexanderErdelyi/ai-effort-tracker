@@ -29,6 +29,21 @@ export function repoOfKey(key: string): string | null {
   return parseBranchKey(key).repoId;
 }
 
+/**
+ * Groups of branch keys of the same repository whose names differ only by
+ * case (#159), e.g. `UAT-Integration` / `UAT-integration`. Legacy keys (no
+ * repository) form their own group; different repositories never match.
+ */
+export function caseVariantBranchGroups(keys: Iterable<string>): string[][] {
+  const groups = new Map<string, string[]>();
+  for (const key of keys) {
+    const { repoId, name } = parseBranchKey(key);
+    const id = `${repoId ?? ''}\u0000${name.toLowerCase()}`;
+    groups.set(id, [...(groups.get(id) ?? []), key]);
+  }
+  return [...groups.values()].filter(g => g.length > 1).map(g => g.sort());
+}
+
 /** Repo filter value for branches tracked before #154 (repository unknown). */
 export const LEGACY_REPO = '__legacy__';
 

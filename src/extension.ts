@@ -376,6 +376,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.undoEntryMove', (id?: string) =>
       undoEntryMoveCmd(typeof id === 'string' ? id : undefined)
     ),
+    // #159: merge duplicate / case-variant branches.
+    vscode.commands.registerCommand('aiEffortTracker.mergeBranches', (arg?: string | { from?: string; to?: string }) =>
+      mergeBranchesCmd(arg)
+    ),
     // Reassignment is the same manual-override flow, framed as moving an
     // already-mapped branch to a different work item (issue #10).
     vscode.commands.registerCommand('aiEffortTracker.reassignBranch', () =>
@@ -838,11 +842,11 @@ async function undoEntryMoveCmd(id?: string): Promise<void> {
       return;
     }
     const picked = await vscode.window.showQuickPick(moves.map(m => ({
-      label: `${branchLabel(m.branch)} \u2192 ${branchLabel(m.toBranch ?? '')}`,
-      description: new Date(m.ts).toLocaleString(),
+      label: `${m.kind === 'merge' ? '\u29c9 ' : ''}${branchLabel(m.branch)} \u2192 ${branchLabel(m.toBranch ?? '')}`,
+      description: (m.kind === 'merge' ? 'merge \u00b7 ' : '') + new Date(m.ts).toLocaleString(),
       detail: m.move ? moveSummary(m.move.stats) : undefined,
       id: m.id
-    })), { placeHolder: 'Undo which entry move?' });
+    })), { placeHolder: 'Undo which entry move or branch merge?' });
     if (!picked) return;
     id = picked.id;
   }
@@ -850,6 +854,62 @@ async function undoEntryMoveCmd(id?: string): Promise<void> {
   refreshDashboard();
   if (undo) vscode.window.showInformationMessage(`AI Effort Tracker: entries moved back to "${branchLabel(undo.toBranch ?? '')}".`);
   else vscode.window.showWarningMessage('AI Effort Tracker: this move was already undone.');
+}
+
+/**
+ * #159: merge all data of one tracked branch into another — duplicates such as
+ * `UAT-Integration` / `UAT-integration`, or a renamed branch. `arg` is the
+ * source key, or `{ from, to }`. Case variants of the source are offered first.
+ */
+async function mergeBranchesCmd(arg?: string | { from?: string; to?: string }): Promise<void> {
+  const payload = typeof arg === 'object' && arg ? arg : typeof arg === 'string' && arg ? { from: arg } : {};
+  const all = db.getAllBranches();
+  const variantsOf = (key: string) => db.getCaseVariantBranches().find(g => g.includes(key))?.filter(k => k !== key) ?? [];
+  let source = payload.from && all.includes(payload.from) ? payload.from : undefined;
+  if (!source) {
+    const flagged = new Set(db.getCaseVariantBranches().flat());
+    const picked = await vscode.window.showQuickPick(
+      all.sort((a, b) => Number(flagged.has(b)) - Number(flagged.has(a)) || a.localeCompare(b))
+        .map(key => ({ label: branchLabel(key), description: flagged.has(key) ? 'same name, different case' : undefined, key })),
+      { placeHolder: 'Merge which branch (it disappears into the other one)?' });
+    if (!picked) return;
+    source = picked.key;
+  }
+  let target = payload.to && all.includes(payload.to) && payload.to !== source ? payload.to : undefined;
+  if (!target) {
+    const variants = variantsOf(source);
+    const repo = repoOfKey(source);
+    const others = all.filter(k => k !== source).sort((a, b) =>
+      Number(variants.includes(b)) - Number(variants.includes(a))
+      || Number(repoOfKey(b) === repo) - Number(repoOfKey(a) === repo) || a.localeCompare(b));
+    const picked = await vscode.window.showQuickPick(others.map(key => {
+      const wi = db.getWorkItemForBranch(key);
+      return {
+        label: branchLabel(key),
+        description: (variants.includes(key) ? 'same name, different case \u00b7 ' : '') + (wi ? '#' + wi : 'no work item'),
+        key
+      };
+    }), { placeHolder: `Merge "${branchLabel(source)}" INTO which branch?`, matchOnDescription: true });
+    if (!picked) return;
+    target = picked.key;
+  }
+  const stats = db.previewBranchMerge(source, target);
+  if (!stats) {
+    vscode.window.showWarningMessage('AI Effort Tracker: these branches cannot be merged.');
+    return;
+  }
+  const ok = await vscode.window.showWarningMessage(
+    `Merge "${branchLabel(source)}" into "${branchLabel(target)}"?`,
+    {
+      modal: true,
+      detail: `Moves ${moveSummary(stats)} and removes "${branchLabel(source)}" from the branch list. Later activity recorded under that name is added to "${branchLabel(target)}".\n\nYou can undo this merge.`
+    },
+    'Merge'
+  );
+  if (ok !== 'Merge') return;
+  const rec = db.mergeBranches(source, target);
+  refreshDashboard();
+  if (rec) await offerMoveUndo(rec.id, `Merged "${branchLabel(source)}" into "${branchLabel(target)}" (${moveSummary(stats)}).`);
 }
 
 export function deactivate() {

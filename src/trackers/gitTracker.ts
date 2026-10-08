@@ -45,8 +45,11 @@ export class GitTracker implements vscode.Disposable {
     if (this.refreshing || this.disposed) return;
     this.refreshing = true;
     try {
-      const branch = await GitTracker.getCurrentBranch();
-      if (!branch || this.disposed) return;
+      const reported = await GitTracker.getCurrentBranch();
+      if (!reported || this.disposed) return;
+      // #159: a merged key resolves to its target; on case-insensitive file
+      // systems git may report another casing of a branch we already track.
+      const branch = this.db.canonicalBranchKey?.(reported, process.platform === 'win32' || process.platform === 'darwin') ?? reported;
 
       const prev = this.timeTracker.getBranch();
       if (branch !== prev) {
