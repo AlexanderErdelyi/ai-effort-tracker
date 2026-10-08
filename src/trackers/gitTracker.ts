@@ -27,6 +27,13 @@ export class GitTracker implements vscode.Disposable {
 
   constructor(private db: Database, private timeTracker: TimeTracker) {}
 
+  private switchListeners: ((prev: string | undefined, next: string, nextIsNew: boolean) => void)[] = [];
+
+  /** #156: called after the checked-out branch changed; `nextIsNew` when nothing was tracked on it yet. */
+  onBranchSwitch(listener: (prev: string | undefined, next: string, nextIsNew: boolean) => void): void {
+    this.switchListeners.push(listener);
+  }
+
   start(_context: vscode.ExtensionContext) {
     if (this.pollInterval || this.disposed) return;
     // Poll git branch every 5 seconds (lightweight)
@@ -43,11 +50,15 @@ export class GitTracker implements vscode.Disposable {
 
       const prev = this.timeTracker.getBranch();
       if (branch !== prev) {
+        const nextIsNew = !this.db.getAllBranches?.().includes(branch);
         this.timeTracker.setBranch(branch);
         // Manual mappings remain sticky in the database.
         const workItemId = GitTracker.extractWorkItemId(branchNameOf(branch));
         if (workItemId) {
           this.db.setWorkItemForBranch(branch, workItemId);
+        }
+        for (const l of this.switchListeners) {
+          try { l(prev, branch, nextIsNew); } catch (e) { console.error('AI Effort Tracker: branch switch listener failed', e); }
         }
       }
     } finally {

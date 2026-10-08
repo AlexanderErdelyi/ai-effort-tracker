@@ -35,6 +35,8 @@
 | `AI Effort Tracker: Link Current Repo to Project` | Adds the open repository to a project; a project can have several (see [Repositories](#repositories)) |
 | `AI Effort Tracker: Unlink Repository from Project` | Removes a repository from a project after confirmation. Tracked data is kept |
 | `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
+| `AI Effort Tracker: Move Entries to Another Branch` | Moves time, lines and credits of a time range (or chosen ledger rows) from one branch to another, e.g. work done on `main` before the feature branch existed (see [Moving entries between branches](#moving-entries-between-branches)) |
+| `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back |
 | `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
 | `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
 | `AI Effort Tracker: Reveal Data Folder` | Open the folder where the data is stored |
@@ -152,6 +154,29 @@ current repository; **AI Effort Tracker: Assign Older Branches to a Repository**
 lets you choose branches and the repository at any time. If the repository
 already has that branch, the totals are added together. Credit, time-log and
 reassignment rows move along, and nothing is merged automatically.
+
+### Moving entries between branches
+
+Work often starts on `main` (a call, a new user story, the spec) before the
+feature branch exists. **AI Effort Tracker: Move Entries to Another Branch**
+(or **⇄ Move entries to another branch…** on a branch's detail page) moves
+what was tracked on one branch to another: pick the target branch and the
+range — *Today*, *Today since HH:MM*, *Since a date* or *Everything*. A preview
+shows the active time, lines, credits and time-log rows before anything moves.
+
+- Daily time, lines, credits, chat counters and focus sessions move along.
+  When the range starts mid-day, that day is split by hour and its lines and
+  counters move proportionally (the preview says so).
+- Credit and time-log rows take over the target branch's work item.
+- In the **Credit Ledger** you can tick single rows and use
+  **⇄ Move selected to branch…** to move only those credits.
+- When you switch to a branch with nothing tracked yet and the previous branch
+  of the same repository has work from today, the extension offers to **move
+  today's entries** to the new branch (or from a start time you choose). Turn this off
+  with `aiEffortTracker.branches.offerMoveOnNewBranch`.
+- Every move is listed under **Entry moves** on the branch page and in the work
+  item's Reassignment History. **↺ Undo** (or **AI Effort Tracker: Undo Entry
+  Move**) moves exactly the same amounts back.
 
 ### Repositories
 

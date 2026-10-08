@@ -53,6 +53,7 @@ const GROUP_RULES: [string, SettingGroup][] = [
   ['codingActiveSeconds', 'Tracking'],
   ['aiActiveSeconds', 'Tracking'],
   ['away.', 'Tracking'],
+  ['branches.', 'Tracking'],
   ['timesheet.', 'Tracking'],
   ['sessions.', 'Tracking'],
   ['handoff.', 'Tracking'],

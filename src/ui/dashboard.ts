@@ -1301,11 +1301,35 @@ function timeLogCardHtml(entries,btnAttrs){
     +'<table class="mt2"><thead><tr><th>Time</th><th>Duration</th><th>Kind</th><th>Note</th><th></th></tr></thead><tbody>'+timeLogRowsHtml(entries)+'</tbody></table>'
     +'<p class="mt2 t-sm muted">Discrete time entries grouped by day. Manual entries roll up into Active Time &amp; ROI above (no double count).</p></div>';
 }
-function reFor(wid){return (RE||[]).filter(function(r){return r.toWorkItemId===wid||r.fromWorkItemId===wid;});}function reassignRowsHtml(wid){
+function reFor(wid){return (RE||[]).filter(function(r){return r.toWorkItemId===wid||r.fromWorkItemId===wid;});}
+// Entry moves between branches (#156): "A \\u2192 B" with what moved and an Undo button.
+function moveStatsText(s){
+  if(!s)return'';var p=[];
+  if(s.activeMs)p.push(fmt(s.activeMs)+' active');
+  if(s.linesHuman||s.linesAi)p.push((s.linesHuman+s.linesAi)+' lines');
+  if(s.ledgerRows)p.push(Number(s.credits).toFixed(1)+' credits');
+  if(s.timeEntries)p.push(s.timeEntries+' time-log');
+  return p.join(' \\u00b7 ');
+}
+function moveRowHtml(r,when){
+  var undone=r.kind==='move'&&(RE||[]).some(function(x){return x.kind==='move-undo'&&x.undoOf===r.id;});
+  var st=moveStatsText(r.move&&r.move.stats);
+  var label=r.kind==='move-undo'?'\\u21BA Undo of move':'\\u21C4 Entries moved'+(r.range&&r.range.fromTs>0?' since '+esc(new Date(r.range.fromTs).toLocaleString()):'');
+  var act=r.kind==='move'?(undone?'<span class="badge bp">undone</span>':' <button class="dtab" data-action="moveUndo" data-id="'+esc(r.id)+'" title="Move these entries back">\\u21BA Undo</button>'):'';
+  var note=r.note?' \\u2014 '+esc(r.note):'';
+  return'<tr><td class="nw">'+esc(when)+'</td><td><strong>'+bh(r.branch)+'</strong> \\u2192 <strong>'+bh(r.toBranch||'')+'</strong></td><td class="nw">'+label+'</td><td style="max-width:260px" title="'+esc(st)+'">'+esc(st)+note+act+'</td></tr>';
+}
+function branchMovesHtml(branch){
+  var list=(RE||[]).filter(function(r){return(r.kind==='move'||r.kind==='move-undo')&&(r.branch===branch||r.toBranch===branch);}).slice(0,5);
+  if(!list.length)return'';
+  return'<div class="mb3 card"><h3>\\u21C4 Entry moves</h3><table class="mt2"><thead><tr><th>When</th><th>From \\u2192 To</th><th>Kind</th><th>Moved</th></tr></thead><tbody>'+list.map(function(r){return moveRowHtml(r,new Date(r.ts).toLocaleString());}).join('')+'</tbody></table></div>';
+}
+function reassignRowsHtml(wid){
   var list=reFor(wid);
   if(!list.length)return'<tr class="empty-row"><td colspan="4">No reassignments touch this work item yet.</td></tr>';
   return list.map(function(r){
     var when=new Date(r.ts).toLocaleString();
+    if(r.kind==='move'||r.kind==='move-undo')return moveRowHtml(r,when);
     var from=r.fromWorkItemId?('#'+esc(r.fromWorkItemId)):'\\u2014';
     var dir=from+' \\u2192 #'+esc(r.toWorkItemId);
     var note=r.note?esc(r.note):'';
@@ -1358,7 +1382,7 @@ function renderWorkItemDetail(){
     +'<div class="card"><h3>Branches</h3><table class="mt2"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p class="mt2 t-sm muted">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="mt3 card"><h3>Manual Effort</h3><table class="mt2"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p class="mt2 t-sm muted">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
     +timeLogCardHtml(w.timeEntries||[],'data-id="'+esc(w.workItemId)+'"')
-    +'<div class="mt3 card"><h3>Reassignment History</h3><table class="mt2"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p class="mt2 t-sm muted">Audit trail of branch \\u2192 work item moves touching this work item (newest first).</p></div>';
+    +'<div class="mt3 card"><h3>Reassignment History</h3><table class="mt2"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p class="mt2 t-sm muted">Audit trail of branch \\u2192 work item moves and entry moves between branches touching this work item (newest first).</p></div>';
   renderBudgetChart(w);
 }
 function renderProjectsView(){
@@ -1370,11 +1394,14 @@ function renderProjectsView(){
 // editing/deleting a row here corrects every derived total automatically.
 // Open deep-analysis rows and the last rendered markup survive the periodic 5s
 // refresh: unchanged data is not re-rendered, changed data re-opens the rows.
-var ledOpen={},ledHtml='';
+var ledOpen={},ledHtml='',ledSel={};
 function renderLedger(){
   var el=document.getElementById('ledger');
+  Object.keys(ledSel).forEach(function(id){if(!(LEDGER||[]).some(function(e){return e.id===id;}))delete ledSel[id];});
+  var nSel=Object.keys(ledSel).length;
   var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button> <button class="dtab" data-action="cmd" data-value="importRealCredits" title="Import recorded credits from a Copilot Chat Debug export">\\u2B07 Import Real Credits</button>';
   add+=' <button class="dtab" data-action="cmd" data-value="importDebugSession">Import Debug Session</button>';
+  add+=' <button class="dtab" data-action="ledMove" title="Move the ticked rows (e.g. spec work done on main) to another branch \\u2014 they take over that branch\\u2019s work item"'+(nSel?'':' disabled')+'>\\u21C4 Move selected'+(nSel?' ('+nSel+')':'')+' to branch\\u2026</button>';
   if(!LEDGER||!LEDGER.length){
     ledHtml='';ledOpen={};
     el.innerHTML='<div class="hbar mb3"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'+emptyState('No credit entries yet','Credits are captured from the chat debug log as you use Copilot. Use \\u201cAdd Entry\\u201d to record one by hand.');
@@ -1392,11 +1419,11 @@ function renderLedger(){
     if(e.debugUsage)src+='<span class="badge bp" title="'+Number(e.credits).toFixed(6)+' ledger credits">'+(e.debugUsage.creditsOverridden?'manually adjusted':e.debugUsage.unpricedRequests?'partial: '+e.debugUsage.unpricedRequests+' unpriced':'recorded')+'</span>';
     if(e.debugUsage&&e.debugUsage.logWarnings)src+='<span class="badge bd">log warnings</span>';
     var dbtn=e.analysis?'<button class="dtab" data-action="ledDetail" data-id="'+esc(e.id)+'" title="Deep analysis \\u2014 lines, tools, token cost">\\uD83D\\uDD0D</button> ':'';
-    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td class="nw">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td class="nw">'+Number(e.credits).toFixed(1)+cfRowBadge(e)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td class="nw">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
+    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td><input type="checkbox" data-action="ledSel" data-id="'+esc(e.id)+'" title="Select to move to another branch"'+(ledSel[e.id]?' checked':'')+'></td><td class="nw">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td class="nw">'+Number(e.credits).toFixed(1)+cfRowBadge(e)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td class="nw">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
   var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'
     +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.'+(LV.length!==LEDGER.length?' Showing '+LV.length+' of '+LEDGER.length+' entries.':'')+'</p>'+cfLegend()
-    +'<div class="card">'+(LV.length?'':emptyState('No entries match the filter','Widen the date range or clear the project and work item in the filter bar.'))+'<table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+    +'<div class="card">'+(LV.length?'':emptyState('No entries match the filter','Widen the date range or clear the project and work item in the filter bar.'))+'<table><thead><tr><th></th><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
   if(html===ledHtml&&el.querySelector('table'))return;
   ledHtml=html;
   el.innerHTML=html;
@@ -1483,7 +1510,7 @@ function openLedgerDetail(id){
     +'<span>\\uD83D\\uDD27 <strong>'+(an.toolCalls||0)+'</strong> tool calls</span>'
     +(an.durationMs?'<span>\\u23F1 <strong>'+fmt(an.durationMs)+'</strong> model time</span>':'')
     +'</div>';
-  var html='<td colspan="8" style="background:var(--surface);padding:12px 16px">'
+  var html='<td colspan="9" style="background:var(--surface);padding:12px 16px">'
     +'<div style="font-weight:600;margin-bottom:4px">\\uD83D\\uDD0D Deep analysis</div>'
     +effHtml
     +'<div style="background:var(--vscode-editorWidget-background,rgba(128,128,128,.08));border-left:3px solid var(--ai);padding:6px 10px;border-radius:4px;margin:6px 0;font-size:.88em">'+tip+'</div>'
@@ -1565,7 +1592,7 @@ function showDetail(branch){
   }
   var effectiveHtml='<div class="mb3 card"><h3>\\u2705 Effective changed lines</h3><div class="mt3 sg"><div class="st"><div class="lbl">Human</div><div class="c-human val">'+(d.effectiveLinesHuman||0)+'</div></div><div class="st"><div class="lbl">AI</div><div class="c-ai val">'+(d.effectiveLinesAi||0)+'</div></div><div class="st"><div class="lbl">Total</div><div class="val">'+((d.effectiveLinesHuman||0)+(d.effectiveLinesAi||0))+'</div></div></div><p class="mt3 t-sm muted">Canonical meaningful line versions used for productivity, equivalent time, generated value and estimate actuals. Unchanged full-file rewrite noise is excluded; later corrections count as additional effective work.</p></div>';
   effectiveHtml+=translationSummaryHtml(d);
-  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+bh(d.branch)+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+bh(d.branch)+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0"><button class="dtab" data-action="moveEntries" data-id="'+esc(d.branch)+'" title="Move time, lines and credits of a time range (e.g. spec work done here before the feature branch existed) to another branch. Can be undone.">\\u21C4 Move entries to another branch\\u2026</button></div>'+branchMovesHtml(d.branch)+'  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
   // Honor the user's current sub-tab instead of the hard-coded Insights default, so a
@@ -2296,6 +2323,10 @@ document.addEventListener('click',function(e){
   else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDetail')toggleLedgerDetail(t.dataset.id);
+  else if(a==='ledSel'){if(t.checked)ledSel[t.dataset.id]=true;else delete ledSel[t.dataset.id];renderLedger();}
+  else if(a==='ledMove'){var lids=Object.keys(ledSel);if(lids.length){vscode.postMessage({type:'cmd',value:'moveEntries',arg:{ledgerIds:lids}});ledSel={};renderLedger();}}
+  else if(a==='moveEntries')vscode.postMessage({type:'cmd',value:'moveEntries',arg:t.dataset.id});
+  else if(a==='moveUndo')vscode.postMessage({type:'cmd',value:'undoEntryMove',arg:t.dataset.id});
   else if(a==='meAdd')vscode.postMessage({type:'cmd',value:'addManualEffort',arg:t.dataset.id});
   else if(a==='meEdit')vscode.postMessage({type:'cmd',value:'editManualEffort',arg:t.dataset.id});
   else if(a==='meDel')vscode.postMessage({type:'cmd',value:'deleteManualEffort',arg:t.dataset.id});

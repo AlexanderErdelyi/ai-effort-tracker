@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
@@ -274,6 +275,15 @@ export interface ReassignmentRecord {
   note?: string;
   /** Groups records written together by one bulk operation. */
   batchId?: string;
+  /**
+   * `move`: entries of `branch` moved to `toBranch` (#156); `move-undo`: such a
+   * move reverted (`undoOf`). Absent on plain work item reassignments.
+   */
+  kind?: 'move' | 'move-undo';
+  toBranch?: string;
+  range?: { fromTs: number; toTs?: number };
+  undoOf?: string;
+  move?: EntryMovePayload;
 }
 
 /**
@@ -1365,6 +1375,268 @@ function rewriteMovedBranchRows(store: Pick<PersistedStore, 'branches' | 'credit
       if (to) row.branch = to;
     }
   }
+  for (const r of store.reassignments ?? []) {
+    const to = target(r.toBranch);
+    if (to) r.toBranch = to;
+  }
+}
+
+/** Which entries {@link Database.moveEntries} moves (#156). */
+export interface EntryMoveOptions {
+  /** Start of the time range (epoch ms, inclusive). `0` moves everything. */
+  fromTs?: number;
+  /** End of the time range (epoch ms, exclusive). Defaults to no end. */
+  toTs?: number;
+  /** Credit ledger rows to move. Without `fromTs` ONLY these rows move. */
+  ledgerIds?: string[];
+}
+
+/** What a branch entry move covers (#156). */
+export interface EntryMoveStats {
+  activeMs: number;
+  idleMs: number;
+  linesHuman: number;
+  linesAi: number;
+  credits: number;
+  ledgerRows: number;
+  timeEntries: number;
+  focusSessions: number;
+  days: number;
+  /** True when part of a day was split by hour, so lines/counters are proportional. */
+  estimated: boolean;
+}
+
+/** Undo data stored on a move audit row (#156). */
+export interface EntryMovePayload {
+  /** Counters actually moved (subtracted from the source, added to the target). */
+  delta: Record<string, unknown>;
+  ledger: { id: string; workItemId: string | null; projectId: string | null }[];
+  timeEntries: { id: string; workItemId: string | null }[];
+  stats: EntryMoveStats;
+}
+
+const ACTIVE_MODES = ['humanCoding', 'aiGenerating', 'reviewing'] as const;
+const sumOf = (a: number[] | undefined) => (a ?? []).reduce((s, v) => s + (Number(v) || 0), 0);
+
+function hourFractions(day: string, fromTs: number, toTs: number): number[] {
+  const [y, m, d] = day.split('-').map(Number);
+  return Array.from({ length: 24 }, (_, h) => {
+    const start = new Date(y, m - 1, d, h).getTime();
+    const end = new Date(y, m - 1, d, h + 1).getTime();
+    if (!(end > start)) return 0;
+    return Math.min(1, Math.max(0, Math.min(end, toTs) - Math.max(start, fromTs)) / (end - start));
+  });
+}
+
+function bucketHasEffort(b: DailyBucket): boolean {
+  return ACTIVE_MODES.some(m => (b[m] ?? 0) > 0) || (b.idle ?? 0) > 0 || (b.linesHuman ?? 0) > 0 || (b.linesAi ?? 0) > 0;
+}
+
+/** Part of one day bucket inside the range, split proportionally per hour. */
+function sliceBucket(b: DailyBucket, fr: number[]): DailyBucket {
+  const scale = (v: number | undefined, f: number) => Math.round((Number(v) || 0) * f);
+  const hours = (b.hours ?? []).map((v, i) => scale(v, fr[i] ?? 0));
+  const out: DailyBucket = { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0, linesHuman: 0, linesAi: 0, hours };
+  if (b.hoursByMode) {
+    out.hoursByMode = { humanCoding: [], aiGenerating: [], reviewing: [] };
+    for (const m of ACTIVE_MODES) {
+      const src = b.hoursByMode[m] ?? [];
+      const moved = src.map((v, i) => scale(v, fr[i] ?? 0));
+      out.hoursByMode[m] = moved;
+      const total = sumOf(src);
+      out[m] = total > 0 ? Math.min(b[m] ?? 0, Math.round((b[m] ?? 0) * sumOf(moved) / total)) : 0;
+    }
+  } else {
+    const total = sumOf(b.hours);
+    const share = total > 0 ? sumOf(hours) / total : 0;
+    for (const m of ACTIVE_MODES) out[m] = Math.round((b[m] ?? 0) * share);
+  }
+  const active = ACTIVE_MODES.reduce((s, m) => s + (b[m] ?? 0), 0);
+  const share = active > 0
+    ? Math.min(1, ACTIVE_MODES.reduce((s, m) => s + out[m], 0) / active)
+    : fr.reduce((s, f) => s + f, 0) / 24;
+  out.idle = scale(b.idle, share);
+  out.linesHuman = scale(b.linesHuman, share);
+  out.linesAi = scale(b.linesAi, share);
+  if (b.linesAiTranslation !== undefined) out.linesAiTranslation = scale(b.linesAiTranslation, share);
+  if (b.linesByCategory) {
+    out.linesByCategory = {};
+    for (const [cat, v] of Object.entries(b.linesByCategory)) {
+      out.linesByCategory[cat] = { human: scale(v.human, share), ai: scale(v.ai, share) };
+    }
+  }
+  return out;
+}
+
+/**
+ * The tracked counters of a branch that fall in `[fromTs, toTs)` (#156). Day
+ * buckets and focus sessions are exact; a partly covered day is split by hour.
+ * Cumulative counters (lines per extension, files, chat counters) carry no
+ * timestamps, so they move in proportion to the moved lines or active time.
+ * `fromTs <= 0` without an end moves everything.
+ */
+export function sliceBranchRange(src: BranchData, fromTs: number, toTs = Infinity): { delta: Record<string, unknown>; stats: EntryMoveStats } {
+  const all = fromTs <= 0 && toTs === Infinity;
+  const stats: EntryMoveStats = { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false };
+  const delta: Record<string, unknown> = {};
+  const daily: Record<string, DailyBucket> = {};
+  const movedMode: Record<TrackingMode, number> = { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0 };
+  let movedActive = 0, totalActive = 0, movedH = 0, totalH = 0, movedA = 0, totalA = 0;
+  for (const [day, b] of Object.entries(src.daily ?? {})) {
+    if (!b || !bucketHasEffort(b)) continue;
+    const active = ACTIVE_MODES.reduce((s, m) => s + (b[m] ?? 0), 0);
+    totalActive += active;
+    totalH += b.linesHuman ?? 0;
+    totalA += b.linesAi ?? 0;
+    const fr = all ? new Array(24).fill(1) : hourFractions(day, fromTs, toTs);
+    if (fr.every(f => f === 0)) continue;
+    let part: DailyBucket;
+    if (fr.every(f => f === 1)) {
+      part = JSON.parse(JSON.stringify(b));
+    } else {
+      part = sliceBucket(b, fr);
+      stats.estimated = true;
+    }
+    if (!bucketHasEffort(part)) continue;
+    daily[day] = part;
+    stats.days++;
+    for (const m of ACTIVE_MODES) movedMode[m] += part[m] ?? 0;
+    movedMode.idle += part.idle ?? 0;
+    movedActive += ACTIVE_MODES.reduce((s, m) => s + (part[m] ?? 0), 0);
+    movedH += part.linesHuman ?? 0;
+    movedA += part.linesAi ?? 0;
+  }
+  if (Object.keys(daily).length) delta.daily = daily;
+
+  const ratio = (moved: number, total: number) => all ? 1 : total > 0 ? Math.min(1, moved / total) : 0;
+  const fracT = ratio(movedActive, totalActive), fracH = ratio(movedH, totalH), fracA = ratio(movedA, totalA);
+  const scale = (v: number | undefined, f: number) => Math.round((Number(v) || 0) * f);
+
+  const time: Record<string, number> = {};
+  for (const m of [...ACTIVE_MODES, 'idle'] as TrackingMode[]) {
+    const v = all ? (src.time?.[m] ?? 0) : Math.min(src.time?.[m] ?? 0, movedMode[m]);
+    if (v > 0) time[m] = v;
+  }
+  if (Object.keys(time).length) delta.time = time;
+  stats.activeMs = ACTIVE_MODES.reduce((s, m) => s + (time[m] ?? 0), 0);
+  stats.idleMs = time.idle ?? 0;
+  stats.linesHuman = movedH;
+  stats.linesAi = movedA;
+
+  const lineChanges: Record<string, { human: LineStats; ai: LineStats }> = {};
+  for (const [ext, v] of Object.entries(src.lineChanges ?? {})) {
+    const human = { added: scale(v?.human?.added, fracH), deleted: scale(v?.human?.deleted, fracH) };
+    const ai = { added: scale(v?.ai?.added, fracA), deleted: scale(v?.ai?.deleted, fracA) };
+    if (human.added || human.deleted || ai.added || ai.deleted) lineChanges[ext] = { human, ai };
+  }
+  if (Object.keys(lineChanges).length) delta.lineChanges = lineChanges;
+
+  const effective: Record<string, { human: number; ai: number }> = {};
+  for (const [cat, v] of Object.entries(src.effectiveLines ?? {})) {
+    const e = { human: scale(v?.human, fracH), ai: scale(v?.ai, fracA) };
+    if (e.human || e.ai) effective[cat] = e;
+  }
+  if (Object.keys(effective).length) delta.effectiveLines = effective;
+
+  const candidates = Object.entries(src.files ?? {}).filter(([, f]) => f && (all || (f.lastTs ?? 0) >= fromTs));
+  const fileH = candidates.reduce((s, [, f]) => s + (f.humanAdded ?? 0), 0);
+  const fileA = candidates.reduce((s, [, f]) => s + (f.aiAdded ?? 0), 0);
+  const fh = all ? 1 : fileH > 0 ? Math.min(1, movedH / fileH) : 0;
+  const fa = all ? 1 : fileA > 0 ? Math.min(1, movedA / fileA) : 0;
+  const files: Record<string, FileStat> = {};
+  for (const [p, f] of candidates) {
+    const part: FileStat = {
+      humanAdded: scale(f.humanAdded, fh), humanDeleted: scale(f.humanDeleted, fh),
+      aiAdded: scale(f.aiAdded, fa), aiDeleted: scale(f.aiDeleted, fa),
+      edits: scale(f.edits, Math.max(fh, fa)), lastTs: f.lastTs ?? 0
+    };
+    if (f.effectiveHuman !== undefined) part.effectiveHuman = scale(f.effectiveHuman, fh);
+    if (f.effectiveAi !== undefined) part.effectiveAi = scale(f.effectiveAi, fa);
+    if (f.effectiveCategory) part.effectiveCategory = f.effectiveCategory;
+    if (part.humanAdded || part.humanDeleted || part.aiAdded || part.aiDeleted || part.edits || part.effectiveHuman || part.effectiveAi) files[p] = part;
+  }
+  if (Object.keys(files).length) delta.files = files;
+
+  const counters: [keyof BranchData, number][] = [
+    ['copilotAcceptances', fracA], ['aiCharsInserted', fracA], ['aiInserts', fracA], ['aiInlineLines', fracA],
+    ['aiChatLines', fracA], ['aiInlineChars', fracA], ['aiChatChars', fracA],
+    ['humanCharsInserted', fracH], ['humanKeystrokes', fracH],
+    ['chatCharsHuman', fracT], ['chatTurnsHuman', fracT], ['autoModelRequests', fracT]
+  ];
+  for (const [key, f] of counters) {
+    const v = scale(src[key] as number | undefined, f);
+    if (v > 0) delta[key] = v;
+  }
+
+  const sessions = (src.focusSessions ?? []).filter(s => s && s.ts >= fromTs && s.ts < toTs);
+  if (sessions.length) delta.focusSessions = JSON.parse(JSON.stringify(sessions));
+  stats.focusSessions = sessions.length;
+  return { delta, stats };
+}
+
+/**
+ * Remove `delta` from `dst` without going below zero and return what was
+ * actually removed (#156), so adding the result elsewhere conserves totals.
+ * Array items (focus sessions) are removed once each by value.
+ */
+export function subtractBranchDelta(dst: Record<string, unknown>, delta: Record<string, unknown>): Record<string, unknown> {
+  const removed: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(delta)) {
+    if (FOLD_META.has(k) || k === 'lastTs') continue;
+    const cur = dst[k];
+    if (typeof v === 'number') {
+      if (typeof cur !== 'number') continue;
+      const r = Math.max(0, Math.min(cur, v));
+      if (r) { dst[k] = cur - r; removed[k] = r; }
+    } else if (Array.isArray(v) && numericArray(v)) {
+      if (!numericArray(cur)) continue;
+      const r = v.map((x, i) => Math.max(0, Math.min(cur[i] ?? 0, x)));
+      if (r.some(x => x)) { dst[k] = cur.map((x, i) => x - (r[i] ?? 0)); removed[k] = r; }
+    } else if (Array.isArray(v)) {
+      if (!Array.isArray(cur)) continue;
+      const out: unknown[] = [];
+      for (const item of v) {
+        const i = cur.findIndex(c => isDeepStrictEqual(c, item));
+        if (i >= 0) out.push(cur.splice(i, 1)[0]);
+      }
+      if (out.length) removed[k] = out;
+    } else if (plainObject(v)) {
+      if (!plainObject(cur)) continue;
+      const r = subtractBranchDelta(cur, v);
+      if (Object.keys(r).length) removed[k] = r;
+    }
+  }
+  return removed;
+}
+
+/** Add a removed delta to a branch, creating day buckets and files with their full shape (#156). */
+function addBranchDelta(dst: BranchData, removed: Record<string, unknown>, original: Record<string, unknown>): void {
+  const days = plainObject(removed.daily) ? Object.keys(removed.daily) : [];
+  if (days.length) dst.daily ??= {};
+  for (const day of days) dst.daily![day] ??= emptyBucket();
+  const files = plainObject(removed.files) ? removed.files as Record<string, Record<string, unknown>> : {};
+  const sourceFiles = plainObject(original.files) ? original.files as Record<string, Partial<FileStat>> : {};
+  if (Object.keys(files).length) dst.files ??= {};
+  for (const [p, f] of Object.entries(files)) {
+    dst.files![p] ??= { humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: 0 };
+    const src = sourceFiles[p];
+    if (src?.lastTs) f.lastTs = src.lastTs;
+    if (src?.effectiveCategory && !dst.files![p].effectiveCategory) dst.files![p].effectiveCategory = src.effectiveCategory;
+  }
+  const lines = plainObject(removed.lineChanges) ? Object.keys(removed.lineChanges) : [];
+  if (lines.length) dst.lineChanges ??= {};
+  for (const ext of lines) dst.lineChanges[ext] ??= { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+  foldValue(dst, removed, '');
+}
+
+/**
+ * Move `delta` from `src` to `dst` (#156): subtract (clamped), then add what
+ * was actually removed. Returns the removed amount (the undo payload).
+ */
+export function transferBranchDelta(src: BranchData, dst: BranchData, delta: Record<string, unknown>): Record<string, unknown> {
+  const removed = subtractBranchDelta(src as unknown as Record<string, unknown>, delta);
+  addBranchDelta(dst, removed, delta);
+  return removed;
 }
 
 /** Keys of real (non-tombstone) branches. */
@@ -1640,7 +1912,22 @@ export function sanitizeReassignments(input: unknown): ReassignmentRecord[] {
     };
     if (typeof r.note === 'string') rec.note = r.note;
     if (typeof r.batchId === 'string') rec.batchId = r.batchId;
-    out.push(rec);
+    if (r.kind === 'move' || r.kind === 'move-undo') rec.kind = r.kind;
+    if (typeof r.toBranch === 'string' && r.toBranch) rec.toBranch = r.toBranch;
+    if (r.range && typeof r.range === 'object' && typeof r.range.fromTs === 'number') {
+      rec.range = { fromTs: r.range.fromTs };
+      if (typeof r.range.toTs === 'number') rec.range.toTs = r.range.toTs;
+    }
+    if (typeof r.undoOf === 'string' && r.undoOf) rec.undoOf = r.undoOf;
+    if (r.move && typeof r.move === 'object' && plainObject(r.move.delta)) {
+      rec.move = {
+        delta: r.move.delta,
+        ledger: Array.isArray(r.move.ledger) ? r.move.ledger.filter(x => x && typeof x.id === 'string') : [],
+        timeEntries: Array.isArray(r.move.timeEntries) ? r.move.timeEntries.filter(x => x && typeof x.id === 'string') : [],
+        stats: plainObject(r.move.stats) ? r.move.stats : { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false }
+              };
+            }
+            out.push(rec);
   }
   return out;
 }
@@ -3444,8 +3731,142 @@ export class Database {
    */
   getReassignments(branch?: string): ReassignmentRecord[] {
     return this.reassignments
-      .filter(r => branch === undefined || r.branch === branch)
-      .sort((a, b) => b.ts - a.ts);
+      .filter(r => branch === undefined || r.branch === branch || r.toBranch === branch)
+      .sort((a, b) => b.ts - a.ts)
+      // The undo payload stays in the store; callers only need the summary.
+      .map(r => r.move ? { ...r, move: { ...r.move, delta: {} } } : r);
+  }
+
+  private liveKey(key: string): string {
+    return this.store[key]?.movedTo ? resolveMovedBranch(this.store, key) ?? key : key;
+  }
+
+  private planEntryMove(from: string, to: string, opts: EntryMoveOptions) {
+    const f = this.liveKey(from), t = this.liveKey(to);
+    const src = this.store[f];
+    if (!src || src.movedTo || !t || f === t || this.store[t]?.movedTo) return undefined;
+    const fromTs = typeof opts.fromTs === 'number' && Number.isFinite(opts.fromTs) ? Math.max(0, opts.fromTs) : undefined;
+    const toTs = typeof opts.toTs === 'number' && Number.isFinite(opts.toTs) ? opts.toTs : Infinity;
+    const empty: EntryMoveStats = { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false };
+    const { delta, stats } = fromTs !== undefined ? sliceBranchRange(src, fromTs, toTs) : { delta: {}, stats: empty };
+    const inRange = (ts: number) => fromTs !== undefined && ts >= fromTs && ts < toTs;
+    const ids = new Set(opts.ledgerIds ?? []);
+    const ledger = this.creditLedger.filter(e => e.branch === f && (ids.has(e.id) || inRange(e.ts)));
+    const timeEntries = fromTs !== undefined ? this.timeEntries.filter(e => e.branch === f && inRange(timeEntryTs(e))) : [];
+    stats.credits = Math.round(ledger.reduce((s, e) => s + (Number(e.credits) || 0), 0) * 1000) / 1000;
+    stats.ledgerRows = ledger.length;
+    stats.timeEntries = timeEntries.length;
+    return { from: f, to: t, src, fromTs, toTs, delta, stats, ledger, timeEntries };
+  }
+
+  /**
+   * What {@link moveEntries} would move from branch `from` to `to` (#156), or
+   * undefined when the move is not possible (same/unknown branch).
+   */
+  previewEntryMove(from: string, to: string, opts: EntryMoveOptions): EntryMoveStats | undefined {
+    return this.planEntryMove(from, to, opts)?.stats;
+  }
+
+  /**
+   * Move tracked entries of branch `from` to branch `to` (#156): time, lines,
+   * files and focus sessions inside the range, credit ledger rows (by range or
+   * id) and time-log rows. The rows take over the work item of `to`. Writes one
+   * audit row that {@link undoEntryMove} reverses exactly. Returns undefined when
+   * nothing was moved.
+   */
+  moveEntries(from: string, to: string, opts: EntryMoveOptions, note?: string): ReassignmentRecord | undefined {
+    const plan = this.planEntryMove(from, to, opts);
+    if (!plan) return undefined;
+    if (!Object.keys(plan.delta).length && !plan.ledger.length && !plan.timeEntries.length) return undefined;
+    const target = this.ensureBranch(plan.to);
+    const srcWi = plan.src.workItemId ?? null;
+    const dstWi = target.workItemId ?? null;
+    const dstProject = dstWi ? this.workItems[dstWi]?.projectId ?? null : null;
+    const removed = transferBranchDelta(plan.src, target, plan.delta);
+    const ledger = plan.ledger.map(e => {
+      const prev = { id: e.id, workItemId: e.workItemId ?? null, projectId: e.projectId ?? null };
+      e.branch = plan.to;
+      e.workItemId = dstWi;
+      e.projectId = dstProject;
+      return prev;
+    });
+    const timeEntries = plan.timeEntries.map(e => {
+      const prev = { id: e.id, workItemId: e.workItemId ?? null };
+      e.branch = plan.to;
+      if (e.workItemId && e.workItemId === srcWi) {
+        if (dstWi) e.workItemId = dstWi;
+        else delete e.workItemId;
+      }
+      return prev;
+    });
+    const rec: ReassignmentRecord = {
+      id: newLedgerId(),
+      ts: Date.now(),
+      branch: plan.from,
+      fromWorkItemId: srcWi,
+      toWorkItemId: dstWi ?? UNASSIGNED_WORK_ITEM_ID,
+      kind: 'move',
+      toBranch: plan.to,
+      move: { delta: removed, ledger, timeEntries, stats: plan.stats }
+    };
+    if (plan.fromTs !== undefined) rec.range = plan.toTs === Infinity ? { fromTs: plan.fromTs } : { fromTs: plan.fromTs, toTs: plan.toTs };
+    if (note && note.trim()) rec.note = note.trim();
+    this.reassignments.push(rec);
+    autoTitleWorkItems(this.store, this.workItems);
+    this.save();
+    return rec;
+  }
+
+  /**
+   * Revert a {@link moveEntries} (#156): the moved counters go back (clamped
+   * to what the target still has) and moved rows that are still on the target
+   * get their branch and work item back. Returns the `move-undo` audit row.
+   */
+  undoEntryMove(id: string): ReassignmentRecord | undefined {
+    const rec = this.reassignments.find(r => r.id === id && r.kind === 'move');
+    if (!rec?.move || !rec.toBranch) return undefined;
+    if (this.reassignments.some(r => r.kind === 'move-undo' && r.undoOf === id)) return undefined;
+    const from = this.liveKey(rec.branch), to = this.liveKey(rec.toBranch);
+    const target = this.store[to];
+    if (!target || from === to) return undefined;
+    const source = this.ensureBranch(from);
+    transferBranchDelta(target, source, rec.move.delta);
+    for (const prev of rec.move.ledger) {
+      const e = this.creditLedger.find(x => x.id === prev.id);
+      if (!e || e.branch !== to) continue;
+      e.branch = from;
+      e.workItemId = prev.workItemId;
+      e.projectId = prev.projectId;
+    }
+    for (const prev of rec.move.timeEntries) {
+      const e = this.timeEntries.find(x => x.id === prev.id);
+      if (!e || e.branch !== to) continue;
+      e.branch = from;
+      if (prev.workItemId) e.workItemId = prev.workItemId;
+      else delete e.workItemId;
+    }
+    const undo: ReassignmentRecord = {
+      id: newLedgerId(),
+      ts: Date.now(),
+      branch: to,
+      fromWorkItemId: target.workItemId ?? null,
+      toWorkItemId: source.workItemId ?? UNASSIGNED_WORK_ITEM_ID,
+      kind: 'move-undo',
+      toBranch: from,
+      undoOf: id
+    };
+    this.reassignments.push(undo);
+    autoTitleWorkItems(this.store, this.workItems);
+    this.save();
+    return undo;
+  }
+
+  /** Entry moves (#156), newest first, with whether each was undone. */
+  getEntryMoves(): (ReassignmentRecord & { undone: boolean })[] {
+    const undone = new Set(this.reassignments.filter(r => r.kind === 'move-undo' && r.undoOf).map(r => r.undoOf));
+    return this.getReassignments()
+      .filter(r => r.kind === 'move')
+      .map(r => ({ ...r, undone: undone.has(r.id) }));
   }
 
   /** The work item id currently mapped to a branch (or null). */

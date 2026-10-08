@@ -25,7 +25,7 @@ import {
   restoreSideStore, SECRET_SETTINGS, serializeBundle, writeSafetyCopy, type BackupBundle, type DataSetId
 } from './store/backup';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
-import type { BranchSummary, EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
+import type { BranchSummary, EntryMoveStats, EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
 import type { TimeEntry, TimeEntryInput, TimeEntryPatch } from './store/database';
 import { TIME_ENTRY_CATEGORIES } from './store/database';
@@ -176,6 +176,7 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar = new StatusBarManager();
   timeTracker = new TimeTracker(db, statusBar);
   gitTracker = new GitTracker(db, timeTracker);
+  gitTracker.onBranchSwitch((prev, next, nextIsNew) => void offerMoveToNewBranch(prev, next, nextIsNew));
   copilotTracker = new CopilotTracker(db, timeTracker);
   chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
   chatSessionUsageTracker = new ChatSessionUsageTracker(db, timeTracker, context.storageUri);
@@ -367,6 +368,13 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand('aiEffortTracker.assignLegacyBranches', () =>
       assignLegacyBranches()
+    ),
+    // #156: move entries tracked on one branch (e.g. main) to another branch.
+    vscode.commands.registerCommand('aiEffortTracker.moveEntries', (arg?: string | { branch?: string; ledgerIds?: string[] }) =>
+      moveEntriesCmd(arg)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.undoEntryMove', (id?: string) =>
+      undoEntryMoveCmd(typeof id === 'string' ? id : undefined)
     ),
     // Reassignment is the same manual-override flow, framed as moving an
     // already-mapped branch to a different work item (issue #10).
@@ -656,6 +664,192 @@ async function assignLegacyBranches(): Promise<void> {
   const moved = db.assignBranchesToRepo(branches.map(b => b.key), repoId);
   vscode.window.showInformationMessage(`AI Effort Tracker: ${moved} branch(es) assigned to ${repoLabel(repoId)}.`);
   refreshDashboard();
+}
+
+function moveSummary(s: EntryMoveStats): string {
+  const parts: string[] = [];
+  if (s.activeMs) parts.push(`${fmtDuration(s.activeMs)} active`);
+  if (s.linesHuman || s.linesAi) parts.push(`${s.linesHuman + s.linesAi} lines`);
+  if (s.ledgerRows) parts.push(`${s.credits} credits (${s.ledgerRows} row${s.ledgerRows === 1 ? '' : 's'})`);
+  if (s.timeEntries) parts.push(`${s.timeEntries} time-log row${s.timeEntries === 1 ? '' : 's'}`);
+  if (s.focusSessions) parts.push(`${s.focusSessions} focus session${s.focusSessions === 1 ? '' : 's'}`);
+  return parts.length ? parts.join(' · ') : 'nothing';
+}
+
+const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+
+/** Parse `HH:MM` (today) or `YYYY-MM-DD[ HH:MM]` as local time. */
+function parseMoveStart(text: string): number | undefined {
+  const t = text.trim();
+  let m = /^(\d{1,2}):(\d{2})$/.exec(t);
+  if (m) {
+    const d = new Date(); d.setHours(Number(m[1]), Number(m[2]), 0, 0);
+    return Number(m[1]) < 24 && Number(m[2]) < 60 ? d.getTime() : undefined;
+  }
+  m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?$/.exec(t);
+  if (!m) return undefined;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4] ?? 0), Number(m[5] ?? 0));
+  return Number.isNaN(d.getTime()) ? undefined : d.getTime();
+}
+
+async function pickMoveTarget(source: string, placeHolder: string): Promise<string | undefined> {
+  const repo = repoOfKey(source);
+  const current = timeTracker?.getBranch();
+  const summaries = db.getAllBranchesSummaries().filter(s => s.branch !== source);
+  summaries.sort((a, b) => Number(repoOfKey(b.branch) === repo) - Number(repoOfKey(a.branch) === repo)
+    || Number(b.branch === current) - Number(a.branch === current) || a.branch.localeCompare(b.branch));
+  const picked = await vscode.window.showQuickPick(summaries.map(s => ({
+    label: (s.branch === current ? '\u25b6 ' : '') + branchLabel(s.branch),
+    description: s.workItemId ? '#' + s.workItemId : 'no work item',
+    key: s.branch
+  })), { placeHolder, matchOnDescription: true });
+  return picked?.key;
+}
+
+/**
+ * #156: move entries recorded on one branch to another — typically work done
+ * on `main` before the feature branch existed. `arg` is a branch key, or
+ * `{ ledgerIds }` from the credit ledger.
+ */
+async function moveEntriesCmd(arg?: string | { branch?: string; ledgerIds?: string[] }): Promise<void> {
+  const payload = typeof arg === 'object' && arg ? arg : typeof arg === 'string' && arg ? { branch: arg } : {};
+  const ledgerIds = Array.isArray(payload.ledgerIds) ? payload.ledgerIds.filter((x): x is string => typeof x === 'string') : [];
+  if (ledgerIds.length) return moveLedgerRows(ledgerIds);
+
+  const current = await GitTracker.getCurrentBranch() ?? timeTracker?.getBranch();
+  let source = payload.branch && db.getAllBranches().includes(payload.branch) ? payload.branch : undefined;
+  if (!source) {
+    const all = db.getAllBranches();
+    const picked = await vscode.window.showQuickPick(
+      all.sort((a, b) => Number(b === current) - Number(a === current) || a.localeCompare(b))
+        .map(key => ({ label: (key === current ? '\u25b6 ' : '') + branchLabel(key), key })),
+      { placeHolder: 'Move entries FROM which branch?' });
+    if (!picked) return;
+    source = picked.key;
+  }
+  const target = await pickMoveTarget(source, `Move entries from "${branchLabel(source)}" TO which branch?`);
+  if (!target) return;
+
+  type RangePick = vscode.QuickPickItem & { fromTs?: number; ask?: 'time' | 'date' };
+  const preview = (fromTs: number) => db.previewEntryMove(source!, target, { fromTs });
+  const today = startOfToday();
+  const picks: RangePick[] = [
+    { label: 'Today', description: moveSummary(preview(today)!), fromTs: today },
+    { label: 'Today since…', description: 'enter a time like 09:30', ask: 'time' },
+    { label: 'Since a date…', description: 'enter YYYY-MM-DD or YYYY-MM-DD HH:MM', ask: 'date' },
+    { label: 'Everything', description: moveSummary(preview(0)!), fromTs: 0 }
+  ];
+  const range = await vscode.window.showQuickPick(picks, { placeHolder: `Which entries of "${branchLabel(source)}" belong to "${branchLabel(target)}"?` });
+  if (!range) return;
+  let fromTs = range.fromTs;
+  if (range.ask) {
+    const text = await vscode.window.showInputBox({
+      prompt: range.ask === 'time' ? 'Start time today (HH:MM)' : 'Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)',
+      validateInput: v => parseMoveStart(v) === undefined ? 'Use HH:MM or YYYY-MM-DD [HH:MM]' : undefined
+    });
+    if (text === undefined) return;
+    fromTs = parseMoveStart(text);
+  }
+  if (fromTs === undefined) return;
+  const stats = preview(fromTs);
+  if (!stats || stats.activeMs + stats.idleMs + stats.linesHuman + stats.linesAi + stats.ledgerRows + stats.timeEntries + stats.focusSessions === 0) {
+    vscode.window.showInformationMessage(`AI Effort Tracker: nothing tracked on "${branchLabel(source)}" in that range.`);
+    return;
+  }
+  const since = fromTs > 0 ? ` since ${new Date(fromTs).toLocaleString()}` : '';
+  const ok = await vscode.window.showWarningMessage(
+    `Move entries from "${branchLabel(source)}" to "${branchLabel(target)}"${since}?`,
+    {
+      modal: true,
+      detail: moveSummary(stats) + (stats.estimated
+        ? '\n\nPart of a day is split by hour, so lines and counters of that day move proportionally.'
+        : '') + '\n\nYou can undo this move.'
+    },
+    'Move'
+  );
+  if (ok !== 'Move') return;
+  const rec = db.moveEntries(source, target, { fromTs });
+  refreshDashboard();
+  if (rec) await offerMoveUndo(rec.id, `Moved ${moveSummary(stats)} to "${branchLabel(target)}".`);
+}
+
+async function moveLedgerRows(ids: string[]): Promise<void> {
+  const rows = db.getCreditEntries().filter(e => ids.includes(e.id));
+  const sources = [...new Set(rows.map(e => e.branch).filter((b): b is string => !!b))];
+  if (!sources.length) {
+    vscode.window.showWarningMessage('AI Effort Tracker: the selected credit rows are not on a branch.');
+    return;
+  }
+  const target = await pickMoveTarget(sources.length === 1 ? sources[0] : '', `Move ${rows.length} credit row(s) to which branch?`);
+  if (!target) return;
+  const moves = sources.filter(s => s !== target).map(s => db.moveEntries(s, target, { ledgerIds: ids })).filter(r => !!r);
+  refreshDashboard();
+  const n = moves.reduce((s, r) => s + (r!.move?.stats.ledgerRows ?? 0), 0);
+  if (moves.length === 1) await offerMoveUndo(moves[0]!.id, `Moved ${n} credit row(s) to "${branchLabel(target)}".`);
+  else vscode.window.showInformationMessage(`AI Effort Tracker: moved ${n} credit row(s) to "${branchLabel(target)}".`);
+}
+
+/**
+ * #156: work often starts on main (a call, the user story, the spec) before the
+ * feature branch exists. On switching to a branch with nothing tracked, offer to
+ * move today's entries of the previous branch of the same repository.
+ */
+async function offerMoveToNewBranch(prev: string | undefined, next: string, nextIsNew: boolean): Promise<void> {
+  if (!nextIsNew || !prev || prev === 'unknown' || repoOfKey(prev) !== repoOfKey(next)) return;
+  if (vscode.workspace.getConfiguration('aiEffortTracker').get<boolean>('branches.offerMoveOnNewBranch', true) === false) return;
+  const stats = db.previewEntryMove(prev, next, { fromTs: startOfToday() });
+  if (!stats || (stats.activeMs < 60_000 && !stats.ledgerRows && !stats.timeEntries)) return;
+  const all = 'Move all of today';
+  const since = 'Choose start time\u2026';
+  const picked = await vscode.window.showInformationMessage(
+    `AI Effort Tracker: "${branchLabel(prev)}" has ${moveSummary(stats)} from today. Move it to the new branch "${branchLabel(next)}"?`,
+    all, since, 'No'
+  );
+  if (picked === all) {
+    const rec = db.moveEntries(prev, next, { fromTs: startOfToday() });
+    refreshDashboard();
+    if (rec) await offerMoveUndo(rec.id, `Moved ${moveSummary(stats)} to "${branchLabel(next)}".`);
+  } else if (picked === since) {
+    const text = await vscode.window.showInputBox({
+      prompt: `Move entries of "${branchLabel(prev)}" since (HH:MM today, or YYYY-MM-DD HH:MM)`,
+      validateInput: v => parseMoveStart(v) === undefined ? 'Use HH:MM or YYYY-MM-DD [HH:MM]' : undefined
+    });
+    const fromTs = text === undefined ? undefined : parseMoveStart(text);
+    if (fromTs === undefined) return;
+    const s = db.previewEntryMove(prev, next, { fromTs });
+    const rec = db.moveEntries(prev, next, { fromTs });
+    refreshDashboard();
+    if (rec && s) await offerMoveUndo(rec.id, `Moved ${moveSummary(s)} to "${branchLabel(next)}".`);
+    else vscode.window.showInformationMessage(`AI Effort Tracker: nothing tracked on "${branchLabel(prev)}" since then.`);
+  }
+}
+
+async function offerMoveUndo(id: string, message: string): Promise<void> {
+  const choice = await vscode.window.showInformationMessage(`AI Effort Tracker: ${message}`, 'Undo');
+  if (choice === 'Undo') await undoEntryMoveCmd(id);
+}
+
+/** #156: revert an entry move (QuickPick when no id is given). */
+async function undoEntryMoveCmd(id?: string): Promise<void> {
+  if (!id) {
+    const moves = db.getEntryMoves().filter(m => !m.undone);
+    if (!moves.length) {
+      vscode.window.showInformationMessage('AI Effort Tracker: there is no entry move to undo.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(moves.map(m => ({
+      label: `${branchLabel(m.branch)} \u2192 ${branchLabel(m.toBranch ?? '')}`,
+      description: new Date(m.ts).toLocaleString(),
+      detail: m.move ? moveSummary(m.move.stats) : undefined,
+      id: m.id
+    })), { placeHolder: 'Undo which entry move?' });
+    if (!picked) return;
+    id = picked.id;
+  }
+  const undo = db.undoEntryMove(id);
+  refreshDashboard();
+  if (undo) vscode.window.showInformationMessage(`AI Effort Tracker: entries moved back to "${branchLabel(undo.toBranch ?? '')}".`);
+  else vscode.window.showWarningMessage('AI Effort Tracker: this move was already undone.');
 }
 
 export function deactivate() {
