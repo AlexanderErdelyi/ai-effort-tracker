@@ -116,6 +116,10 @@
         "title": "AI Effort Tracker: Merge Branch Into Another…"
       },
       {
+        "command": "aiEffortTracker.undoLineCleanup",
+        "title": "AI Effort Tracker: Undo Line Recount"
+      },
+      {
         "command": "aiEffortTracker.reassignBranch",
         "title": "AI Effort Tracker: Reassign Branch to a Different Work Item"
       },
@@ -1049,6 +1053,24 @@
             "**/*.g.xlf"
           ],
           "description": "Glob patterns (relative to the repository root) of changed files that never need review, e.g. lock files and generated output."
+        },
+        "aiEffortTracker.lines.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/package-lock.json",
+            "**/yarn.lock",
+            "**/pnpm-lock.yaml",
+            "**/*.min.js",
+            "**/*.map",
+            "**/node_modules/**",
+            "**/out/**",
+            "**/dist/**",
+            "**/*.g.xlf"
+          ],
+          "description": "Glob patterns (relative to the workspace folder) of files whose changed lines are never counted, e.g. lock files and generated output. Edits there still count as activity time."
         },
         "aiEffortTracker.review.baseRef": {
           "type": "string",

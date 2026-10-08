@@ -2,6 +2,12 @@ import * as vscode from 'vscode';
 import { Database } from '../store/database';
 import { TimeTracker } from './timeTracker';
 import { getFileExt } from '../util/fileTypes';
+import { lineDiff, meaningfulLineVersions } from '../util/lineDiff';
+import { recentWorkingTreeOp } from '../util/gitOps';
+import { DEFAULT_REVIEW_EXCLUDE, excludeMatcher } from '../analysis/review';
+
+/** Edits touching this many raw lines are recounted from a real diff (#160). */
+export const BULK_EDIT_LINES = 200;
 
 export interface CodeEdit {
   event: vscode.TextDocumentChangeEvent;
@@ -15,8 +21,16 @@ export class CopilotTracker implements vscode.Disposable {
   private disposables: vscode.Disposable[] = [];
   private documentLines = new Map<string, string[]>();
   private editListener?: (edit: CodeEdit) => void;
+  private excluded: (relPath: string) => boolean = () => false;
 
-  constructor(private db: Database, private timeTracker: TimeTracker) {}
+  constructor(private db: Database, private timeTracker: TimeTracker) {
+    this.readExclude();
+  }
+
+  private readExclude() {
+    const patterns = vscode.workspace.getConfiguration('aiEffortTracker').get<string[]>('lines.exclude');
+    this.excluded = excludeMatcher(Array.isArray(patterns) ? patterns : DEFAULT_REVIEW_EXCLUDE);
+  }
 
   /** Observes classified file edits (correction capture, #131). */
   setEditListener(listener: ((edit: CodeEdit) => void) | undefined) {
@@ -36,7 +50,10 @@ export class CopilotTracker implements vscode.Disposable {
         }
       }),
       vscode.workspace.onDidCloseTextDocument(doc => this.documentLines.delete(doc.uri.toString())),
-      vscode.workspace.onDidChangeTextDocument(event => this.onDocChange(event))
+      vscode.workspace.onDidChangeTextDocument(event => this.onDocChange(event)),
+      vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('aiEffortTracker.lines.exclude')) this.readExclude();
+      })
     );
   }
 
@@ -90,18 +107,36 @@ export class CopilotTracker implements vscode.Disposable {
     const after = event.document.getText().split(/\r?\n/);
     this.documentLines.set(key, after);
 
+    // A clean (non-dirty) reload right after checkout / pull / merge / reset is
+    // git rewriting the file on disk, not anyone's work (#160).
+    if (scheme === 'file' && !event.document.isDirty && recentWorkingTreeOp(event.document.fileName)) return;
+
     const relPath = vscode.workspace.asRelativePath(event.document.uri, false);
-    if (insertedLines > 0 || deletedLines > 0) {
-      this.db.recordLineChange(branch, ext, source, insertedLines, deletedLines, relPath);
+    // Whole-file replaces (agent rewrites, regenerated files, disk reloads) report
+    // every line as deleted and inserted again: count what really changed (#160).
+    // Small edits keep raw counts so a typed Enter stays one added line.
+    let effective: number | undefined;
+    if (before && insertedLines + deletedLines >= BULK_EDIT_LINES) {
+      const d = lineDiff(before, after);
+      insertedChars = Math.round(insertedChars * d.added / Math.max(1, insertedLines));
+      insertedLines = d.added;
+      deletedLines = d.deleted;
+      effective = d.added + d.deleted;
     }
-    if (before) {
-      this.db.recordEffectiveLines(branch, relPath, source, meaningfulLineVersions(before, after));
+    const counted = !this.excluded(relPath.replace(/\\/g, '/'));
+    if (counted) {
+      if (insertedLines > 0 || deletedLines > 0) {
+        this.db.recordLineChange(branch, ext, source, insertedLines, deletedLines, relPath);
+      }
+      if (before) {
+        this.db.recordEffectiveLines(branch, relPath, source, effective ?? meaningfulLineVersions(before, after));
+      }
     }
 
-    if (insertedChars > 0) {
+    if (counted && insertedChars > 0) {
       this.db.recordChars(branch, source, insertedChars);
     }
-    if (source === 'ai' && insertedChars > 0) {
+    if (counted && source === 'ai' && insertedChars > 0) {
       // Inline completion = one contiguous insert, no deletion, into the editor
       // you're actively looking at, modest size. Everything else (multi-region,
       // replacements, background file writes) is a chat/agent apply.
@@ -146,42 +181,4 @@ export class CopilotTracker implements vscode.Disposable {
   }
 }
 
-/**
- * Count meaningful line versions between two document states. Common prefix and
- * suffix lines are ignored, so a whole-file rewrite that preserves 100 lines and
- * adds one counts as one. A later delete or replacement counts as another version.
- */
-export function meaningfulLineVersions(before: string[], after: string[]): number {
-  let start = 0;
-  while (start < before.length && start < after.length && before[start] === after[start]) start++;
-  let bi = before.length - 1, ai = after.length - 1;
-  while (bi >= start && ai >= start && before[bi] === after[ai]) { bi--; ai--; }
-  const a = before.slice(start, bi + 1);
-  const b = after.slice(start, ai + 1);
-  if (a.length === 0 || b.length === 0) return a.length + b.length;
-
-  // LCS recognizes unchanged lines that merely shifted after an insertion/deletion.
-  // Cap quadratic work; large replacement blocks fall back to unique-line matching.
-  if (a.length * b.length <= 1_000_000) {
-    let prev = new Uint32Array(b.length + 1);
-    for (let i = 1; i <= a.length; i++) {
-      const cur = new Uint32Array(b.length + 1);
-      for (let j = 1; j <= b.length; j++) {
-        cur[j] = a[i - 1] === b[j - 1]
-          ? prev[j - 1] + 1
-          : Math.max(prev[j], cur[j - 1]);
-      }
-      prev = cur;
-    }
-    const retained = prev[b.length];
-    return (a.length - retained) + (b.length - retained);
-  }
-  const counts = new Map<string, number>();
-  for (const line of a) counts.set(line, (counts.get(line) ?? 0) + 1);
-  let retained = 0;
-  for (const line of b) {
-    const n = counts.get(line) ?? 0;
-    if (n > 0) { retained++; counts.set(line, n - 1); }
-  }
-  return (a.length - retained) + (b.length - retained);
-}
+export { meaningfulLineVersions, lineDiff } from '../util/lineDiff';

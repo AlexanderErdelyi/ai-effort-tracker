@@ -38,6 +38,7 @@
 | `AI Effort Tracker: Move Entries to Another Branch` | Moves time, lines and credits of a time range (or chosen ledger rows) from one branch to another, e.g. work done on `main` before the feature branch existed (see [Moving entries between branches](#moving-entries-between-branches)) |
 | `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back, or splits a merged branch out again |
 | `AI Effort Tracker: Merge Branch Into Another…` | Merges all data of a duplicate branch (e.g. same name, different case) into another branch (see [Merging duplicate branches](#merging-duplicate-branches)) |
+| `AI Effort Tracker: Undo Line Recount` | Restores the AI line counts a data-health **Recount lines** removed (see [Line-count guard rails](#line-count-guard-rails)) |
 | `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
 | `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
 | `AI Effort Tracker: Reveal Data Folder` | Open the folder where the data is stored |
@@ -52,6 +53,7 @@ Every setting can be changed in the dashboard's **⚙ Settings** tab (see [Setti
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `aiEffortTracker.idleThresholdSeconds` | `120` | Seconds before switching to idle |
+| `aiEffortTracker.lines.exclude` | lock files, generated output | Globs of files whose changed lines are never counted (see [Line-count guard rails](#line-count-guard-rails)) |
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | Legacy plain-text GitHub PAT. Prefer **⚙ Settings → Integrations → Set token**, which keeps it in VS Code secure storage |
@@ -578,6 +580,27 @@ estimate, projects without rates, unpriced requests and models without prices,
 future timestamps and implausible days. Most findings have a one-click fix or a
 button that opens the right command. Copilot can read the report through the MCP
 tool `data_health`.
+
+### Line-count guard rails
+
+Some edits replace a whole document: git checkout, pull, merge or reset reloads
+open files, translation files (`.xlf`) are regenerated, and agents sometimes
+rewrite a whole file. Counted line by line, each looked like thousands of AI lines.
+
+- Edits that touch 200 or more lines are recounted with a real diff, so only
+  lines that really changed count (an unchanged rewrite counts nothing).
+- A clean (not dirty) reload while git rewrites the working tree (within 30 s of a
+  checkout, pull, merge, reset or rebase, or while `index.lock` exists) is not
+  counted at all. Commits don't count as such an operation.
+- Files matching `aiEffortTracker.lines.exclude` (default: lock files, `*.min.js`,
+  `*.map`, `node_modules`, `out`, `dist`, `*.g.xlf`) never count lines; editing
+  them still counts as activity time.
+- Data health flags files whose stored AI lines are implausible: at least 2,000
+  AI lines added + deleted and 200 or more per edit. **Recount lines** replaces the
+  raw count with the diff-based effective count (or drops it when that is also
+  implausible, more than 1,000 per edit), on the file, branch and daily totals.
+  **Undo** in the message, or **AI Effort Tracker: Undo Line Recount**, puts the
+  exact numbers back.
 
 ## Code review tracking
 

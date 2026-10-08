@@ -4,7 +4,8 @@ import * as crypto from 'crypto';
 import { isDeepStrictEqual } from 'util';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
-import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
+import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity, getFileExt } from '../util/fileTypes';
+import { distribute, findChurnOutliers, type ChurnOutlier } from '../analysis/lineChurn';
 import type { FileCategory } from '../util/fileTypes';
 import { branchKey, branchNameOf, caseVariantBranchGroups, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
 import {
@@ -614,6 +615,31 @@ interface BranchData {
    * here and {@link migrateStore} folds them into `movedTo`.
    */
   movedTo?: string;
+  /** Implausible AI line churn removed by a recount (#160); each record undoes exactly. */
+  lineCleanups?: LineCleanup[];
+}
+
+/** AI lines one recount (#160) removed from a branch, kept so it can be undone. */
+export interface LineCleanup {
+  id: string;
+  ts: number;
+  /** Shared by all branches recounted in one run. */
+  batchId: string;
+  /** Per file: what was taken off the file stat, the ext counters and the effective counters. */
+  files: {
+    path: string;
+    ext: string;
+    category: string;
+    effCategory: string;
+    aiAdded: number;
+    aiDeleted: number;
+    effectiveAi: number;
+    lineAdded: number;
+    lineDeleted: number;
+    effective: number;
+  }[];
+  /** Per day and line category: what was taken off the daily counters. */
+  days: { day: string; category: string; linesAi: number; categoryAi: number; translation: number }[];
 }
 
 type Store = Record<string, BranchData>;
@@ -1426,6 +1452,8 @@ export interface BranchMergePayload {
   timeAdjustment?: Partial<Record<TrackingMode, number>>;
   effectiveLegacyBaseline?: Record<string, { human: number; ai: number }>;
   creditsLog?: CreditEntry[];
+  /** Ids of line recounts (#160) the target took over. */
+  lineCleanups?: string[];
   /** Work item of the source before the merge. */
   source: { workItemId: string | null; manual: boolean };
   /** Work item of the target before the merge (it may adopt the source's). */
@@ -3892,6 +3920,10 @@ export class Database {
       merge.creditsLog = JSON.parse(JSON.stringify(src.creditsLog));
       target.creditsLog = [...(target.creditsLog ?? []), ...JSON.parse(JSON.stringify(src.creditsLog))];
     }
+    if (src.lineCleanups?.length) {
+      merge.lineCleanups = src.lineCleanups.map(c => c.id);
+      target.lineCleanups = [...(target.lineCleanups ?? []), ...JSON.parse(JSON.stringify(src.lineCleanups))];
+    }
     rec.merge = merge;
     this.store[plan.from] = branchTombstone(src, plan.to);
     autoTitleWorkItems(this.store, this.workItems);
@@ -3944,6 +3976,13 @@ export class Database {
         if (log.length) target.creditsLog = log; else delete target.creditsLog;
         source.creditsLog = JSON.parse(JSON.stringify(m.creditsLog));
       }
+      if (m.lineCleanups?.length) {
+        const ids = new Set(m.lineCleanups);
+        const back = (target.lineCleanups ?? []).filter(c => ids.has(c.id));
+        const keep = (target.lineCleanups ?? []).filter(c => !ids.has(c.id));
+        if (keep.length) target.lineCleanups = keep; else delete target.lineCleanups;
+        if (back.length) source.lineCleanups = [...(source.lineCleanups ?? []), ...back];
+      }
       source.workItemId = m.source.workItemId;
       if (m.source.manual) source.workItemIdManual = true; else delete source.workItemIdManual;
       if (target.workItemId !== m.target.workItemId && target.workItemId === m.source.workItemId) {
@@ -3987,6 +4026,142 @@ export class Database {
     return this.getReassignments()
       .filter(r => r.kind === 'move' || r.kind === 'merge')
       .map(r => ({ ...r, undone: undone.has(r.id) }));
+  }
+
+  /** Files whose AI line churn is implausible (#160), biggest first. */
+  getLineChurnOutliers(): ChurnOutlier[] {
+    return findChurnOutliers(this.store);
+  }
+
+  /**
+   * Recount implausible AI line churn (#160) on every live branch: file stats,
+   * ext and effective counters and the daily AI lines drop to the diff-based
+   * count. Each branch keeps a {@link LineCleanup} record so
+   * {@link undoLineCleanup} restores the exact numbers. Returns the batch id
+   * and what was removed, or undefined when nothing needed fixing.
+   */
+  fixLineChurn(): { batchId: string; files: number; branches: number; lines: number } | undefined {
+    const outliers = findChurnOutliers(this.store);
+    if (!outliers.length) return undefined;
+    const batchId = newLedgerId();
+    const ts = Date.now();
+    const byBranch = new Map<string, ChurnOutlier[]>();
+    for (const o of outliers) byBranch.set(o.branch, [...(byBranch.get(o.branch) ?? []), o]);
+    let lines = 0;
+    for (const [branch, list] of byBranch) {
+      const data = this.store[branch];
+      const rec: LineCleanup = { id: newLedgerId(), ts, batchId, files: [], days: [] };
+      const addedByCat = new Map<string, number>();
+      for (const o of list) {
+        const f = data.files![o.path];
+        const ext = getFileExt(o.path);
+        const category = categorize(o.path);
+        const effCategory = f.effectiveCategory ?? category;
+        const aiAdded = Math.max(0, f.aiAdded - o.after.aiAdded);
+        const aiDeleted = Math.max(0, f.aiDeleted - o.after.aiDeleted);
+        const effectiveAi = Math.max(0, (f.effectiveAi ?? 0) - o.after.effectiveAi);
+        f.aiAdded -= aiAdded;
+        f.aiDeleted -= aiDeleted;
+        if (effectiveAi) f.effectiveAi = (f.effectiveAi ?? 0) - effectiveAi;
+        const lc = data.lineChanges[ext]?.ai;
+        const lineAdded = lc ? Math.min(Math.max(0, lc.added), aiAdded) : 0;
+        const lineDeleted = lc ? Math.min(Math.max(0, lc.deleted), aiDeleted) : 0;
+        if (lc) { lc.added -= lineAdded; lc.deleted -= lineDeleted; }
+        const eb = data.effectiveLines?.[effCategory];
+        const effective = eb ? Math.min(Math.max(0, eb.ai), effectiveAi) : 0;
+        if (eb) eb.ai -= effective;
+        rec.files.push({ path: o.path, ext, category, effCategory, aiAdded, aiDeleted, effectiveAi, lineAdded, lineDeleted, effective });
+        addedByCat.set(category, (addedByCat.get(category) ?? 0) + aiAdded);
+        lines += aiAdded + aiDeleted;
+      }
+      const daily = data.daily ?? {};
+      for (const [category, amount] of addedByCat) {
+        const take = (day: string, part: number) => {
+          const b = daily[day];
+          const linesAi = Math.min(Math.max(0, b.linesAi), part);
+          b.linesAi -= linesAi;
+          const c = b.linesByCategory?.[category];
+          const categoryAi = c ? Math.min(Math.max(0, c.ai), part) : 0;
+          if (c) c.ai -= categoryAi;
+          let translation = 0;
+          if (category === 'translation' && b.linesAiTranslation !== undefined) {
+            translation = Math.min(Math.max(0, b.linesAiTranslation), part);
+            b.linesAiTranslation -= translation;
+          }
+          if (linesAi || categoryAi || translation) rec.days.push({ day, category, linesAi, categoryAi, translation });
+          return linesAi;
+        };
+        const withCat: Record<string, number> = {};
+        for (const [day, b] of Object.entries(daily)) {
+          const c = b.linesByCategory?.[category]?.ai ?? 0;
+          if (c > 0 && b.linesAi > 0) withCat[day] = Math.min(c, b.linesAi);
+        }
+        let left = amount;
+        for (const [day, part] of Object.entries(distribute(left, withCat))) left -= take(day, part);
+        if (left > 0) {
+          const legacy: Record<string, number> = {};
+          for (const [day, b] of Object.entries(daily)) if (!b.linesByCategory && b.linesAi > 0) legacy[day] = b.linesAi;
+          for (const [day, part] of Object.entries(distribute(left, legacy))) left -= take(day, part);
+        }
+      }
+      (data.lineCleanups ??= []).push(rec);
+    }
+    this.save();
+    return { batchId, files: outliers.length, branches: byBranch.size, lines };
+  }
+
+  /** Line recounts (#160), newest first, one row per run. */
+  getLineCleanups(): { batchId: string; ts: number; files: number; branches: number; lines: number }[] {
+    const out = new Map<string, { batchId: string; ts: number; files: number; branches: number; lines: number }>();
+    for (const data of Object.values(this.store)) {
+      for (const c of data?.lineCleanups ?? []) {
+        const row = out.get(c.batchId) ?? { batchId: c.batchId, ts: c.ts, files: 0, branches: 0, lines: 0 };
+        row.branches++;
+        row.files += c.files.length;
+        row.lines += c.files.reduce((n, f) => n + f.aiAdded + f.aiDeleted, 0);
+        out.set(c.batchId, row);
+      }
+    }
+    return [...out.values()].sort((a, b) => b.ts - a.ts);
+  }
+
+  /** Put back what a line recount (#160) removed, by batch id or record id. Returns the records undone. */
+  undoLineCleanup(batchOrId: string): number {
+    let n = 0;
+    for (const [key, holder] of Object.entries(this.store)) {
+      const recs = (holder?.lineCleanups ?? []).filter(c => c.batchId === batchOrId || c.id === batchOrId);
+      if (!recs.length) continue;
+      const data = this.store[this.liveKey(key)] ?? holder;
+      for (const rec of recs) {
+        for (const f of rec.files) {
+          data.files ??= {};
+          const file = (data.files[f.path] ??= { humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: rec.ts });
+          file.aiAdded += f.aiAdded;
+          file.aiDeleted += f.aiDeleted;
+          if (f.effectiveAi) file.effectiveAi = (file.effectiveAi ?? 0) + f.effectiveAi;
+          if (f.lineAdded || f.lineDeleted) {
+            const lc = (data.lineChanges[f.ext] ??= { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } });
+            lc.ai.added += f.lineAdded;
+            lc.ai.deleted += f.lineDeleted;
+          }
+          if (f.effective) {
+            const eb = ((data.effectiveLines ??= {})[f.effCategory] ??= { human: 0, ai: 0 });
+            eb.ai += f.effective;
+          }
+        }
+        for (const d of rec.days) {
+          const b = data.daily?.[d.day] ?? this.ensureBucket(data, d.day);
+          b.linesAi += d.linesAi;
+          if (d.categoryAi) ((b.linesByCategory ??= {})[d.category] ??= { human: 0, ai: 0 }).ai += d.categoryAi;
+          if (d.translation) b.linesAiTranslation = (b.linesAiTranslation ?? 0) + d.translation;
+        }
+        n++;
+      }
+      const keep = (holder.lineCleanups ?? []).filter(c => !recs.includes(c));
+      if (keep.length) holder.lineCleanups = keep; else delete holder.lineCleanups;
+    }
+    if (n) this.save();
+    return n;
   }
 
   /** Live branches of the same repository whose names differ only by case (#159). */

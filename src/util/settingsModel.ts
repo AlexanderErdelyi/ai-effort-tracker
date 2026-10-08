@@ -57,6 +57,7 @@ const GROUP_RULES: [string, SettingGroup][] = [
   ['timesheet.', 'Tracking'],
   ['sessions.', 'Tracking'],
   ['handoff.', 'Tracking'],
+  ['lines.', 'Tracking'],
   ['nudges.', 'Nudges'],
   ['review.', 'Review'],
   ['corrections.', 'Corrections & rules'],

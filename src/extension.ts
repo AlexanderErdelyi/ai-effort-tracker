@@ -380,6 +380,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.mergeBranches', (arg?: string | { from?: string; to?: string }) =>
       mergeBranchesCmd(arg)
     ),
+    // #160: undo a recount of implausible AI line churn.
+    vscode.commands.registerCommand('aiEffortTracker.undoLineCleanup', (batchId?: string) =>
+      undoLineCleanupCmd(typeof batchId === 'string' ? batchId : undefined)
+    ),
     // Reassignment is the same manual-override flow, framed as moving an
     // already-mapped branch to a different work item (issue #10).
     vscode.commands.registerCommand('aiEffortTracker.reassignBranch', () =>
@@ -854,6 +858,29 @@ async function undoEntryMoveCmd(id?: string): Promise<void> {
   refreshDashboard();
   if (undo) vscode.window.showInformationMessage(`AI Effort Tracker: entries moved back to "${branchLabel(undo.toBranch ?? '')}".`);
   else vscode.window.showWarningMessage('AI Effort Tracker: this move was already undone.');
+}
+
+/** #160: put back what a line recount removed (QuickPick when no batch is given). */
+async function undoLineCleanupCmd(batchId?: string): Promise<void> {
+  if (!batchId) {
+    const runs = db.getLineCleanups();
+    if (!runs.length) {
+      vscode.window.showInformationMessage('AI Effort Tracker: there is no line recount to undo.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(runs.map(r => ({
+      label: new Date(r.ts).toLocaleString(),
+      description: `${r.files} file(s) on ${r.branches} branch(es)`,
+      detail: `${r.lines.toLocaleString()} AI lines removed`,
+      id: r.batchId
+    })), { placeHolder: 'Undo which line recount?' });
+    if (!picked) return;
+    batchId = picked.id;
+  }
+  const n = db.undoLineCleanup(batchId);
+  refreshDashboard();
+  if (n) vscode.window.showInformationMessage('AI Effort Tracker: line counts restored.');
+  else vscode.window.showWarningMessage('AI Effort Tracker: this recount was already undone.');
 }
 
 /**
@@ -3214,6 +3241,20 @@ async function fixDataHealth(checkId?: string) {
   } else if (checkId === 'stale-credit-attribution') {
     const n = db.reattributeUnassignedCredits();
     vscode.window.showInformationMessage(`AI Effort Tracker: ${n} credit row(s) now count for their branch's work item.`);
+  } else if (checkId === 'implausible-line-churn') {
+    const outliers = db.getLineChurnOutliers();
+    if (!outliers.length) return;
+    const excess = outliers.reduce((n, o) => n + o.excess, 0);
+    const ok = await vscode.window.showWarningMessage(
+      `Recount AI lines of ${outliers.length} file(s)? ${excess.toLocaleString()} AI lines came from whole-file reloads or rewrites and are removed from file, branch and daily totals. You can undo this.`,
+      { modal: true }, 'Recount lines');
+    if (ok !== 'Recount lines') return;
+    const r = db.fixLineChurn();
+    refreshDashboard();
+    if (!r) return;
+    void vscode.window.showInformationMessage(`AI Effort Tracker: recounted ${r.files} file(s) on ${r.branches} branch(es); ${r.lines.toLocaleString()} AI lines removed.`, 'Undo')
+      .then(pick => { if (pick === 'Undo') void undoLineCleanupCmd(r.batchId); });
+    return;
   } else {
     void vscode.commands.executeCommand('aiEffortTracker.checkDataHealth');
     return;
