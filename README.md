@@ -627,13 +627,27 @@ before/after code; filter **To label**, **Lessons** or **All**, and **Yours** or
 for AL objects, otherwise `**/*.<ext>`). Notes and labels show up in the
 **Show Captured Corrections** report too.
 
-The tracker suggests a label you can accept per line, per episode or all at once:
+The tracker suggests a label you can accept per line, per episode or all at once.
+In this order:
 
-- your changes: moved code is *ordering/structure*, whitespace-only edits are *style*,
-  changed numbers are *wrong fact*, added or changed comments are *documentation*;
-- AI rework: the first keyword rule matching the prompt (e.g. "wrong", "doesn't work"
-  → *logic bug*, "status" → *progress update*), else the same checks of the change,
-  otherwise *requirement change*.
+1. **Your earlier labels**: a correction like ones you (or Copilot) already labelled
+   gets the same category, scope and note ("Like 3 corrections labelled “progress
+   update” in `**/*.md`"). AI rework is compared by its prompt, your own changes by
+   the file and the words that changed. Labels from **Accept all** do not count.
+2. AI rework: the first keyword rule matching the prompt (e.g. "wrong", "doesn't work"
+   → *logic bug*, "status" → *progress update*).
+3. What changed: moved code (also cut and pasted within 30 minutes) is
+   *ordering/structure*, spacing, letter case, quotes or semicolons only is *style*,
+   changed numbers are *wrong fact*, comments only is *documentation*. For your own
+   changes also: the same lines in another order is *ordering/structure*, one
+   identifier renamed is *naming*, a test file is *tests*, an added error or guard is
+   *error handling* and an edit of a Markdown or text file is *documentation*.
+4. AI rework otherwise: *requirement change*.
+
+**Suggestion accuracy** under the category table shows how often the suggestion
+was the label you picked, per source, and the keyword rules you usually change
+(with the category you pick instead), so you know which rules to edit. Corrections
+labelled with **Accept all** and not reviewed since are not counted.
 
 Lesson categories are `aiEffortTracker.corrections.categories` (wrong fact, logic bug,
 style, naming, documentation, ordering/structure, error handling, tests and performance
@@ -641,7 +655,8 @@ by default). *requirement change*, *progress update* and *not a lesson* are alwa
 available for corrections that do not teach a rule; they are kept but do not count as lessons. The keyword rules are
 `aiEffortTracker.corrections.keywordRules` (`{ "pattern": regex, "category": name }`,
 case-insensitive, first match wins). Copilot can label too with the MCP tool
-`label_correction`, e.g. "label the corrections of the last episode as naming".
+`label_correction`, e.g. "label the corrections of the last episode as naming";
+`list_corrections` gives it the suggestion for each unlabelled correction.
 
 Add a **note** per line (or **Note for all** in an open episode) saying *why* the code
 was corrected, written as a rule: "Read field numbers from the table; never renumber a

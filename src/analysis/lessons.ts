@@ -1,8 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { groupEpisodes, type Correction } from './corrections';
-import { NON_LESSON_CATEGORIES, normalizeCategory, suggestScope } from './correctionLabels';
-import { globToRegExp } from './review';
+import { NON_LESSON_CATEGORIES, normalizeCategory, scopeMatches, suggestScope } from './correctionLabels';
 
 /**
  * Coding rules learned from labelled corrections (#133) and handed back to
@@ -200,14 +199,7 @@ export function lessonGroups(corrections: readonly Correction[], rules: readonly
     || b.episodes - a.episodes || b.count - a.count || a.key.localeCompare(b.key));
 }
 
-/** Does `scope` match this path? Also tries every sub-path, so absolute paths and paths from the repository's parent folder match too. */
-export function scopeMatches(scope: string, filePath: string): boolean {
-  const re = globToRegExp(scope || '**');
-  const p = filePath.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (re.test(p)) return true;
-  for (let i = p.indexOf('/'); i >= 0; i = p.indexOf('/', i + 1)) if (re.test(p.slice(i + 1))) return true;
-  return false;
-}
+export { scopeMatches };
 
 /** Rules for one repository: those without a repo plus those of this repo. */
 export const rulesForRepo = (rules: readonly LessonRule[], repo?: string) =>

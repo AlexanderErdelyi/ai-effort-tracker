@@ -15,7 +15,7 @@ import { decodeReviewStore, emptyReviewStore, REVIEW_FILE, reviewIssues, reviewS
 import { reviewMark, reviewResolveIssue, type ResolveAction, type ReviewMarkArgs, type ReviewMarkIo } from '../analysis/reviewMark';
 import { ReviewStore } from '../review/reviewStore';
 import { CORRECTIONS_FILE, decodeCorrectionStore, emptyCorrectionStore, groupEpisodes, listCorrections, type CorrectionKind } from '../analysis/corrections';
-import { DEFAULT_LESSON_CATEGORIES, labelDelta, NON_LESSON_CATEGORIES } from '../analysis/correctionLabels';
+import { CORRECTION_RULES_SNAPSHOT_FILE, createSuggester, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta, NON_LESSON_CATEGORIES } from '../analysis/correctionLabels';
 import { CorrectionStore } from '../store/correctionStore';
 import { decodeLessonStore, emptyLessonStore, findRules, lessonGroups, LESSONS_FILE, proposeRuleDelta } from '../analysis/lessons';
 import { LessonStore } from '../store/lessonStore';
@@ -225,7 +225,7 @@ export const TOOLS = [
   {
     name: 'list_corrections',
     title: 'Corrections of AI-written code',
-    description: 'Changes made later to code that an AI edit wrote, captured in VS Code: the developer\'s own edits (source "human") and Copilot rework requested with a new prompt (source "ai"). Each correction has its kind (modify, insert, delete, move), file and line, the enclosing declaration, a short before/after snippet and, when known, the prompt that asked for the change (trigger) and the prompt that produced the original code (origin). Newest first, with counts by source, kind and file type, plus "episodes": the returned corrections grouped by the prompt that caused them (AI rework) or by one sitting of the developer\'s edits (human). One prompt that changes a requirement can rework dozens of lines, so judge AI rework per episode; the developer\'s own (human) corrections are the strongest signal of real mistakes. Use it to learn what the developer usually changes after AI programming (ordering, documentation, naming, checks, wrong facts) and to suggest coding rules.',
+    description: 'Changes made later to code that an AI edit wrote, captured in VS Code: the developer\'s own edits (source "human") and Copilot rework requested with a new prompt (source "ai"). Each correction has its kind (modify, insert, delete, move), file and line, the enclosing declaration, a short before/after snippet and, when known, the prompt that asked for the change (trigger) and the prompt that produced the original code (origin). Newest first, with counts by source, kind and file type, plus "episodes": the returned corrections grouped by the prompt that caused them (AI rework) or by one sitting of the developer\'s edits (human). One prompt that changes a requirement can rework dozens of lines, so judge AI rework per episode; the developer\'s own (human) corrections are the strongest signal of real mistakes. Unlabelled corrections carry "suggestion": the tracker\'s guess at the label (category, reason, source history/keyword/heuristic/default, scope, note); a "history" suggestion copies labels of similar corrections the developer already labelled. Check a suggestion against the code before you use it with label_correction. Use it to learn what the developer usually changes after AI programming (ordering, documentation, naming, checks, wrong facts) and to suggest coding rules.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -428,6 +428,12 @@ export function loadBudgetSnapshot(file = process.env.AET_STORE_PATH ? path.join
   return value;
 }
 
+/** Keyword rules from the extension's settings snapshot, else the defaults. */
+function correctionRules(): unknown {
+  const rules = loadSnapshotFile(CORRECTION_RULES_SNAPSHOT_FILE)?.rules;
+  return Array.isArray(rules) ? rules : DEFAULT_KEYWORD_RULES;
+}
+
 const snapshotCache = new Map<string, { stamp: string; value: Json | null }>();
 
 /** A JSON snapshot the extension writes next to the store; null when absent or unreadable. */
@@ -538,10 +544,19 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
       const numArg = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
       const source = args.source === 'human' || args.source === 'ai' ? args.source : undefined;
       const kind = ['modify', 'insert', 'delete', 'move'].includes(args.kind as string) ? args.kind as CorrectionKind : undefined;
-      const result = listCorrections(loadCorrectionStore(), {
+      const data = loadCorrectionStore();
+      const listed = listCorrections(data, {
         workItemId: str(args.workItemId), branch: str(args.branch), path: str(args.path), repo: str(args.repo),
         source, kind, days: numArg(args.days), limit: numArg(args.limit), category: str(args.category)
       });
+      const suggest = createSuggester(data.corrections, correctionRules());
+      const result = {
+        ...listed,
+        corrections: listed.corrections.map(c => {
+          const s = c.category ? undefined : suggest(c);
+          return s ? { ...c, suggestion: { category: s.category, reason: s.reason, source: s.source, ...(s.scope ? { scope: s.scope } : {}), ...(s.note ? { note: s.note } : {}) } } : c;
+        })
+      };
       return result.total ? result : { ...result, note: 'No corrections captured yet. They are recorded in VS Code when code an AI edit wrote is changed later (setting aiEffortTracker.corrections.enabled).' };
     }
     case 'label_correction': {
@@ -560,7 +575,7 @@ export function callTool(name: string, args: Json, data = loadData()): unknown {
         category: args.category,
         ...(typeof args.scope === 'string' ? { scope: args.scope } : {}),
         ...(typeof args.note === 'string' ? { note: args.note } : {})
-      }, 'copilot');
+      }, 'copilot', Date.now(), correctionRules());
       const labeled = Object.keys(delta.patch);
       const unknown = [...new Set(ids)].filter(id => !delta.patch[id]);
       if (!labeled.length) throw new Error(`No corrections with these ids: ${unknown.join(', ')}.`);

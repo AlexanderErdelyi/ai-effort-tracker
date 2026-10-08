@@ -81,12 +81,17 @@ export interface Correction {
   note?: string;
   labeledBy?: LabelSource;
   labeledAt?: number;
+  /** What the tracker suggested when the correction was first labelled (#150). */
+  suggested?: SuggestedLabel;
 }
 
 export type LabelSource = 'user' | 'copilot' | 'rule';
+/** Where a label suggestion came from: your earlier labels, a prompt keyword rule, a check of the diff, or the AI fallback. */
+export type SuggestionSource = 'history' | 'keyword' | 'heuristic' | 'default';
+export interface SuggestedLabel { category: string; source: SuggestionSource; rule?: string }
 
 /** Label fields a patch can set; an empty string clears the field. */
-export interface CorrectionLabel { category?: string; scope?: string; note?: string; labeledBy?: LabelSource; labeledAt?: number }
+export interface CorrectionLabel { category?: string; scope?: string; note?: string; labeledBy?: LabelSource; labeledAt?: number; suggested?: SuggestedLabel }
 export type CorrectionPatch = { trigger?: PromptRef; origin?: PromptRef } & CorrectionLabel;
 
 export interface FileOwnership {
@@ -332,7 +337,7 @@ export function mergeCorrectionDelta(data: CorrectionStoreData, delta: Correctio
 function applyPatch(c: Correction, p: CorrectionPatch): Correction {
   const out: Correction = { ...c, ...p };
   for (const k of ['category', 'scope', 'note'] as const) if (out[k] === '') delete out[k];
-  if (!out.category) { delete out.labeledBy; delete out.labeledAt; }
+  if (!out.category) { delete out.labeledBy; delete out.labeledAt; delete out.suggested; }
   return out;
 }
 
@@ -373,6 +378,11 @@ function decodeCorrection(v: unknown): Correction | undefined {
   if (s(v.note)) c.note = s(v.note);
   if (c.category && (v.labeledBy === 'user' || v.labeledBy === 'copilot' || v.labeledBy === 'rule')) c.labeledBy = v.labeledBy;
   if (c.category && finite(v.labeledAt)) c.labeledAt = v.labeledAt;
+  const sg = isObj(v.suggested) ? v.suggested : undefined;
+  const sgSource = (['history', 'keyword', 'heuristic', 'default'] as const).find(k => k === sg?.source);
+  if (c.category && sg && s(sg.category) && sgSource) {
+    c.suggested = { category: sg.category as string, source: sgSource, ...(s(sg.rule) ? { rule: sg.rule as string } : {}) };
+  }
   const trigger = decodePrompt(v.trigger), origin = decodePrompt(v.origin);
   if (trigger) c.trigger = trigger;
   if (origin) c.origin = origin;
