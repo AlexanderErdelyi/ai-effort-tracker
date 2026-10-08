@@ -4,6 +4,8 @@
  * list of problems, each with a count, examples and a fix action.
  */
 import type { LedgerEntry, Project, TimeEntry, WorkItem, ManualEffortEntry } from '../store/database';
+import { caseVariantBranchGroups } from '../util/branchKey';
+import { findChurnOutliers, type ChurnFileStat } from './lineChurn';
 
 export const HEALTH_SNAPSHOT_FILE = 'health-snapshot.json';
 const UNASSIGNED = '__unassigned__';
@@ -65,6 +67,9 @@ interface HealthBranch {
   time?: Record<string, number>;
   timeAdjustment?: Record<string, number>;
   daily?: Record<string, { humanCoding?: number; aiGenerating?: number; reviewing?: number; idle?: number }>;
+  /** Set on a branch folded/merged into another key (#154/#159); not a real branch. */
+  movedTo?: string;
+  files?: Record<string, ChurnFileStat>;
 }
 
 export interface HealthData {
@@ -131,7 +136,7 @@ export function checkDataHealth(data: HealthData, env: HealthEnv, now = Date.now
   const projects = data.projects ?? {};
   const ledger = Array.isArray(data.creditLedger) ? data.creditLedger : [];
   const timeEntries = Array.isArray(data.timeEntries) ? data.timeEntries : [];
-  const branches = Object.entries(data.branches ?? {});
+  const branches = Object.entries(data.branches ?? {}).filter(([, b]) => !b?.movedTo);
 
   // --- Persistence -----------------------------------------------------------
   add({
@@ -264,6 +269,33 @@ export function checkDataHealth(data: HealthData, env: HealthEnv, now = Date.now
   });
 
   const branchWi = new Map(branches.map(([name, b]) => [name, b.workItemId]));
+
+  // Same branch tracked under two casings (git on Windows/macOS), #159.
+  const byName = new Map(branches);
+  const variants = caseVariantBranchGroups(byName.keys()).map(keys => {
+    const sized = keys.map(k => ({ key: k, ms: branchActiveMs(byName.get(k)!) })).sort((a, b) => b.ms - a.ms || a.key.localeCompare(b.key));
+    return { into: sized[0], others: sized.slice(1) };
+  });
+  add({
+    id: 'case-variant-branches', severity: 'warning', title: 'Each branch is tracked under one name',
+    count: variants.length,
+    detail: 'These branches of the same repository differ only by upper/lower case, so git reported one branch under two names and its effort is split. "Merge" moves everything of the smaller one into the larger one (undoable).',
+    examples: examples(variants, v => ({
+      label: `${v.others.map(o => `${o.key} (${hours(o.ms)} h)`).join(', ')} → ${v.into.key} (${hours(v.into.ms)} h)`,
+      action: { label: 'Merge', command: 'mergeBranches', arg: v.others[0].key }
+    }))
+  });
+
+  // Whole-file reloads/rewrites counted line for line as AI work (#160).
+  const churn = findChurnOutliers(Object.fromEntries(branches));
+  const churnExcess = churn.reduce((n, o) => n + o.excess, 0);
+  add({
+    id: 'implausible-line-churn', severity: 'warning', title: 'AI line counts are plausible',
+    count: churn.length,
+    detail: `${churn.length} file(s) count ${churnExcess.toLocaleString('en-US')} more AI lines than really changed: whole-file reloads (git checkout/pull), regenerated files or full-document rewrites were counted line for line. "Recount lines" uses the diff-based count instead (undoable).`,
+    examples: examples(churn, o => ({ label: `${o.branch} – ${o.path}: ${(o.before.aiAdded + o.before.aiDeleted).toLocaleString('en-US')} → ${(o.after.aiAdded + o.after.aiDeleted).toLocaleString('en-US')} AI lines` })),
+    fix: churn.length ? { label: 'Recount lines', command: 'fixDataHealth', arg: 'implausible-line-churn' } : undefined
+  });
   const noWi = ledger.filter(e => !realWorkItem(e.workItemId));
   const stale = noWi.filter(e => e.branch && realWorkItem(branchWi.get(e.branch)) && wis[branchWi.get(e.branch)!]);
   add({

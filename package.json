@@ -2,7 +2,7 @@
   "name": "ai-effort-tracker",
   "displayName": "AI Effort Tracker",
   "description": "Track human vs AI effort, time, and cost per work item / branch",
-  "version": "0.37.0",
+  "version": "0.38.0",
   "publisher": "AlexanderErdelyi",
   "repository": {
     "type": "git",
@@ -98,6 +98,26 @@
       {
         "command": "aiEffortTracker.assignBranchToWorkItem",
         "title": "AI Effort Tracker: Assign Branch to Work Item"
+      },
+      {
+        "command": "aiEffortTracker.assignLegacyBranches",
+        "title": "AI Effort Tracker: Assign Older Branches to a Repository"
+      },
+      {
+        "command": "aiEffortTracker.moveEntries",
+        "title": "AI Effort Tracker: Move Entries to Another Branch"
+      },
+      {
+        "command": "aiEffortTracker.undoEntryMove",
+        "title": "AI Effort Tracker: Undo Entry Move"
+      },
+      {
+        "command": "aiEffortTracker.mergeBranches",
+        "title": "AI Effort Tracker: Merge Branch Into Another…"
+      },
+      {
+        "command": "aiEffortTracker.undoLineCleanup",
+        "title": "AI Effort Tracker: Undo Line Recount"
       },
       {
         "command": "aiEffortTracker.reassignBranch",
@@ -208,6 +228,10 @@
         "title": "AI Effort Tracker: Link Current Repo to Project"
       },
       {
+        "command": "aiEffortTracker.unlinkRepoFromProject",
+        "title": "AI Effort Tracker: Unlink Repository from Project"
+      },
+      {
         "command": "aiEffortTracker.runSetup",
         "title": "AI Effort Tracker: Run Setup"
       },
@@ -238,6 +262,10 @@
       {
         "command": "aiEffortTracker.editWorkItem",
         "title": "AI Effort Tracker: Edit Work Item"
+      },
+      {
+        "command": "aiEffortTracker.renameWorkItem",
+        "title": "AI Effort Tracker: Rename Work Item"
       },
       {
         "command": "aiEffortTracker.assignWorkItemToProject",
@@ -530,6 +558,11 @@
           "type": "boolean",
           "default": true,
           "description": "When you come back after being away from VS Code (idle, other app, meeting, sleep), ask whether to count the time as meeting, review/thinking or other work, and log it as a time entry. Time another VS Code window was active is not asked about."
+        },
+        "aiEffortTracker.branches.offerMoveOnNewBranch": {
+          "type": "boolean",
+          "default": true,
+          "description": "When you switch to a branch that has nothing tracked yet and the previous branch of the same repository has work from today (e.g. a spec written on main), offer to move today's entries to the new branch."
         },
         "aiEffortTracker.away.minMinutes": {
           "type": "number",
@@ -1020,6 +1053,24 @@
             "**/*.g.xlf"
           ],
           "description": "Glob patterns (relative to the repository root) of changed files that never need review, e.g. lock files and generated output."
+        },
+        "aiEffortTracker.lines.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/package-lock.json",
+            "**/yarn.lock",
+            "**/pnpm-lock.yaml",
+            "**/*.min.js",
+            "**/*.map",
+            "**/node_modules/**",
+            "**/out/**",
+            "**/dist/**",
+            "**/*.g.xlf"
+          ],
+          "description": "Glob patterns (relative to the workspace folder) of files whose changed lines are never counted, e.g. lock files and generated output. Edits there still count as activity time."
         },
         "aiEffortTracker.review.baseRef": {
           "type": "string",

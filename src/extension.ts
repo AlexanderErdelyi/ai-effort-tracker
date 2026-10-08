@@ -5,6 +5,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
+import { branchLabel, branchNameOf, LEGACY_REPO, repoLabel, repoOfKey } from './util/branchKey';
+import { buildRepoOverview } from './analysis/repoOverview';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
@@ -23,7 +25,7 @@ import {
   restoreSideStore, SECRET_SETTINGS, serializeBundle, writeSafetyCopy, type BackupBundle, type DataSetId
 } from './store/backup';
 import { CURRENT_SCHEMA_VERSION, UNASSIGNED_WORK_ITEM_ID } from './store/database';
-import type { EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
+import type { BranchSummary, EntryMoveStats, EstimateBreakdown, EstimateUnit, LedgerEntry, LedgerEntryPatch } from './store/database';
 import type { ManualEffortEntry, ManualEffortInput, ManualEffortPatch } from './store/database';
 import type { TimeEntry, TimeEntryInput, TimeEntryPatch } from './store/database';
 import { TIME_ENTRY_CATEGORIES } from './store/database';
@@ -174,6 +176,7 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar = new StatusBarManager();
   timeTracker = new TimeTracker(db, statusBar);
   gitTracker = new GitTracker(db, timeTracker);
+  gitTracker.onBranchSwitch((prev, next, nextIsNew) => void offerMoveToNewBranch(prev, next, nextIsNew));
   copilotTracker = new CopilotTracker(db, timeTracker);
   chatUsageTracker = new ChatUsageTracker(db, timeTracker, context.logUri);
   chatSessionUsageTracker = new ChatSessionUsageTracker(db, timeTracker, context.storageUri);
@@ -218,7 +221,7 @@ export function activate(context: vscode.ExtensionContext) {
       });
       if (!model) return;
       const input = await vscode.window.showInputBox({
-        prompt: `Credits used on "${branch}" with ${model} (number shown in the chat response)`,
+        prompt: `Credits used on "${branchLabel(branch)}" with ${model} (number shown in the chat response)`,
         placeHolder: 'e.g. 272.3',
         value: lastCredits != null ? String(lastCredits) : undefined,
         validateInput: v => (v && !isNaN(parseFloat(v))) ? null : 'Enter a number'
@@ -258,7 +261,7 @@ export function activate(context: vscode.ExtensionContext) {
       void context.globalState.update('lastCreditModel', model);
       void context.globalState.update('lastCreditValue', credits);
       vscode.window.showInformationMessage(
-        `Logged ${credits} credits (${model}) on ${branch}.`
+        `Logged ${credits} credits (${model}) on ${branchLabel(branch)}.`
       );
       refreshDashboard();
     }),
@@ -276,11 +279,12 @@ export function activate(context: vscode.ExtensionContext) {
         })), { title: 'Import recorded credits and edit details', placeHolder: 'Choose a chat session in this workspace' });
         if (!picked) return;
         const current = await GitTracker.getCurrentBranch() ?? timeTracker.getBranch();
-        const branch = await vscode.window.showQuickPick([...new Set([current, ...db.getAllBranches()])], {
+        const pickedBranch = await vscode.window.showQuickPick([...new Set([current, ...db.getAllBranches()])].map(key => ({ label: branchLabel(key), key })), {
           title: 'Attribute this chat history to a branch',
           placeHolder: 'Historical logs do not identify the branch. Choose explicitly; existing attribution is preserved.'
         });
-        if (!branch) return;
+        if (!pickedBranch) return;
+        const branch = pickedBranch.key;
         const result = await debugLogUsageTracker.importSession(picked.session, branch);
         vscode.window.showInformationMessage(
           `Debug session: ${result.credits.toFixed(6)} recorded credits across ${result.turns} turn(s). ` +
@@ -321,7 +325,7 @@ export function activate(context: vscode.ExtensionContext) {
       const branch = (await GitTracker.getCurrentBranch()) ?? timeTracker.getBranch();
       const summary = creditImportTracker.importFiles(targets, branch);
       vscode.window.showInformationMessage(
-        `Imported ${summary.credits.toFixed(1)} exact credits to "${branch}" — ${summary.turns} turn(s), ` +
+        `Imported ${summary.credits.toFixed(1)} exact credits to "${branchLabel(branch)}" — ${summary.turns} turn(s), ` +
           `${summary.requests} request(s) from ${summary.files} file(s). ` +
           `${summary.inserted} new, ${summary.updated} updated` +
           (summary.purgedAuto > 0 ? `, ${summary.purgedAuto} estimate(s) replaced.` : '.')
@@ -361,6 +365,24 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand('aiEffortTracker.assignBranchToWorkItem', () =>
       assignBranchToWorkItem()
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.assignLegacyBranches', () =>
+      assignLegacyBranches()
+    ),
+    // #156: move entries tracked on one branch (e.g. main) to another branch.
+    vscode.commands.registerCommand('aiEffortTracker.moveEntries', (arg?: string | { branch?: string; ledgerIds?: string[] }) =>
+      moveEntriesCmd(arg)
+    ),
+    vscode.commands.registerCommand('aiEffortTracker.undoEntryMove', (id?: string) =>
+      undoEntryMoveCmd(typeof id === 'string' ? id : undefined)
+    ),
+    // #159: merge duplicate / case-variant branches.
+    vscode.commands.registerCommand('aiEffortTracker.mergeBranches', (arg?: string | { from?: string; to?: string }) =>
+      mergeBranchesCmd(arg)
+    ),
+    // #160: undo a recount of implausible AI line churn.
+    vscode.commands.registerCommand('aiEffortTracker.undoLineCleanup', (batchId?: string) =>
+      undoLineCleanupCmd(typeof batchId === 'string' ? batchId : undefined)
     ),
     // Reassignment is the same manual-override flow, framed as moving an
     // already-mapped branch to a different work item (issue #10).
@@ -467,7 +489,8 @@ export function activate(context: vscode.ExtensionContext) {
       setDeveloperProfile()
     ),
     vscode.commands.registerCommand('aiEffortTracker.createProject', () => createProject()),
-    vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', () => linkRepoToProject()),
+    vscode.commands.registerCommand('aiEffortTracker.linkRepoToProject', (arg?: unknown) => linkRepoToProject(typeof arg === 'string' ? arg : undefined)),
+    vscode.commands.registerCommand('aiEffortTracker.unlinkRepoFromProject', (arg?: unknown) => unlinkRepoFromProject(arg)),
     // #144: guided setup hub + the walkthrough's step commands.
     vscode.commands.registerCommand('aiEffortTracker.runSetup', () => runSetup(setup)),
     vscode.commands.registerCommand('aiEffortTracker.setup.rates', () => runStep(setup, 'rates')),
@@ -481,7 +504,8 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
     vscode.commands.registerCommand('aiEffortTracker.createWorkItem', () => createWorkItem()),
-    vscode.commands.registerCommand('aiEffortTracker.editWorkItem', () => editWorkItem()),
+    vscode.commands.registerCommand('aiEffortTracker.editWorkItem', (id?: unknown) => editWorkItem(typeof id === 'string' ? id : undefined)),
+    vscode.commands.registerCommand('aiEffortTracker.renameWorkItem', (id?: unknown) => renameWorkItem(typeof id === 'string' ? id : undefined)),
     vscode.commands.registerCommand('aiEffortTracker.assignWorkItemToProject', (workItemId?: string) => assignWorkItemToProject(workItemId)),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
@@ -583,6 +607,336 @@ export function activate(context: vscode.ExtensionContext) {
     if (e.affectsConfiguration('aiEffortTracker')) void updateSetupContext(setup);
   }));
   void updateSetupContext(setup).then(() => maybeShowWalkthrough(setup));
+  const legacyTimer = setTimeout(() => void promptLegacyBranches(context), 15_000);
+  context.subscriptions.push({ dispose: () => clearTimeout(legacyTimer) });
+}
+
+const LEGACY_PROMPT_KEY = 'legacyBranchesPrompted';
+
+/**
+ * #154: branches recorded before branch identity per repository have no
+ * repository. Ask once whether to file them under the current repository;
+ * never merge automatically.
+ */
+async function promptLegacyBranches(context: vscode.ExtensionContext): Promise<void> {
+  if (context.globalState.get<boolean>(LEGACY_PROMPT_KEY)) return;
+  const legacy = db.getLegacyBranches();
+  const repoId = await GitTracker.getRepoId();
+  if (!legacy.length || !repoId) return;
+  await context.globalState.update(LEGACY_PROMPT_KEY, true);
+  const all = `Assign all to ${repoLabel(repoId)}`;
+  const choose = 'Choose\u2026';
+  const picked = await vscode.window.showInformationMessage(
+    `AI Effort Tracker now tracks branches per repository, so "main" in two repositories stays separate. ${legacy.length} older branch(es) have no repository yet.`,
+    all, choose, 'Later'
+  );
+  if (picked === all) {
+    const moved = db.assignBranchesToRepo(legacy, repoId);
+    vscode.window.showInformationMessage(`AI Effort Tracker: ${moved} branch(es) assigned to ${repoLabel(repoId)}.`);
+    refreshDashboard();
+  } else if (picked === choose) {
+    await assignLegacyBranches();
+  }
+}
+
+/** Assign branches without a repository (#154) to a repository of your choice. */
+async function assignLegacyBranches(): Promise<void> {
+  const legacy = db.getLegacyBranches();
+  if (!legacy.length) {
+    vscode.window.showInformationMessage('AI Effort Tracker: every tracked branch already belongs to a repository.');
+    return;
+  }
+  const current = await GitTracker.getRepoId();
+  const repos = [...new Set([current, ...db.getAllBranches().map(repoOfKey)].filter((r): r is string => !!r))];
+  if (!repos.length) {
+    vscode.window.showWarningMessage('AI Effort Tracker: open a folder in a git repository first.');
+    return;
+  }
+  const branches = await vscode.window.showQuickPick(
+    legacy.map(key => {
+      const s = db.getSummaryForBranch(key);
+      return { label: key, description: s.workItemId ? `#${s.workItemId}` : undefined, picked: true, key };
+    }),
+    { canPickMany: true, placeHolder: 'Branches to move under a repository' }
+  );
+  if (!branches?.length) return;
+  let repoId = repos[0];
+  if (repos.length > 1) {
+    const repo = await vscode.window.showQuickPick(
+      repos.map(r => ({ label: repoLabel(r), description: r === current ? `${r} (current)` : r, repoId: r })),
+      { placeHolder: 'Repository these branches belong to' }
+    );
+    if (!repo) return;
+    repoId = repo.repoId;
+  }
+  const moved = db.assignBranchesToRepo(branches.map(b => b.key), repoId);
+  vscode.window.showInformationMessage(`AI Effort Tracker: ${moved} branch(es) assigned to ${repoLabel(repoId)}.`);
+  refreshDashboard();
+}
+
+function moveSummary(s: EntryMoveStats): string {
+  const parts: string[] = [];
+  if (s.activeMs) parts.push(`${fmtDuration(s.activeMs)} active`);
+  if (s.linesHuman || s.linesAi) parts.push(`${s.linesHuman + s.linesAi} lines`);
+  if (s.ledgerRows) parts.push(`${s.credits} credits (${s.ledgerRows} row${s.ledgerRows === 1 ? '' : 's'})`);
+  if (s.timeEntries) parts.push(`${s.timeEntries} time-log row${s.timeEntries === 1 ? '' : 's'}`);
+  if (s.focusSessions) parts.push(`${s.focusSessions} focus session${s.focusSessions === 1 ? '' : 's'}`);
+  return parts.length ? parts.join(' · ') : 'nothing';
+}
+
+const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+
+/** Parse `HH:MM` (today) or `YYYY-MM-DD[ HH:MM]` as local time. */
+function parseMoveStart(text: string): number | undefined {
+  const t = text.trim();
+  let m = /^(\d{1,2}):(\d{2})$/.exec(t);
+  if (m) {
+    const d = new Date(); d.setHours(Number(m[1]), Number(m[2]), 0, 0);
+    return Number(m[1]) < 24 && Number(m[2]) < 60 ? d.getTime() : undefined;
+  }
+  m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?$/.exec(t);
+  if (!m) return undefined;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4] ?? 0), Number(m[5] ?? 0));
+  return Number.isNaN(d.getTime()) ? undefined : d.getTime();
+}
+
+async function pickMoveTarget(source: string, placeHolder: string): Promise<string | undefined> {
+  const repo = repoOfKey(source);
+  const current = timeTracker?.getBranch();
+  const summaries = db.getAllBranchesSummaries().filter(s => s.branch !== source);
+  summaries.sort((a, b) => Number(repoOfKey(b.branch) === repo) - Number(repoOfKey(a.branch) === repo)
+    || Number(b.branch === current) - Number(a.branch === current) || a.branch.localeCompare(b.branch));
+  const picked = await vscode.window.showQuickPick(summaries.map(s => ({
+    label: (s.branch === current ? '\u25b6 ' : '') + branchLabel(s.branch),
+    description: s.workItemId ? '#' + s.workItemId : 'no work item',
+    key: s.branch
+  })), { placeHolder, matchOnDescription: true });
+  return picked?.key;
+}
+
+/**
+ * #156: move entries recorded on one branch to another — typically work done
+ * on `main` before the feature branch existed. `arg` is a branch key, or
+ * `{ ledgerIds }` from the credit ledger.
+ */
+async function moveEntriesCmd(arg?: string | { branch?: string; ledgerIds?: string[] }): Promise<void> {
+  const payload = typeof arg === 'object' && arg ? arg : typeof arg === 'string' && arg ? { branch: arg } : {};
+  const ledgerIds = Array.isArray(payload.ledgerIds) ? payload.ledgerIds.filter((x): x is string => typeof x === 'string') : [];
+  if (ledgerIds.length) return moveLedgerRows(ledgerIds);
+
+  const current = await GitTracker.getCurrentBranch() ?? timeTracker?.getBranch();
+  let source = payload.branch && db.getAllBranches().includes(payload.branch) ? payload.branch : undefined;
+  if (!source) {
+    const all = db.getAllBranches();
+    const picked = await vscode.window.showQuickPick(
+      all.sort((a, b) => Number(b === current) - Number(a === current) || a.localeCompare(b))
+        .map(key => ({ label: (key === current ? '\u25b6 ' : '') + branchLabel(key), key })),
+      { placeHolder: 'Move entries FROM which branch?' });
+    if (!picked) return;
+    source = picked.key;
+  }
+  const target = await pickMoveTarget(source, `Move entries from "${branchLabel(source)}" TO which branch?`);
+  if (!target) return;
+
+  type RangePick = vscode.QuickPickItem & { fromTs?: number; ask?: 'time' | 'date' };
+  const preview = (fromTs: number) => db.previewEntryMove(source!, target, { fromTs });
+  const today = startOfToday();
+  const picks: RangePick[] = [
+    { label: 'Today', description: moveSummary(preview(today)!), fromTs: today },
+    { label: 'Today since…', description: 'enter a time like 09:30', ask: 'time' },
+    { label: 'Since a date…', description: 'enter YYYY-MM-DD or YYYY-MM-DD HH:MM', ask: 'date' },
+    { label: 'Everything', description: moveSummary(preview(0)!), fromTs: 0 }
+  ];
+  const range = await vscode.window.showQuickPick(picks, { placeHolder: `Which entries of "${branchLabel(source)}" belong to "${branchLabel(target)}"?` });
+  if (!range) return;
+  let fromTs = range.fromTs;
+  if (range.ask) {
+    const text = await vscode.window.showInputBox({
+      prompt: range.ask === 'time' ? 'Start time today (HH:MM)' : 'Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)',
+      validateInput: v => parseMoveStart(v) === undefined ? 'Use HH:MM or YYYY-MM-DD [HH:MM]' : undefined
+    });
+    if (text === undefined) return;
+    fromTs = parseMoveStart(text);
+  }
+  if (fromTs === undefined) return;
+  const stats = preview(fromTs);
+  if (!stats || stats.activeMs + stats.idleMs + stats.linesHuman + stats.linesAi + stats.ledgerRows + stats.timeEntries + stats.focusSessions === 0) {
+    vscode.window.showInformationMessage(`AI Effort Tracker: nothing tracked on "${branchLabel(source)}" in that range.`);
+    return;
+  }
+  const since = fromTs > 0 ? ` since ${new Date(fromTs).toLocaleString()}` : '';
+  const ok = await vscode.window.showWarningMessage(
+    `Move entries from "${branchLabel(source)}" to "${branchLabel(target)}"${since}?`,
+    {
+      modal: true,
+      detail: moveSummary(stats) + (stats.estimated
+        ? '\n\nPart of a day is split by hour, so lines and counters of that day move proportionally.'
+        : '') + '\n\nYou can undo this move.'
+    },
+    'Move'
+  );
+  if (ok !== 'Move') return;
+  const rec = db.moveEntries(source, target, { fromTs });
+  refreshDashboard();
+  if (rec) await offerMoveUndo(rec.id, `Moved ${moveSummary(stats)} to "${branchLabel(target)}".`);
+}
+
+async function moveLedgerRows(ids: string[]): Promise<void> {
+  const rows = db.getCreditEntries().filter(e => ids.includes(e.id));
+  const sources = [...new Set(rows.map(e => e.branch).filter((b): b is string => !!b))];
+  if (!sources.length) {
+    vscode.window.showWarningMessage('AI Effort Tracker: the selected credit rows are not on a branch.');
+    return;
+  }
+  const target = await pickMoveTarget(sources.length === 1 ? sources[0] : '', `Move ${rows.length} credit row(s) to which branch?`);
+  if (!target) return;
+  const moves = sources.filter(s => s !== target).map(s => db.moveEntries(s, target, { ledgerIds: ids })).filter(r => !!r);
+  refreshDashboard();
+  const n = moves.reduce((s, r) => s + (r!.move?.stats.ledgerRows ?? 0), 0);
+  if (moves.length === 1) await offerMoveUndo(moves[0]!.id, `Moved ${n} credit row(s) to "${branchLabel(target)}".`);
+  else vscode.window.showInformationMessage(`AI Effort Tracker: moved ${n} credit row(s) to "${branchLabel(target)}".`);
+}
+
+/**
+ * #156: work often starts on main (a call, the user story, the spec) before the
+ * feature branch exists. On switching to a branch with nothing tracked, offer to
+ * move today's entries of the previous branch of the same repository.
+ */
+async function offerMoveToNewBranch(prev: string | undefined, next: string, nextIsNew: boolean): Promise<void> {
+  if (!nextIsNew || !prev || prev === 'unknown' || repoOfKey(prev) !== repoOfKey(next)) return;
+  if (vscode.workspace.getConfiguration('aiEffortTracker').get<boolean>('branches.offerMoveOnNewBranch', true) === false) return;
+  const stats = db.previewEntryMove(prev, next, { fromTs: startOfToday() });
+  if (!stats || (stats.activeMs < 60_000 && !stats.ledgerRows && !stats.timeEntries)) return;
+  const all = 'Move all of today';
+  const since = 'Choose start time\u2026';
+  const picked = await vscode.window.showInformationMessage(
+    `AI Effort Tracker: "${branchLabel(prev)}" has ${moveSummary(stats)} from today. Move it to the new branch "${branchLabel(next)}"?`,
+    all, since, 'No'
+  );
+  if (picked === all) {
+    const rec = db.moveEntries(prev, next, { fromTs: startOfToday() });
+    refreshDashboard();
+    if (rec) await offerMoveUndo(rec.id, `Moved ${moveSummary(stats)} to "${branchLabel(next)}".`);
+  } else if (picked === since) {
+    const text = await vscode.window.showInputBox({
+      prompt: `Move entries of "${branchLabel(prev)}" since (HH:MM today, or YYYY-MM-DD HH:MM)`,
+      validateInput: v => parseMoveStart(v) === undefined ? 'Use HH:MM or YYYY-MM-DD [HH:MM]' : undefined
+    });
+    const fromTs = text === undefined ? undefined : parseMoveStart(text);
+    if (fromTs === undefined) return;
+    const s = db.previewEntryMove(prev, next, { fromTs });
+    const rec = db.moveEntries(prev, next, { fromTs });
+    refreshDashboard();
+    if (rec && s) await offerMoveUndo(rec.id, `Moved ${moveSummary(s)} to "${branchLabel(next)}".`);
+    else vscode.window.showInformationMessage(`AI Effort Tracker: nothing tracked on "${branchLabel(prev)}" since then.`);
+  }
+}
+
+async function offerMoveUndo(id: string, message: string): Promise<void> {
+  const choice = await vscode.window.showInformationMessage(`AI Effort Tracker: ${message}`, 'Undo');
+  if (choice === 'Undo') await undoEntryMoveCmd(id);
+}
+
+/** #156: revert an entry move (QuickPick when no id is given). */
+async function undoEntryMoveCmd(id?: string): Promise<void> {
+  if (!id) {
+    const moves = db.getEntryMoves().filter(m => !m.undone);
+    if (!moves.length) {
+      vscode.window.showInformationMessage('AI Effort Tracker: there is no entry move to undo.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(moves.map(m => ({
+      label: `${m.kind === 'merge' ? '\u29c9 ' : ''}${branchLabel(m.branch)} \u2192 ${branchLabel(m.toBranch ?? '')}`,
+      description: (m.kind === 'merge' ? 'merge \u00b7 ' : '') + new Date(m.ts).toLocaleString(),
+      detail: m.move ? moveSummary(m.move.stats) : undefined,
+      id: m.id
+    })), { placeHolder: 'Undo which entry move or branch merge?' });
+    if (!picked) return;
+    id = picked.id;
+  }
+  const undo = db.undoEntryMove(id);
+  refreshDashboard();
+  if (undo) vscode.window.showInformationMessage(`AI Effort Tracker: entries moved back to "${branchLabel(undo.toBranch ?? '')}".`);
+  else vscode.window.showWarningMessage('AI Effort Tracker: this move was already undone.');
+}
+
+/** #160: put back what a line recount removed (QuickPick when no batch is given). */
+async function undoLineCleanupCmd(batchId?: string): Promise<void> {
+  if (!batchId) {
+    const runs = db.getLineCleanups();
+    if (!runs.length) {
+      vscode.window.showInformationMessage('AI Effort Tracker: there is no line recount to undo.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(runs.map(r => ({
+      label: new Date(r.ts).toLocaleString(),
+      description: `${r.files} file(s) on ${r.branches} branch(es)`,
+      detail: `${r.lines.toLocaleString()} AI lines removed`,
+      id: r.batchId
+    })), { placeHolder: 'Undo which line recount?' });
+    if (!picked) return;
+    batchId = picked.id;
+  }
+  const n = db.undoLineCleanup(batchId);
+  refreshDashboard();
+  if (n) vscode.window.showInformationMessage('AI Effort Tracker: line counts restored.');
+  else vscode.window.showWarningMessage('AI Effort Tracker: this recount was already undone.');
+}
+
+/**
+ * #159: merge all data of one tracked branch into another — duplicates such as
+ * `UAT-Integration` / `UAT-integration`, or a renamed branch. `arg` is the
+ * source key, or `{ from, to }`. Case variants of the source are offered first.
+ */
+async function mergeBranchesCmd(arg?: string | { from?: string; to?: string }): Promise<void> {
+  const payload = typeof arg === 'object' && arg ? arg : typeof arg === 'string' && arg ? { from: arg } : {};
+  const all = db.getAllBranches();
+  const variantsOf = (key: string) => db.getCaseVariantBranches().find(g => g.includes(key))?.filter(k => k !== key) ?? [];
+  let source = payload.from && all.includes(payload.from) ? payload.from : undefined;
+  if (!source) {
+    const flagged = new Set(db.getCaseVariantBranches().flat());
+    const picked = await vscode.window.showQuickPick(
+      all.sort((a, b) => Number(flagged.has(b)) - Number(flagged.has(a)) || a.localeCompare(b))
+        .map(key => ({ label: branchLabel(key), description: flagged.has(key) ? 'same name, different case' : undefined, key })),
+      { placeHolder: 'Merge which branch (it disappears into the other one)?' });
+    if (!picked) return;
+    source = picked.key;
+  }
+  let target = payload.to && all.includes(payload.to) && payload.to !== source ? payload.to : undefined;
+  if (!target) {
+    const variants = variantsOf(source);
+    const repo = repoOfKey(source);
+    const others = all.filter(k => k !== source).sort((a, b) =>
+      Number(variants.includes(b)) - Number(variants.includes(a))
+      || Number(repoOfKey(b) === repo) - Number(repoOfKey(a) === repo) || a.localeCompare(b));
+    const picked = await vscode.window.showQuickPick(others.map(key => {
+      const wi = db.getWorkItemForBranch(key);
+      return {
+        label: branchLabel(key),
+        description: (variants.includes(key) ? 'same name, different case \u00b7 ' : '') + (wi ? '#' + wi : 'no work item'),
+        key
+      };
+    }), { placeHolder: `Merge "${branchLabel(source)}" INTO which branch?`, matchOnDescription: true });
+    if (!picked) return;
+    target = picked.key;
+  }
+  const stats = db.previewBranchMerge(source, target);
+  if (!stats) {
+    vscode.window.showWarningMessage('AI Effort Tracker: these branches cannot be merged.');
+    return;
+  }
+  const ok = await vscode.window.showWarningMessage(
+    `Merge "${branchLabel(source)}" into "${branchLabel(target)}"?`,
+    {
+      modal: true,
+      detail: `Moves ${moveSummary(stats)} and removes "${branchLabel(source)}" from the branch list. Later activity recorded under that name is added to "${branchLabel(target)}".\n\nYou can undo this merge.`
+    },
+    'Merge'
+  );
+  if (ok !== 'Merge') return;
+  const rec = db.mergeBranches(source, target);
+  refreshDashboard();
+  if (rec) await offerMoveUndo(rec.id, `Merged "${branchLabel(source)}" into "${branchLabel(target)}" (${moveSummary(stats)}).`);
 }
 
 export function deactivate() {
@@ -611,7 +965,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
   try { lastBilling = await ghService.getBillingUsage(); } catch { /* ignore */ }
   const initialNet = await GitTracker.getNetLineChange();
   if (initialNet) db.seedEffectiveLinesFromGit(initialNet.branch, initialNet.byCategory);
-  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(),   db.getManualEffort(), db.getReassignments(), initialNet, dashFilter);
+  dashboardPanel.webview.html = renderDashboardHtml(db.getAllBranchesSummaries(), branch, nonce, ghMetrics, getInsightsConfig(), getAnalytics(), lastBilling, db.getAllProjectSummaries(), withRework(withReview(db.getAllWorkItemSummaries())), db.getCreditEntries(),   db.getManualEffort(), db.getReassignments(), initialNet, dashFilter, repoRows(db.getAllBranchesSummaries()));
 
   dashboardPanel.webview.onDidReceiveMessage(async (m) => {
     if (m?.type === 'ready') { flushPendingOpenWorkItem(); return; }
@@ -622,7 +976,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
         return;
       }
       if (m?.type === 'optimize') {
-        dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId, m.from, m.to) });
+        dashboardPanel?.webview.postMessage({ type: 'optimizeData', ...optimizePayload(m.days, m.workItemId, m.projectId, m.from, m.to, m.repoId) });
         return;
       }
     if (m?.type === 'health') {
@@ -692,9 +1046,11 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
 
     const netChange = await GitTracker.getNetLineChange();
     if (netChange) db.seedEffectiveLinesFromGit(netChange.branch, netChange.byCategory);
+    const summaries = db.getAllBranchesSummaries();
     dashboardPanel.webview.postMessage({
       type: 'update',
-      summaries: db.getAllBranchesSummaries(),
+      summaries,
+      repos: repoRows(summaries),
       currentBranch,
       ghMetrics: ghData,
       config: getInsightsConfig(),
@@ -734,7 +1090,7 @@ async function assignBranchToWorkItem() {
   }));
   picks.push({ label: '$(add) New work item\u2026', create: true });
   const picked = await vscode.window.showQuickPick(picks, {
-    placeHolder: `Assign branch "${branch}" to a work item` + (current ? ` (current: #${current})` : '')
+    placeHolder: `Assign branch "${branchLabel(branch)}" to a work item` + (current ? ` (current: #${current})` : '')
   });
   if (!picked) return;
 
@@ -757,7 +1113,7 @@ async function assignBranchToWorkItem() {
     db.reassignBranchToWorkItem(branch, workItemId);
   }
   vscode.window.showInformationMessage(
-    `Branch "${branch}" assigned to work item #${workItemId}.`
+    `Branch "${branchLabel(branch)}" assigned to work item #${workItemId}.`
   );
   refreshDashboard();
 }
@@ -768,15 +1124,16 @@ async function assignBranchToWorkItem() {
  */
 async function pickBranch(placeHolder: string): Promise<string | undefined> {
   const picks = db.getAllBranchesSummaries().map(s => ({
-    label: s.branch,
-    description: s.workItemId ? '#' + s.workItemId : undefined
+    label: branchLabel(s.branch),
+    description: s.workItemId ? '#' + s.workItemId : undefined,
+    key: s.branch
   }));
   if (picks.length === 0) {
     vscode.window.showWarningMessage('No branches tracked yet.');
     return undefined;
   }
   const picked = await vscode.window.showQuickPick(picks, { placeHolder });
-  return picked?.label;
+  return picked?.key;
 }
 
 /**
@@ -1252,7 +1609,7 @@ async function adjustTrackedTime(arg?: string) {
     if (!branch) return;
   }
   if (!mode) {
-    const picked = await pickTrackingMode(`Which mode's tracked time on "${branch}"?`);
+    const picked = await pickTrackingMode(`Which mode's tracked time on "${branchLabel(branch)}"?`);
     if (picked === CANCELLED || picked == null) return;
     mode = picked;
   }
@@ -1264,7 +1621,7 @@ async function adjustTrackedTime(arg?: string) {
 
   const value = await vscode.window.showInputBox({
     prompt:
-      `Corrected ${modeLabel(mode)} time for "${branch}" ` +
+      `Corrected ${modeLabel(mode)} time for "${branchLabel(branch)}" ` +
       `(minutes or h:mm; blank to reset this mode to auto). ` +
       `Auto-tracked raw = ${rawTxt}, currently showing ${effTxt}.`,
     value: effTxt,
@@ -1279,14 +1636,14 @@ async function adjustTrackedTime(arg?: string) {
   if (!value.trim()) {
     db.clearTimeAdjustment(branch, mode);
     vscode.window.showInformationMessage(
-      `${modeLabel(mode)} time for "${branch}" reset to auto (${rawTxt}).`
+      `${modeLabel(mode)} time for "${branchLabel(branch)}" reset to auto (${rawTxt}).`
     );
   } else {
     const desiredMs = parseDurationMs(value)!;
     db.setEffectiveTime(branch, mode, desiredMs);
     const nowTxt = msToHm(db.getEffectiveTime(branch)[mode]);
     vscode.window.showInformationMessage(
-      `${modeLabel(mode)} time for "${branch}" set to ${nowTxt} (auto-tracked raw ${rawTxt} preserved).`
+      `${modeLabel(mode)} time for "${branchLabel(branch)}" set to ${nowTxt} (auto-tracked raw ${rawTxt} preserved).`
     );
   }
   refreshDashboard();
@@ -1308,8 +1665,8 @@ async function resetTrackedTime(arg?: string) {
   db.clearTimeAdjustment(branch);
   vscode.window.showInformationMessage(
     hadAdjustment
-      ? `Tracked-time adjustments for "${branch}" reset to auto.`
-      : `"${branch}" has no time adjustments — already on auto.`
+      ? `Tracked-time adjustments for "${branchLabel(branch)}" reset to auto.`
+      : `"${branchLabel(branch)}" has no time adjustments — already on auto.`
   );
   refreshDashboard();
 }
@@ -1587,9 +1944,12 @@ async function createProject() {
   refreshDashboard();
 }
 
-/** Link the current workspace repo to an existing project (issue #27). */
-async function linkRepoToProject() {
-  const repoId = await GitTracker.getRepoId();
+/**
+ * Link a repository to an existing project (issue #27). Defaults to the current
+ * workspace repo; the dashboard's Repositories section passes one (#155).
+ */
+async function linkRepoToProject(target?: string) {
+  const repoId = target && target !== LEGACY_REPO ? target : target ? undefined : await GitTracker.getRepoId();
   if (!repoId) {
     vscode.window.showWarningMessage('No repository detected in the current workspace to link.');
     return;
@@ -1610,11 +1970,47 @@ async function linkRepoToProject() {
     };
   });
   const picked = await vscode.window.showQuickPick(picks, {
-    placeHolder: `Link this repository (${repoId}) to which project?`
+    placeHolder: `Link ${target ? repoLabel(repoId) : 'this repository'} (${repoId}) to which project?`
   });
   if (!picked) return;
   db.linkRepoToProject(picked.id, repoId);
-  vscode.window.showInformationMessage(`Linked this repo to "${db.getProject(picked.id)?.name ?? picked.id}".`);
+  vscode.window.showInformationMessage(`Linked ${target ? repoLabel(repoId) : 'this repo'} to "${db.getProject(picked.id)?.name ?? picked.id}".`);
+  if (setupDeps) void updateSetupContext(setupDeps);
+  refreshDashboard();
+}
+
+/**
+ * Detach a repository from a project (#155). `arg` is `projectId\0repoId` from
+ * the dashboard; without it the user picks the project and the repository.
+ */
+async function unlinkRepoFromProject(arg?: unknown) {
+  let [projectId, repoId] = typeof arg === 'string' ? arg.split('\u0000') : [];
+  if (!projectId) {
+    const linked = db.getAllProjects().filter(p => p.repos.length);
+    if (!linked.length) {
+      vscode.window.showInformationMessage('No project has a linked repository.');
+      return;
+    }
+    const p = await vscode.window.showQuickPick(
+      linked.map(x => ({ label: x.name, description: x.repos.map(repoLabel).join(', '), id: x.id })),
+      { placeHolder: 'Unlink a repository from which project?' });
+    if (!p) return;
+    projectId = p.id;
+  }
+  const project = db.getProject(projectId);
+  if (!project) return;
+  if (!repoId) {
+    const r = await vscode.window.showQuickPick(
+      project.repos.map(x => ({ label: repoLabel(x), description: x, id: x })),
+      { placeHolder: `Unlink which repository from "${project.name}"?` });
+    if (!r) return;
+    repoId = r.id;
+  }
+  const ok = await vscode.window.showWarningMessage(
+    `Unlink ${repoLabel(repoId)} from "${project.name}"? Tracked branches and credits stay as they are.`,
+    { modal: true }, 'Unlink');
+  if (ok !== 'Unlink') return;
+  db.unlinkRepoFromProject(projectId, repoId);
   if (setupDeps) void updateSetupContext(setupDeps);
   refreshDashboard();
 }
@@ -1737,7 +2133,7 @@ async function promptTimestamp(
 /** Short human label for a ledger entry, used in QuickPicks and messages. */
 function ledgerLabel(e: LedgerEntry): string {
   const when = new Date(e.ts).toLocaleString();
-  const attr = e.workItemId ? ` #${e.workItemId}` : e.branch ? ` ${e.branch}` : '';
+  const attr = e.workItemId ? ` #${e.workItemId}` : e.branch ? ` ${branchLabel(e.branch)}` : '';
   const note = e.note ? ` — ${e.note}` : '';
   return `${e.credits} cr · ${e.model} · ${e.source}${attr} · ${when}${note}`;
 }
@@ -2320,7 +2716,7 @@ async function pickBranchOptional(
   const picks: BP[] = [
     { label: '$(circle-slash) No branch (work outside VS Code)', none: true, description: current == null ? 'current' : undefined },
     ...summaries.map(s => ({
-      label: (s.branch === current ? '\u25b6 ' : '') + s.branch,
+      label: (s.branch === current ? '\u25b6 ' : '') + branchLabel(s.branch),
       description: s.workItemId ? '#' + s.workItemId : undefined,
       branch: s.branch
     }))
@@ -2605,21 +3001,36 @@ async function createWorkItem() {
  * Edit an existing work item (issue #27): change its title and optionally
  * reassign its project. Excludes the synthetic holding buckets.
  */
-async function editWorkItem() {
-  const wi = await pickWorkItem('Edit which work item?');
+async function editWorkItem(workItemId?: string) {
+  const wi = workItemId || await pickWorkItem('Edit which work item?');
   if (!wi) return;
   const existing = db.getWorkItem(wi);
-  const title = await vscode.window.showInputBox({
-    prompt: `Title for work item #${wi}`,
-    value: existing?.title ?? ''
-  });
-  if (title === undefined) return;
-  db.upsertWorkItem(wi, { title: title.trim() ? title.trim() : null });
+  if (!await promptWorkItemTitle(wi)) return;
 
   const sel = await pickProjectOrNone(`Project for #${wi} (Esc to keep current)`, existing?.projectId ?? null);
   if (sel !== undefined) db.setProjectForWorkItem(wi, sel);
 
   vscode.window.showInformationMessage(`Work item #${wi} updated.`);
+  refreshDashboard();
+}
+
+/** Ask for a work item title; empty lets it be derived from its branch again (#157). */
+async function promptWorkItemTitle(wi: string): Promise<boolean> {
+  const existing = db.getWorkItem(wi);
+  const title = await vscode.window.showInputBox({
+    prompt: `Title for work item #${wi}` + (existing?.titleAuto ? ' (currently taken from its branch name)' : ''),
+    placeHolder: 'Empty = use the branch name when only one branch is linked',
+    value: existing?.title ?? ''
+  });
+  if (title === undefined) return false;
+  db.upsertWorkItem(wi, { title: title.trim() ? title.trim() : null });
+  return true;
+}
+
+/** Rename a work item from the dashboard (#157). */
+async function renameWorkItem(workItemId?: string) {
+  const wi = workItemId || await pickWorkItem('Rename which work item?');
+  if (!wi || !await promptWorkItemTitle(wi)) return;
   refreshDashboard();
 }
 
@@ -2830,6 +3241,20 @@ async function fixDataHealth(checkId?: string) {
   } else if (checkId === 'stale-credit-attribution') {
     const n = db.reattributeUnassignedCredits();
     vscode.window.showInformationMessage(`AI Effort Tracker: ${n} credit row(s) now count for their branch's work item.`);
+  } else if (checkId === 'implausible-line-churn') {
+    const outliers = db.getLineChurnOutliers();
+    if (!outliers.length) return;
+    const excess = outliers.reduce((n, o) => n + o.excess, 0);
+    const ok = await vscode.window.showWarningMessage(
+      `Recount AI lines of ${outliers.length} file(s)? ${excess.toLocaleString()} AI lines came from whole-file reloads or rewrites and are removed from file, branch and daily totals. You can undo this.`,
+      { modal: true }, 'Recount lines');
+    if (ok !== 'Recount lines') return;
+    const r = db.fixLineChurn();
+    refreshDashboard();
+    if (!r) return;
+    void vscode.window.showInformationMessage(`AI Effort Tracker: recounted ${r.files} file(s) on ${r.branches} branch(es); ${r.lines.toLocaleString()} AI lines removed.`, 'Undo')
+      .then(pick => { if (pick === 'Undo') void undoLineCleanupCmd(r.batchId); });
+    return;
   } else {
     void vscode.commands.executeCommand('aiEffortTracker.checkDataHealth');
     return;
@@ -2838,7 +3263,7 @@ async function fixDataHealth(checkId?: string) {
 }
 
 /** Usage-optimization data for the dashboard's Optimize tab (same engine as the MCP server). */
-function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown, from?: unknown, to?: unknown) {
+function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown, from?: unknown, to?: unknown, repoId?: unknown) {
   try {
     const isDay = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(parseDay(v));
     const fromMs = isDay(from) ? parseDay(from) : undefined;
@@ -2847,7 +3272,8 @@ function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown
       ...(fromMs !== undefined ? { from: fromMs } : { days: typeof days === 'number' && days > 0 ? Math.min(days, 3650) : 30 }),
       ...(toMs !== undefined ? { to: toMs } : {}),
       ...(typeof workItemId === 'string' && workItemId ? { workItemId } : {}),
-      ...(typeof projectId === 'string' && projectId ? { projectId } : {})
+      ...(typeof projectId === 'string' && projectId ? { projectId } : {}),
+      ...(typeof repoId === 'string' && repoId ? { repoId } : {})
     };
     const data = db.getUsageData();
     return {
@@ -2950,13 +3376,20 @@ function withReview<T extends { branches: string[] }>(list: T[]): (T & { review?
   });
 }
 /** Push an immediate refresh to the dashboard (e.g. after logging credits). */
+/** Tracked branches grouped by repository for the dashboard (#155). */
+function repoRows(summaries: BranchSummary[]) {
+  return buildRepoOverview(summaries, db.getAllProjects());
+}
+
 function refreshDashboard() {
   if (!dashboardPanel) return;
   Promise.all([GitTracker.getCurrentBranch(), GitTracker.getNetLineChange()]).then(([b, netChange]) => {
     if (netChange) db.seedEffectiveLinesFromGit(netChange.branch, netChange.byCategory);
+    const summaries = db.getAllBranchesSummaries();
     dashboardPanel?.webview.postMessage({
       type: 'update',
-      summaries: db.getAllBranchesSummaries(),
+      summaries,
+      repos: repoRows(summaries),
       currentBranch: b ?? 'unknown',
       config: getInsightsConfig(),
       analytics: getAnalytics(),
@@ -3084,7 +3517,7 @@ async function exportReport(db: Database, tracker: TimeTracker) {
   const json = JSON.stringify(summary, null, 2);
 
   const uri = await vscode.window.showSaveDialog({
-    defaultUri: vscode.Uri.file(`effort-report-${branch ?? 'unknown'}.json`),
+    defaultUri: vscode.Uri.file(`effort-report-${branchNameOf(branch ?? 'unknown').replace(/[\\/:*?"<>|]/g, '-')}.json`),
     filters: { JSON: ['json'] }
   });
   if (uri) {

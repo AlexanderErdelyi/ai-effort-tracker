@@ -1,10 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
-import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
+import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity, getFileExt } from '../util/fileTypes';
+import { distribute, findChurnOutliers, type ChurnOutlier } from '../analysis/lineChurn';
 import type { FileCategory } from '../util/fileTypes';
+import { branchKey, branchNameOf, caseVariantBranchGroups, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
 import {
   resolveEffectiveRates,
   computeRoiFigures,
@@ -24,6 +27,7 @@ import { duplicateLedgerIndexes } from '../analysis/dataHealth';
 import type { TimesheetSourceRow } from '../analysis/timesheet';
 import { rateInputsFromStore } from '../analysis/correctionRate';
 import { buildCalendar, type CalendarData } from '../analysis/calendar';
+import { buildRepoOverview, type RepoRow } from '../analysis/repoOverview';
 import {
   addCredit,
   creditConfidence,
@@ -49,7 +53,12 @@ export interface ExtStats {
 }
 
 export interface BranchSummary {
+  /** Store key: `<repoId>::<name>`, or just the name for legacy keys (#154). */
   branch: string;
+  /** Repository of the branch, null for legacy entries tracked before #154. */
+  repoId: string | null;
+  /** Git branch name without the repository. */
+  name: string;
   workItemId: string | null;
   humanCodingMs: number;
   aiGeneratingMs: number;
@@ -267,6 +276,17 @@ export interface ReassignmentRecord {
   note?: string;
   /** Groups records written together by one bulk operation. */
   batchId?: string;
+  /**
+   * `move`: entries of `branch` moved to `toBranch` (#156); `move-undo`: such a
+   * move reverted (`undoOf`). Absent on plain work item reassignments.
+   */
+  kind?: 'move' | 'merge' | 'move-undo';
+  toBranch?: string;
+  range?: { fromTs: number; toTs?: number };
+  undoOf?: string;
+  move?: EntryMovePayload;
+  /** Extra undo data of a branch merge (#159). */
+  merge?: BranchMergePayload;
 }
 
 /**
@@ -589,6 +609,37 @@ interface BranchData {
   effectiveLinesVersion?: number;
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
+  /**
+   * Set on a branch whose data was folded into another branch key (#154). The
+   * record stays as a zeroed tombstone so late deltas from other windows land
+   * here and {@link migrateStore} folds them into `movedTo`.
+   */
+  movedTo?: string;
+  /** Implausible AI line churn removed by a recount (#160); each record undoes exactly. */
+  lineCleanups?: LineCleanup[];
+}
+
+/** AI lines one recount (#160) removed from a branch, kept so it can be undone. */
+export interface LineCleanup {
+  id: string;
+  ts: number;
+  /** Shared by all branches recounted in one run. */
+  batchId: string;
+  /** Per file: what was taken off the file stat, the ext counters and the effective counters. */
+  files: {
+    path: string;
+    ext: string;
+    category: string;
+    effCategory: string;
+    aiAdded: number;
+    aiDeleted: number;
+    effectiveAi: number;
+    lineAdded: number;
+    lineDeleted: number;
+    effective: number;
+  }[];
+  /** Per day and line category: what was taken off the daily counters. */
+  days: { day: string; category: string; linesAi: number; categoryAi: number; translation: number }[];
 }
 
 type Store = Record<string, BranchData>;
@@ -603,6 +654,12 @@ type Store = Record<string, BranchData>;
 export interface WorkItem {
   id: string;
   title: string | null;
+  /**
+   * True while {@link title} was derived from the single linked branch name
+   * (#157). Any manual title edit clears it, and an auto title never replaces
+   * a manual one (also not when concurrent windows merge).
+   */
+  titleAuto?: boolean;
   projectId: string | null;
   estimate: number | null;
   externalRef: string | null;
@@ -772,6 +829,7 @@ export interface PersistedStore {
 export interface WorkItemSummary {
   workItemId: string;
   title: string | null;
+  titleAuto?: boolean;
   projectId: string | null;
   estimate: number | null;
   /** Per-category estimate breakdown, if one was entered (issue #16). */
@@ -918,6 +976,11 @@ export interface ProjectSummary extends BranchRollup {
   roi: ProjectRoi;
   /** How much of credits, time, lines and ROI was measured vs estimated vs manual (#143). */
   confidence?: SubjectConfidence;
+  /**
+   * The project's branches grouped by repository (#155), plus every linked
+   * repository even without tracked branches. Repo totals sum their branches.
+   */
+  repoBreakdown: RepoRow[];
 }
 
 /**
@@ -1038,11 +1101,11 @@ const NON_WORK_ITEM_IDS = new Set<string>(['unknown', UNASSIGNED_WORK_ITEM_ID]);
  * This is the SAME detection the live tracker applies on branch switch — the
  * tracker's `GitTracker.extractWorkItemId` delegates here so the regex lives in
  * exactly ONE place and migration + live tracking can never drift. Matches
- * `feature/1234-something`, `bugfix/1234`, `1234-auth`, etc. Pure.
+ * `feature/1234-something`, `bugfix/1234`, `1234-auth`, `#1234-fix`,
+ * `feature/#1234-x` and Azure Boards style `AB#1234-x` (#158). Pure.
  */
 export function extractWorkItemId(branch: string): string | undefined {
-  // Matches patterns like: feature/1234-something, bugfix/1234, 1234-something
-  const match = branch.match(/(?:^|[/_-])(\d{3,6})(?:[_-]|$)/);
+  const match = branch.match(/(?:^|[/_#-])(\d{3,6})(?:[_-]|$)/);
   return match?.[1];
 }
 
@@ -1091,7 +1154,11 @@ export function backfillWorkItems(
  *  3. otherwise park it in the {@link UNASSIGNED_WORK_ITEM_ID} holding work item
  *     (created lazily with a clear 'Unassigned' title) so its effort stays visible.
  *
- * Strictly additive and idempotent: it only ever SETS a previously-null
+ * A branch that was auto-PARKED in the holding item (not a manual choice) is
+ * re-detected too, so an improved `detect` (#158: `#1234-…`) later adopts it;
+ * those branch names are returned so their credit rows can follow.
+ *
+ * Strictly additive and idempotent: it only ever SETS a null or auto-parked
  * `workItemId` (and may create a work item), never clears, overwrites or drops
  * any branch field. A branch already mapped — manual or auto — is skipped, so a
  * second run changes nothing. Pure over the passed structures (the `detect`
@@ -1101,14 +1168,18 @@ export function assignUnmappedBranches(
   branches: Store,
   workItems: Record<string, WorkItem>,
   detect: (branch: string) => string | undefined
-): void {
+): string[] {
+  const adopted: string[] = [];
   for (const [name, data] of Object.entries(branches)) {
-    if (!data || typeof data !== 'object') continue;
-    // Only touch orphaned branches; never override an existing (manual OR auto) mapping.
-    if (data.workItemId != null || data.workItemIdManual) continue;
+    if (!data || typeof data !== 'object' || data.workItemIdManual || data.movedTo) continue;
+    const parked = data.workItemId === UNASSIGNED_WORK_ITEM_ID;
+    // Only touch orphaned or auto-parked branches; never override a real mapping.
+    if (data.workItemId != null && !parked) continue;
 
-    const detected = detect(name);
+    const detected = detect(branchNameOf(name));
+    if (parked && (!detected || NON_WORK_ITEM_IDS.has(detected))) continue;
     if (detected && !NON_WORK_ITEM_IDS.has(detected)) {
+      if (parked) adopted.push(name);
       data.workItemId = detected;
       if (!workItems[detected]) {
         workItems[detected] = {
@@ -1124,7 +1195,7 @@ export function assignUnmappedBranches(
     }
 
     // Detached-HEAD `unknown` (and other reserved buckets) stay standalone.
-    if (RESERVED_BRANCH_BUCKETS.has(name)) continue;
+    if (RESERVED_BRANCH_BUCKETS.has(branchNameOf(name))) continue;
 
     // Everything else that carries effort but has no work item lands in the holding item.
     data.workItemId = UNASSIGNED_WORK_ITEM_ID;
@@ -1139,7 +1210,485 @@ export function assignUnmappedBranches(
       };
     }
   }
+  return adopted;
 }
+
+/**
+ * Readable work item title from a branch name (#157): drops the path prefix
+ * (`feature/`, `users/x/`) and the id token (`#2134`, `AB#2134`, `2134`), then
+ * turns dashes/underscores into spaces. Undefined when nothing is left.
+ */
+export function deriveWorkItemTitle(branch: string, id: string): string | undefined {
+  const leaf = branch.slice(branch.lastIndexOf('/') + 1);
+  const title = leaf
+    .replace(new RegExp(`(^|[_-])(?:AB)?#?${id}(?=[_-]|$)`, 'i'), '$1')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return title || undefined;
+}
+
+/**
+ * Give untitled (or still auto-titled) work items the name of their ONLY
+ * linked branch (#157). Items with several branches keep what they have, and
+ * a manual title is never touched. Returns whether anything changed.
+ */
+export function autoTitleWorkItems(branches: Store, workItems: Record<string, WorkItem>): boolean {
+  const linked = new Map<string, string[]>();
+  for (const [name, data] of Object.entries(branches)) {
+    const id = data?.workItemId;
+    if (!id || NON_WORK_ITEM_IDS.has(id) || data.movedTo) continue;
+    const list = linked.get(id);
+    if (list) list.push(branchNameOf(name)); else linked.set(id, [branchNameOf(name)]);
+  }
+  let changed = false;
+  for (const wi of Object.values(workItems)) {
+    if (NON_WORK_ITEM_IDS.has(wi.id) || (wi.title != null && !wi.titleAuto)) continue;
+    const names = linked.get(wi.id);
+    if (names?.length !== 1) continue;
+    const title = deriveWorkItemTitle(names[0], wi.id);
+    if (!title || (title === wi.title && wi.titleAuto)) continue;
+    wi.title = title;
+    wi.titleAuto = true;
+    changed = true;
+  }
+  return changed;
+}
+
+/** Credit rows of branches adopted out of the holding item follow the branch (#158). */
+export function relinkAdoptedLedger(
+  adopted: string[],
+  branches: Store,
+  workItems: Record<string, WorkItem>,
+  ledger: LedgerEntry[]
+): void {
+  if (!adopted.length) return;
+  const set = new Set(adopted);
+  for (const e of ledger) {
+    if (!e.branch || !set.has(e.branch)) continue;
+    if (e.workItemId && e.workItemId !== UNASSIGNED_WORK_ITEM_ID) continue;
+    const id = branches[e.branch]?.workItemId;
+    if (!id) continue;
+    e.workItemId = id;
+    e.projectId = workItems[id]?.projectId ?? null;
+  }
+}
+
+/** Branch fields that describe identity, not tracked effort (#154 folds). */
+const FOLD_META = new Set(['workItemId', 'workItemIdManual', 'movedTo', 'effectiveLinesVersion', 'effectiveCategory']);
+const plainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+const numericArray = (v: unknown): v is number[] => Array.isArray(v) && v.every(x => typeof x === 'number');
+
+function foldValue(dst: unknown, src: unknown, key: string): unknown {
+  if (src === undefined || src === null) return dst;
+  if (dst === undefined || dst === null) return JSON.parse(JSON.stringify(src));
+  if (typeof src === 'number' && typeof dst === 'number') return key === 'lastTs' ? Math.max(dst, src) : dst + src;
+  if (numericArray(src) && numericArray(dst)) {
+    return Array.from({ length: Math.max(src.length, dst.length) }, (_, i) => (dst[i] ?? 0) + (src[i] ?? 0));
+  }
+  if (Array.isArray(src) && Array.isArray(dst)) {
+    const all = [...dst, ...JSON.parse(JSON.stringify(src))];
+    return key === 'focusSessions' ? all.sort((a, b) => (a?.ts ?? 0) - (b?.ts ?? 0)).slice(-500) : all;
+  }
+  if (plainObject(src) && plainObject(dst)) {
+    for (const [k, v] of Object.entries(src)) {
+      if (FOLD_META.has(k)) { if (k === 'effectiveCategory' && dst[k] === undefined) dst[k] = v; continue; }
+      dst[k] = foldValue(dst[k], v, k);
+    }
+    return dst;
+  }
+  return dst;
+}
+
+/**
+ * Add every tracked counter of `src` into `dst` (#154): numbers and per-hour
+ * arrays are summed, timestamps take the max, focus sessions are combined. The
+ * work item of `dst` wins unless it is unmapped or only auto-parked.
+ */
+export function foldBranchData(dst: BranchData, src: BranchData): void {
+  foldValue(dst, src, '');
+  dst.effectiveLinesVersion = Math.max(dst.effectiveLinesVersion ?? 0, src.effectiveLinesVersion ?? 0) || undefined;
+  if (dst.effectiveLinesVersion === undefined) delete dst.effectiveLinesVersion;
+  const dstAuto = dst.workItemId == null || (dst.workItemId === UNASSIGNED_WORK_ITEM_ID && !dst.workItemIdManual);
+  if (dstAuto && src.workItemId != null && !(src.workItemId === UNASSIGNED_WORK_ITEM_ID && !src.workItemIdManual)) {
+    dst.workItemId = src.workItemId;
+    if (src.workItemIdManual) dst.workItemIdManual = true;
+  }
+}
+
+function zeroed(value: unknown, key: string): unknown {
+  if (typeof value === 'number') return FOLD_META.has(key) ? value : 0;
+  if (numericArray(value)) return value.map(() => 0);
+  if (Array.isArray(value)) return [];
+  if (plainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = zeroed(v, k);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * A zeroed copy of a folded branch that points at its new key (#154). It keeps
+ * the counter shape so a concurrent window's delta (disk + local - base) still
+ * lands on it instead of being dropped by the merge.
+ */
+export function branchTombstone(src: BranchData, movedTo: string): BranchData {
+  const t = zeroed(src, '') as BranchData;
+  delete t.timeAdjustment;
+  delete t.effectiveLegacyBaseline;
+  delete t.creditsLog;
+  t.movedTo = movedTo;
+  t.time ??= { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0 };
+  t.copilotAcceptances ??= 0;
+  t.lineChanges ??= {};
+  return t;
+}
+
+function hasEffort(value: unknown, key = ''): boolean {
+  if (FOLD_META.has(key)) return false;
+  if (typeof value === 'number') return value !== 0;
+  if (Array.isArray(value)) return numericArray(value) ? value.some(v => v !== 0) : value.length > 0;
+  if (plainObject(value)) return Object.entries(value).some(([k, v]) => hasEffort(v, k));
+  return false;
+}
+
+/** Final key a (possibly chained) tombstone points at, or undefined. */
+export function resolveMovedBranch(branches: Store, key: string): string | undefined {
+  let current = key;
+  for (let hops = 0; hops < 16; hops++) {
+    const next = branches[current]?.movedTo;
+    if (!next) return current === key ? undefined : current;
+    if (next === key) return undefined;
+    current = next;
+  }
+  return undefined;
+}
+
+/**
+ * Fold the data of branch `from` into branch `to` and leave a tombstone (#154,
+ * reused by branch moves/merges). Credit, time-log and reassignment rows follow.
+ * Returns false when nothing was moved.
+ */
+export function moveBranchKey(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>, from: string, to: string): boolean {
+  const src = store.branches[from];
+  if (!src || from === to || src.movedTo) return false;
+  const dst = store.branches[to];
+  if (dst?.movedTo) return false;
+  if (dst) foldBranchData(dst, src);
+  else store.branches[to] = JSON.parse(JSON.stringify({ ...src, movedTo: undefined }));
+  store.branches[from] = branchTombstone(src, to);
+  rewriteMovedBranchRows(store);
+  return true;
+}
+
+/** Fold late deltas from tombstones into their targets and repoint row references (#154). */
+export function foldBranchTombstones(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>): void {
+  for (const [key, data] of Object.entries(store.branches)) {
+    if (!data?.movedTo) continue;
+    const target = resolveMovedBranch(store.branches, key);
+    if (!target) { delete data.movedTo; continue; }
+    if (!hasEffort(data)) continue;
+    foldBranchData(store.branches[target], data);
+    store.branches[key] = branchTombstone(data, data.movedTo);
+  }
+  rewriteMovedBranchRows(store);
+}
+
+function rewriteMovedBranchRows(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>): void {
+  const target = (b: string | null | undefined) => b && store.branches[b]?.movedTo ? resolveMovedBranch(store.branches, b) : undefined;
+  for (const rows of [store.creditLedger, store.timeEntries] as { branch?: string | null }[][]) {
+    for (const row of rows ?? []) {
+      const to = target(row.branch);
+      if (to) row.branch = to;
+    }
+  }
+  // A merge row (#159) keeps naming its source so it can be undone.
+  for (const r of store.reassignments ?? []) {
+    if (r.kind === 'merge') continue;
+    const from = target(r.branch);
+    if (from) r.branch = from;
+    const to = target(r.toBranch);
+    if (to) r.toBranch = to;
+  }
+}
+
+/** Which entries {@link Database.moveEntries} moves (#156). */
+export interface EntryMoveOptions {
+  /** Start of the time range (epoch ms, inclusive). `0` moves everything. */
+  fromTs?: number;
+  /** End of the time range (epoch ms, exclusive). Defaults to no end. */
+  toTs?: number;
+  /** Credit ledger rows to move. Without `fromTs` ONLY these rows move. */
+  ledgerIds?: string[];
+}
+
+/** What a branch entry move covers (#156). */
+export interface EntryMoveStats {
+  activeMs: number;
+  idleMs: number;
+  linesHuman: number;
+  linesAi: number;
+  credits: number;
+  ledgerRows: number;
+  timeEntries: number;
+  focusSessions: number;
+  days: number;
+  /** True when part of a day was split by hour, so lines/counters are proportional. */
+  estimated: boolean;
+}
+
+/** Undo data stored on a move audit row (#156). */
+export interface EntryMovePayload {
+  /** Counters actually moved (subtracted from the source, added to the target). */
+  delta: Record<string, unknown>;
+  ledger: { id: string; workItemId: string | null; projectId: string | null }[];
+  timeEntries: { id: string; workItemId: string | null }[];
+  stats: EntryMoveStats;
+}
+
+/** What a branch merge (#159) moved besides the {@link EntryMovePayload}. */
+export interface BranchMergePayload {
+  timeAdjustment?: Partial<Record<TrackingMode, number>>;
+  effectiveLegacyBaseline?: Record<string, { human: number; ai: number }>;
+  creditsLog?: CreditEntry[];
+  /** Ids of line recounts (#160) the target took over. */
+  lineCleanups?: string[];
+  /** Work item of the source before the merge. */
+  source: { workItemId: string | null; manual: boolean };
+  /** Work item of the target before the merge (it may adopt the source's). */
+  target: { workItemId: string | null; manual: boolean };
+}
+
+const ACTIVE_MODES = ['humanCoding', 'aiGenerating', 'reviewing'] as const;
+const sumOf = (a: number[] | undefined) => (a ?? []).reduce((s, v) => s + (Number(v) || 0), 0);
+
+function hourFractions(day: string, fromTs: number, toTs: number): number[] {
+  const [y, m, d] = day.split('-').map(Number);
+  return Array.from({ length: 24 }, (_, h) => {
+    const start = new Date(y, m - 1, d, h).getTime();
+    const end = new Date(y, m - 1, d, h + 1).getTime();
+    if (!(end > start)) return 0;
+    return Math.min(1, Math.max(0, Math.min(end, toTs) - Math.max(start, fromTs)) / (end - start));
+  });
+}
+
+function bucketHasEffort(b: DailyBucket): boolean {
+  return ACTIVE_MODES.some(m => (b[m] ?? 0) > 0) || (b.idle ?? 0) > 0 || (b.linesHuman ?? 0) > 0 || (b.linesAi ?? 0) > 0;
+}
+
+/** Part of one day bucket inside the range, split proportionally per hour. */
+function sliceBucket(b: DailyBucket, fr: number[]): DailyBucket {
+  const scale = (v: number | undefined, f: number) => Math.round((Number(v) || 0) * f);
+  const hours = (b.hours ?? []).map((v, i) => scale(v, fr[i] ?? 0));
+  const out: DailyBucket = { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0, linesHuman: 0, linesAi: 0, hours };
+  if (b.hoursByMode) {
+    out.hoursByMode = { humanCoding: [], aiGenerating: [], reviewing: [] };
+    for (const m of ACTIVE_MODES) {
+      const src = b.hoursByMode[m] ?? [];
+      const moved = src.map((v, i) => scale(v, fr[i] ?? 0));
+      out.hoursByMode[m] = moved;
+      const total = sumOf(src);
+      out[m] = total > 0 ? Math.min(b[m] ?? 0, Math.round((b[m] ?? 0) * sumOf(moved) / total)) : 0;
+    }
+  } else {
+    const total = sumOf(b.hours);
+    const share = total > 0 ? sumOf(hours) / total : 0;
+    for (const m of ACTIVE_MODES) out[m] = Math.round((b[m] ?? 0) * share);
+  }
+  const active = ACTIVE_MODES.reduce((s, m) => s + (b[m] ?? 0), 0);
+  const share = active > 0
+    ? Math.min(1, ACTIVE_MODES.reduce((s, m) => s + out[m], 0) / active)
+    : fr.reduce((s, f) => s + f, 0) / 24;
+  out.idle = scale(b.idle, share);
+  out.linesHuman = scale(b.linesHuman, share);
+  out.linesAi = scale(b.linesAi, share);
+  if (b.linesAiTranslation !== undefined) out.linesAiTranslation = scale(b.linesAiTranslation, share);
+  if (b.linesByCategory) {
+    out.linesByCategory = {};
+    for (const [cat, v] of Object.entries(b.linesByCategory)) {
+      out.linesByCategory[cat] = { human: scale(v.human, share), ai: scale(v.ai, share) };
+    }
+  }
+  return out;
+}
+
+/**
+ * The tracked counters of a branch that fall in `[fromTs, toTs)` (#156). Day
+ * buckets and focus sessions are exact; a partly covered day is split by hour.
+ * Cumulative counters (lines per extension, files, chat counters) carry no
+ * timestamps, so they move in proportion to the moved lines or active time.
+ * `fromTs <= 0` without an end moves everything.
+ */
+export function sliceBranchRange(src: BranchData, fromTs: number, toTs = Infinity): { delta: Record<string, unknown>; stats: EntryMoveStats } {
+  const all = fromTs <= 0 && toTs === Infinity;
+  const stats: EntryMoveStats = { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false };
+  const delta: Record<string, unknown> = {};
+  const daily: Record<string, DailyBucket> = {};
+  const movedMode: Record<TrackingMode, number> = { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0 };
+  let movedActive = 0, totalActive = 0, movedH = 0, totalH = 0, movedA = 0, totalA = 0;
+  for (const [day, b] of Object.entries(src.daily ?? {})) {
+    if (!b || !bucketHasEffort(b)) continue;
+    const active = ACTIVE_MODES.reduce((s, m) => s + (b[m] ?? 0), 0);
+    totalActive += active;
+    totalH += b.linesHuman ?? 0;
+    totalA += b.linesAi ?? 0;
+    const fr = all ? new Array(24).fill(1) : hourFractions(day, fromTs, toTs);
+    if (fr.every(f => f === 0)) continue;
+    let part: DailyBucket;
+    if (fr.every(f => f === 1)) {
+      part = JSON.parse(JSON.stringify(b));
+    } else {
+      part = sliceBucket(b, fr);
+      stats.estimated = true;
+    }
+    if (!bucketHasEffort(part)) continue;
+    daily[day] = part;
+    stats.days++;
+    for (const m of ACTIVE_MODES) movedMode[m] += part[m] ?? 0;
+    movedMode.idle += part.idle ?? 0;
+    movedActive += ACTIVE_MODES.reduce((s, m) => s + (part[m] ?? 0), 0);
+    movedH += part.linesHuman ?? 0;
+    movedA += part.linesAi ?? 0;
+  }
+  if (Object.keys(daily).length) delta.daily = daily;
+
+  const ratio = (moved: number, total: number) => all ? 1 : total > 0 ? Math.min(1, moved / total) : 0;
+  const fracT = ratio(movedActive, totalActive), fracH = ratio(movedH, totalH), fracA = ratio(movedA, totalA);
+  const scale = (v: number | undefined, f: number) => Math.round((Number(v) || 0) * f);
+
+  const time: Record<string, number> = {};
+  for (const m of [...ACTIVE_MODES, 'idle'] as TrackingMode[]) {
+    const v = all ? (src.time?.[m] ?? 0) : Math.min(src.time?.[m] ?? 0, movedMode[m]);
+    if (v > 0) time[m] = v;
+  }
+  if (Object.keys(time).length) delta.time = time;
+  stats.activeMs = ACTIVE_MODES.reduce((s, m) => s + (time[m] ?? 0), 0);
+  stats.idleMs = time.idle ?? 0;
+  stats.linesHuman = movedH;
+  stats.linesAi = movedA;
+
+  const lineChanges: Record<string, { human: LineStats; ai: LineStats }> = {};
+  for (const [ext, v] of Object.entries(src.lineChanges ?? {})) {
+    const human = { added: scale(v?.human?.added, fracH), deleted: scale(v?.human?.deleted, fracH) };
+    const ai = { added: scale(v?.ai?.added, fracA), deleted: scale(v?.ai?.deleted, fracA) };
+    if (human.added || human.deleted || ai.added || ai.deleted) lineChanges[ext] = { human, ai };
+  }
+  if (Object.keys(lineChanges).length) delta.lineChanges = lineChanges;
+
+  const effective: Record<string, { human: number; ai: number }> = {};
+  for (const [cat, v] of Object.entries(src.effectiveLines ?? {})) {
+    const e = { human: scale(v?.human, fracH), ai: scale(v?.ai, fracA) };
+    if (e.human || e.ai) effective[cat] = e;
+  }
+  if (Object.keys(effective).length) delta.effectiveLines = effective;
+
+  const candidates = Object.entries(src.files ?? {}).filter(([, f]) => f && (all || (f.lastTs ?? 0) >= fromTs));
+  const fileH = candidates.reduce((s, [, f]) => s + (f.humanAdded ?? 0), 0);
+  const fileA = candidates.reduce((s, [, f]) => s + (f.aiAdded ?? 0), 0);
+  const fh = all ? 1 : fileH > 0 ? Math.min(1, movedH / fileH) : 0;
+  const fa = all ? 1 : fileA > 0 ? Math.min(1, movedA / fileA) : 0;
+  const files: Record<string, FileStat> = {};
+  for (const [p, f] of candidates) {
+    const part: FileStat = {
+      humanAdded: scale(f.humanAdded, fh), humanDeleted: scale(f.humanDeleted, fh),
+      aiAdded: scale(f.aiAdded, fa), aiDeleted: scale(f.aiDeleted, fa),
+      edits: scale(f.edits, Math.max(fh, fa)), lastTs: f.lastTs ?? 0
+    };
+    if (f.effectiveHuman !== undefined) part.effectiveHuman = scale(f.effectiveHuman, fh);
+    if (f.effectiveAi !== undefined) part.effectiveAi = scale(f.effectiveAi, fa);
+    if (f.effectiveCategory) part.effectiveCategory = f.effectiveCategory;
+    if (part.humanAdded || part.humanDeleted || part.aiAdded || part.aiDeleted || part.edits || part.effectiveHuman || part.effectiveAi) files[p] = part;
+  }
+  if (Object.keys(files).length) delta.files = files;
+
+  const counters: [keyof BranchData, number][] = [
+    ['copilotAcceptances', fracA], ['aiCharsInserted', fracA], ['aiInserts', fracA], ['aiInlineLines', fracA],
+    ['aiChatLines', fracA], ['aiInlineChars', fracA], ['aiChatChars', fracA],
+    ['humanCharsInserted', fracH], ['humanKeystrokes', fracH],
+    ['chatCharsHuman', fracT], ['chatTurnsHuman', fracT], ['autoModelRequests', fracT]
+  ];
+  for (const [key, f] of counters) {
+    const v = scale(src[key] as number | undefined, f);
+    if (v > 0) delta[key] = v;
+  }
+
+  const sessions = (src.focusSessions ?? []).filter(s => s && s.ts >= fromTs && s.ts < toTs);
+  if (sessions.length) delta.focusSessions = JSON.parse(JSON.stringify(sessions));
+  stats.focusSessions = sessions.length;
+  return { delta, stats };
+}
+
+/**
+ * Remove `delta` from `dst` without going below zero and return what was
+ * actually removed (#156), so adding the result elsewhere conserves totals.
+ * Array items (focus sessions) are removed once each by value.
+ */
+export function subtractBranchDelta(dst: Record<string, unknown>, delta: Record<string, unknown>): Record<string, unknown> {
+  const removed: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(delta)) {
+    if (FOLD_META.has(k) || k === 'lastTs') continue;
+    const cur = dst[k];
+    if (typeof v === 'number') {
+      if (typeof cur !== 'number') continue;
+      const r = Math.max(0, Math.min(cur, v));
+      if (r) { dst[k] = cur - r; removed[k] = r; }
+    } else if (Array.isArray(v) && numericArray(v)) {
+      if (!numericArray(cur)) continue;
+      const r = v.map((x, i) => Math.max(0, Math.min(cur[i] ?? 0, x)));
+      if (r.some(x => x)) { dst[k] = cur.map((x, i) => x - (r[i] ?? 0)); removed[k] = r; }
+    } else if (Array.isArray(v)) {
+      if (!Array.isArray(cur)) continue;
+      const out: unknown[] = [];
+      for (const item of v) {
+        const i = cur.findIndex(c => isDeepStrictEqual(c, item));
+        if (i >= 0) out.push(cur.splice(i, 1)[0]);
+      }
+      if (out.length) removed[k] = out;
+    } else if (plainObject(v)) {
+      if (!plainObject(cur)) continue;
+      const r = subtractBranchDelta(cur, v);
+      if (Object.keys(r).length) removed[k] = r;
+    }
+  }
+  return removed;
+}
+
+/** Add a removed delta to a branch, creating day buckets and files with their full shape (#156). */
+function addBranchDelta(dst: BranchData, removed: Record<string, unknown>, original: Record<string, unknown>): void {
+  const days = plainObject(removed.daily) ? Object.keys(removed.daily) : [];
+  if (days.length) dst.daily ??= {};
+  for (const day of days) dst.daily![day] ??= emptyBucket();
+  const files = plainObject(removed.files) ? removed.files as Record<string, Record<string, unknown>> : {};
+  const sourceFiles = plainObject(original.files) ? original.files as Record<string, Partial<FileStat>> : {};
+  if (Object.keys(files).length) dst.files ??= {};
+  for (const [p, f] of Object.entries(files)) {
+    dst.files![p] ??= { humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: 0 };
+    const src = sourceFiles[p];
+    if (src?.lastTs) f.lastTs = src.lastTs;
+    if (src?.effectiveCategory && !dst.files![p].effectiveCategory) dst.files![p].effectiveCategory = src.effectiveCategory;
+  }
+  const lines = plainObject(removed.lineChanges) ? Object.keys(removed.lineChanges) : [];
+  if (lines.length) dst.lineChanges ??= {};
+  for (const ext of lines) dst.lineChanges[ext] ??= { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } };
+  foldValue(dst, removed, '');
+}
+
+/**
+ * Move `delta` from `src` to `dst` (#156): subtract (clamped), then add what
+ * was actually removed. Returns the removed amount (the undo payload).
+ */
+export function transferBranchDelta(src: BranchData, dst: BranchData, delta: Record<string, unknown>): Record<string, unknown> {
+  const removed = subtractBranchDelta(src as unknown as Record<string, unknown>, delta);
+  addBranchDelta(dst, removed, delta);
+  return removed;
+}
+
+/** Keys of real (non-tombstone) branches. */
+export function liveBranchKeys(branches: Store): string[] {
+  return Object.keys(branches).filter(k => !branches[k]?.movedTo);
+}
+
 export function newLedgerId(): string {
   try {
     return crypto.randomUUID();
@@ -1288,8 +1837,12 @@ export function migrateStore(parsed: unknown): PersistedStore {
   sanitizeBranchTimeAdjustments(branches);
   // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
   // their legacy credit log is attributed to the resolved/holding work item.
-  assignUnmappedBranches(branches, workItems, extractWorkItemId);
+  const adopted = assignUnmappedBranches(branches, workItems, extractWorkItemId);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
+  relinkAdoptedLedger(adopted, branches, workItems, creditLedger);
+  // #154: late deltas on folded branch keys follow the branch they moved to.
+  foldBranchTombstones({ branches, creditLedger, timeEntries, reassignments });
+  autoTitleWorkItems(branches, workItems);
   const writer = isEnvelope(parsed) && typeof (parsed as PersistedStore).writer === 'string'
     ? (parsed as PersistedStore).writer : undefined;
   return {
@@ -1404,6 +1957,29 @@ export function sanitizeReassignments(input: unknown): ReassignmentRecord[] {
     };
     if (typeof r.note === 'string') rec.note = r.note;
     if (typeof r.batchId === 'string') rec.batchId = r.batchId;
+    if (r.kind === 'move' || r.kind === 'merge' || r.kind === 'move-undo') rec.kind = r.kind;
+    if (typeof r.toBranch === 'string' && r.toBranch) rec.toBranch = r.toBranch;
+    if (r.range && typeof r.range === 'object' && typeof r.range.fromTs === 'number') {
+      rec.range = { fromTs: r.range.fromTs };
+      if (typeof r.range.toTs === 'number') rec.range.toTs = r.range.toTs;
+    }
+    if (typeof r.undoOf === 'string' && r.undoOf) rec.undoOf = r.undoOf;
+    if (r.move && typeof r.move === 'object' && plainObject(r.move.delta)) {
+      rec.move = {
+        delta: r.move.delta,
+        ledger: Array.isArray(r.move.ledger) ? r.move.ledger.filter(x => x && typeof x.id === 'string') : [],
+        timeEntries: Array.isArray(r.move.timeEntries) ? r.move.timeEntries.filter(x => x && typeof x.id === 'string') : [],
+        stats: plainObject(r.move.stats) ? r.move.stats : { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false }
+      };
+    }
+    if (r.merge && typeof r.merge === 'object' && plainObject(r.merge.source) && plainObject(r.merge.target)) {
+      const m = r.merge;
+      const wi = (x: { workItemId?: unknown; manual?: unknown }) => ({ workItemId: typeof x.workItemId === 'string' ? x.workItemId : null, manual: x.manual === true });
+      rec.merge = { source: wi(m.source), target: wi(m.target) };
+      if (plainObject(m.timeAdjustment)) rec.merge.timeAdjustment = m.timeAdjustment;
+      if (plainObject(m.effectiveLegacyBaseline)) rec.merge.effectiveLegacyBaseline = m.effectiveLegacyBaseline;
+      if (Array.isArray(m.creditsLog)) rec.merge.creditsLog = m.creditsLog;
+    }
     out.push(rec);
   }
   return out;
@@ -2074,7 +2650,9 @@ export class Database {
     }
   }
 
-  private ensureBranch(branch: string): BranchData {
+  private ensureBranch(key: string): BranchData {
+    // A folded branch key (#154) keeps receiving late writes on its new key.
+    const branch = this.store[key]?.movedTo ? resolveMovedBranch(this.store, key) ?? key : key;
     if (!this.store[branch]) {
       this.store[branch] = {
         workItemId: null,
@@ -3049,6 +3627,42 @@ export class Database {
    * (see {@link reassignBranchToWorkItem}) this is a no-op so the user's choice
    * survives later auto-detection passes (issue #10).
    */
+  /**
+   * Branches tracked before #154 without a repository (except the reserved
+   * `unknown` bucket). They keep working; {@link assignBranchesToRepo} moves
+   * them under a repository.
+   */
+  getLegacyBranches(): string[] {
+    return liveBranchKeys(this.store)
+      .filter(k => repoOfKey(k) === null && !RESERVED_BRANCH_BUCKETS.has(k))
+      .sort();
+  }
+
+  /**
+   * Move legacy branches under a repository (#154): `main` becomes
+   * `<repoId>::main`, folded into it when that key already has data. Credit,
+   * time-log and reassignment rows follow. Returns the number moved.
+   */
+  assignBranchesToRepo(keys: readonly string[], repoId: string): number {
+    if (!repoId) return 0;
+    const store = { branches: this.store, creditLedger: this.creditLedger, timeEntries: this.timeEntries, reassignments: this.reassignments };
+    let moved = 0;
+    for (const key of keys) {
+      if (repoOfKey(key) !== null || RESERVED_BRANCH_BUCKETS.has(key)) continue;
+      if (moveBranchKey(store, key, branchKey(repoId, key))) moved++;
+    }
+    if (moved) {
+      autoTitleWorkItems(this.store, this.workItems);
+      this.save();
+    }
+    return moved;
+  }
+
+  /** Store key for a full key or plain branch name (unique match or `preferRepo`). */
+  resolveBranch(ref: string, preferRepo?: string | null): string | undefined {
+    return resolveBranchRef(ref, liveBranchKeys(this.store), preferRepo);
+  }
+
   setWorkItemForBranch(branch: string, workItemId: string) {
     const data = this.ensureBranch(branch);
     // Never clobber a manual override with auto-detection.
@@ -3068,6 +3682,7 @@ export class Database {
         }
       }
     }
+    autoTitleWorkItems(this.store, this.workItems);
     this.save();
   }
 
@@ -3136,6 +3751,7 @@ export class Database {
       this.reassignments.push(rec);
       records.push(rec);
     }
+    autoTitleWorkItems(this.store, this.workItems);
     this.save();
     return records;
   }
@@ -3168,8 +3784,407 @@ export class Database {
    */
   getReassignments(branch?: string): ReassignmentRecord[] {
     return this.reassignments
-      .filter(r => branch === undefined || r.branch === branch)
-      .sort((a, b) => b.ts - a.ts);
+      .filter(r => branch === undefined || r.branch === branch || r.toBranch === branch)
+      .sort((a, b) => b.ts - a.ts)
+      // The undo payload stays in the store; callers only need the summary.
+      .map(r => r.move ? { ...r, move: { ...r.move, delta: {} } } : r);
+  }
+
+  private liveKey(key: string): string {
+    return this.store[key]?.movedTo ? resolveMovedBranch(this.store, key) ?? key : key;
+  }
+
+  private planEntryMove(from: string, to: string, opts: EntryMoveOptions) {
+    const f = this.liveKey(from), t = this.liveKey(to);
+    const src = this.store[f];
+    if (!src || src.movedTo || !t || f === t || this.store[t]?.movedTo) return undefined;
+    const fromTs = typeof opts.fromTs === 'number' && Number.isFinite(opts.fromTs) ? Math.max(0, opts.fromTs) : undefined;
+    const toTs = typeof opts.toTs === 'number' && Number.isFinite(opts.toTs) ? opts.toTs : Infinity;
+    const empty: EntryMoveStats = { activeMs: 0, idleMs: 0, linesHuman: 0, linesAi: 0, credits: 0, ledgerRows: 0, timeEntries: 0, focusSessions: 0, days: 0, estimated: false };
+    const { delta, stats } = fromTs !== undefined ? sliceBranchRange(src, fromTs, toTs) : { delta: {}, stats: empty };
+    const inRange = (ts: number) => fromTs !== undefined && ts >= fromTs && ts < toTs;
+    const ids = new Set(opts.ledgerIds ?? []);
+    const ledger = this.creditLedger.filter(e => e.branch === f && (ids.has(e.id) || inRange(e.ts)));
+    const timeEntries = fromTs !== undefined ? this.timeEntries.filter(e => e.branch === f && inRange(timeEntryTs(e))) : [];
+    stats.credits = Math.round(ledger.reduce((s, e) => s + (Number(e.credits) || 0), 0) * 1000) / 1000;
+    stats.ledgerRows = ledger.length;
+    stats.timeEntries = timeEntries.length;
+    return { from: f, to: t, src, fromTs, toTs, delta, stats, ledger, timeEntries };
+  }
+
+  /**
+   * What {@link moveEntries} would move from branch `from` to `to` (#156), or
+   * undefined when the move is not possible (same/unknown branch).
+   */
+  previewEntryMove(from: string, to: string, opts: EntryMoveOptions): EntryMoveStats | undefined {
+    return this.planEntryMove(from, to, opts)?.stats;
+  }
+
+  /**
+   * Move tracked entries of branch `from` to branch `to` (#156): time, lines,
+   * files and focus sessions inside the range, credit ledger rows (by range or
+   * id) and time-log rows. The rows take over the work item of `to`. Writes one
+   * audit row that {@link undoEntryMove} reverses exactly. Returns undefined when
+   * nothing was moved.
+   */
+  moveEntries(from: string, to: string, opts: EntryMoveOptions, note?: string): ReassignmentRecord | undefined {
+    const plan = this.planEntryMove(from, to, opts);
+    if (!plan) return undefined;
+    if (!Object.keys(plan.delta).length && !plan.ledger.length && !plan.timeEntries.length) return undefined;
+    const rec = this.applyEntryMove(plan, 'move', note);
+    autoTitleWorkItems(this.store, this.workItems);
+    this.save();
+    return rec;
+  }
+
+  /** Transfer a planned move and push its audit row; the caller saves. */
+  private applyEntryMove(plan: NonNullable<ReturnType<Database['planEntryMove']>>, kind: 'move' | 'merge', note?: string): ReassignmentRecord {
+    const target = this.ensureBranch(plan.to);
+    const srcWi = plan.src.workItemId ?? null;
+    const dstWi = target.workItemId ?? null;
+    const dstProject = dstWi ? this.workItems[dstWi]?.projectId ?? null : null;
+    const removed = transferBranchDelta(plan.src, target, plan.delta);
+    const ledger = plan.ledger.map(e => {
+      const prev = { id: e.id, workItemId: e.workItemId ?? null, projectId: e.projectId ?? null };
+      e.branch = plan.to;
+      e.workItemId = dstWi;
+      e.projectId = dstProject;
+      return prev;
+    });
+    const timeEntries = plan.timeEntries.map(e => {
+      const prev = { id: e.id, workItemId: e.workItemId ?? null };
+      e.branch = plan.to;
+      if (e.workItemId && e.workItemId === srcWi) {
+        if (dstWi) e.workItemId = dstWi;
+        else delete e.workItemId;
+      }
+      return prev;
+    });
+    const rec: ReassignmentRecord = {
+      id: newLedgerId(),
+      ts: Date.now(),
+      branch: plan.from,
+      fromWorkItemId: srcWi,
+      toWorkItemId: dstWi ?? UNASSIGNED_WORK_ITEM_ID,
+      kind,
+      toBranch: plan.to,
+      move: { delta: removed, ledger, timeEntries, stats: plan.stats }
+    };
+    if (plan.fromTs !== undefined) rec.range = plan.toTs === Infinity ? { fromTs: plan.fromTs } : { fromTs: plan.fromTs, toTs: plan.toTs };
+    if (note && note.trim()) rec.note = note.trim();
+    this.reassignments.push(rec);
+    return rec;
+  }
+
+  /** What {@link mergeBranches} would move (#159), or undefined when not possible. */
+  previewBranchMerge(from: string, to: string): EntryMoveStats | undefined {
+    return this.planEntryMove(from, to, { fromTs: 0 })?.stats;
+  }
+
+  /**
+   * Merge branch `from` into `to` (#159): every entry moves (like
+   * {@link moveEntries} with everything), time adjustments follow, and `from`
+   * becomes a tombstone so later writes to that key land on `to`. The target
+   * adopts the source's work item when it has none. Undo with {@link undoEntryMove}.
+   */
+  mergeBranches(from: string, to: string, note?: string): ReassignmentRecord | undefined {
+    const plan = this.planEntryMove(from, to, { fromTs: 0 });
+    if (!plan) return undefined;
+    const src = plan.src;
+    const target = this.ensureBranch(plan.to);
+    const merge: BranchMergePayload = {
+      source: { workItemId: src.workItemId ?? null, manual: !!src.workItemIdManual },
+      target: { workItemId: target.workItemId ?? null, manual: !!target.workItemIdManual }
+    };
+    const parked = (wi: string | null | undefined, manual?: boolean) => wi == null || (wi === UNASSIGNED_WORK_ITEM_ID && !manual);
+    if (parked(target.workItemId, target.workItemIdManual) && !parked(src.workItemId, src.workItemIdManual)) {
+      target.workItemId = src.workItemId;
+      if (src.workItemIdManual) target.workItemIdManual = true;
+    }
+    const rec = this.applyEntryMove(plan, 'merge', note);
+    const adj = src.timeAdjustment ?? {};
+    if (Object.keys(adj).length) {
+      merge.timeAdjustment = { ...adj };
+      const t = target.timeAdjustment ??= {};
+      for (const [m, v] of Object.entries(adj) as [TrackingMode, number][]) {
+        const sum = (t[m] ?? 0) + (Number(v) || 0);
+        if (sum) t[m] = sum; else delete t[m];
+      }
+      if (!Object.keys(t).length) delete target.timeAdjustment;
+    }
+    if (src.effectiveLegacyBaseline && Object.keys(src.effectiveLegacyBaseline).length) {
+      merge.effectiveLegacyBaseline = JSON.parse(JSON.stringify(src.effectiveLegacyBaseline));
+      target.effectiveLegacyBaseline = foldValue(target.effectiveLegacyBaseline, src.effectiveLegacyBaseline, '') as BranchData['effectiveLegacyBaseline'];
+    }
+    if (src.creditsLog?.length) {
+      merge.creditsLog = JSON.parse(JSON.stringify(src.creditsLog));
+      target.creditsLog = [...(target.creditsLog ?? []), ...JSON.parse(JSON.stringify(src.creditsLog))];
+    }
+    if (src.lineCleanups?.length) {
+      merge.lineCleanups = src.lineCleanups.map(c => c.id);
+      target.lineCleanups = [...(target.lineCleanups ?? []), ...JSON.parse(JSON.stringify(src.lineCleanups))];
+    }
+    rec.merge = merge;
+    this.store[plan.from] = branchTombstone(src, plan.to);
+    autoTitleWorkItems(this.store, this.workItems);
+    this.save();
+    return rec;
+  }
+
+  /**
+   * Revert a {@link moveEntries} (#156): the moved counters go back (clamped
+   * to what the target still has) and moved rows that are still on the target
+   * get their branch and work item back. Returns the `move-undo` audit row.
+   */
+  undoEntryMove(id: string): ReassignmentRecord | undefined {
+    const rec = this.reassignments.find(r => r.id === id && (r.kind === 'move' || r.kind === 'merge'));
+    if (!rec?.move || !rec.toBranch) return undefined;
+    if (this.reassignments.some(r => r.kind === 'move-undo' && r.undoOf === id)) return undefined;
+    // An undone merge (#159) brings its source branch back to life first.
+    const tomb = rec.kind === 'merge' ? this.store[rec.branch] : undefined;
+    const tombTarget = tomb?.movedTo;
+    if (tomb) delete tomb.movedTo;
+    const from = this.liveKey(rec.branch), to = this.liveKey(rec.toBranch);
+    const target = this.store[to];
+    if (!target || from === to) {
+      if (tomb && tombTarget) tomb.movedTo = tombTarget;
+      return undefined;
+    }
+    const source = this.ensureBranch(from);
+    transferBranchDelta(target, source, rec.move.delta);
+    const m = rec.merge;
+    if (m) {
+      if (m.timeAdjustment && Object.keys(m.timeAdjustment).length) {
+        const t = target.timeAdjustment ?? {};
+        for (const [mode, v] of Object.entries(m.timeAdjustment) as [TrackingMode, number][]) {
+          const rest = (t[mode] ?? 0) - (Number(v) || 0);
+          if (rest) t[mode] = rest; else delete t[mode];
+        }
+        if (Object.keys(t).length) target.timeAdjustment = t; else delete target.timeAdjustment;
+        source.timeAdjustment = { ...m.timeAdjustment };
+      }
+      if (m.effectiveLegacyBaseline) {
+        if (target.effectiveLegacyBaseline) subtractBranchDelta(target.effectiveLegacyBaseline, m.effectiveLegacyBaseline);
+        source.effectiveLegacyBaseline = JSON.parse(JSON.stringify(m.effectiveLegacyBaseline));
+      }
+      if (m.creditsLog?.length) {
+        const log = target.creditsLog ?? [];
+        for (const c of m.creditsLog) {
+          const i = log.findIndex(x => isDeepStrictEqual(x, c));
+          if (i >= 0) log.splice(i, 1);
+        }
+        if (log.length) target.creditsLog = log; else delete target.creditsLog;
+        source.creditsLog = JSON.parse(JSON.stringify(m.creditsLog));
+      }
+      if (m.lineCleanups?.length) {
+        const ids = new Set(m.lineCleanups);
+        const back = (target.lineCleanups ?? []).filter(c => ids.has(c.id));
+        const keep = (target.lineCleanups ?? []).filter(c => !ids.has(c.id));
+        if (keep.length) target.lineCleanups = keep; else delete target.lineCleanups;
+        if (back.length) source.lineCleanups = [...(source.lineCleanups ?? []), ...back];
+      }
+      source.workItemId = m.source.workItemId;
+      if (m.source.manual) source.workItemIdManual = true; else delete source.workItemIdManual;
+      if (target.workItemId !== m.target.workItemId && target.workItemId === m.source.workItemId) {
+        target.workItemId = m.target.workItemId;
+        if (m.target.manual) target.workItemIdManual = true; else delete target.workItemIdManual;
+      }
+    }
+    for (const prev of rec.move.ledger) {
+      const e = this.creditLedger.find(x => x.id === prev.id);
+      if (!e || e.branch !== to) continue;
+      e.branch = from;
+      e.workItemId = prev.workItemId;
+      e.projectId = prev.projectId;
+    }
+    for (const prev of rec.move.timeEntries) {
+      const e = this.timeEntries.find(x => x.id === prev.id);
+      if (!e || e.branch !== to) continue;
+      e.branch = from;
+      if (prev.workItemId) e.workItemId = prev.workItemId;
+      else delete e.workItemId;
+    }
+    const undo: ReassignmentRecord = {
+      id: newLedgerId(),
+      ts: Date.now(),
+      branch: to,
+      fromWorkItemId: target.workItemId ?? null,
+      toWorkItemId: source.workItemId ?? UNASSIGNED_WORK_ITEM_ID,
+      kind: 'move-undo',
+      toBranch: from,
+      undoOf: id
+    };
+    this.reassignments.push(undo);
+    autoTitleWorkItems(this.store, this.workItems);
+    this.save();
+    return undo;
+  }
+
+  /** Entry moves (#156) and branch merges (#159), newest first, with whether each was undone. */
+  getEntryMoves(): (ReassignmentRecord & { undone: boolean })[] {
+    const undone = new Set(this.reassignments.filter(r => r.kind === 'move-undo' && r.undoOf).map(r => r.undoOf));
+    return this.getReassignments()
+      .filter(r => r.kind === 'move' || r.kind === 'merge')
+      .map(r => ({ ...r, undone: undone.has(r.id) }));
+  }
+
+  /** Files whose AI line churn is implausible (#160), biggest first. */
+  getLineChurnOutliers(): ChurnOutlier[] {
+    return findChurnOutliers(this.store);
+  }
+
+  /**
+   * Recount implausible AI line churn (#160) on every live branch: file stats,
+   * ext and effective counters and the daily AI lines drop to the diff-based
+   * count. Each branch keeps a {@link LineCleanup} record so
+   * {@link undoLineCleanup} restores the exact numbers. Returns the batch id
+   * and what was removed, or undefined when nothing needed fixing.
+   */
+  fixLineChurn(): { batchId: string; files: number; branches: number; lines: number } | undefined {
+    const outliers = findChurnOutliers(this.store);
+    if (!outliers.length) return undefined;
+    const batchId = newLedgerId();
+    const ts = Date.now();
+    const byBranch = new Map<string, ChurnOutlier[]>();
+    for (const o of outliers) byBranch.set(o.branch, [...(byBranch.get(o.branch) ?? []), o]);
+    let lines = 0;
+    for (const [branch, list] of byBranch) {
+      const data = this.store[branch];
+      const rec: LineCleanup = { id: newLedgerId(), ts, batchId, files: [], days: [] };
+      const addedByCat = new Map<string, number>();
+      for (const o of list) {
+        const f = data.files![o.path];
+        const ext = getFileExt(o.path);
+        const category = categorize(o.path);
+        const effCategory = f.effectiveCategory ?? category;
+        const aiAdded = Math.max(0, f.aiAdded - o.after.aiAdded);
+        const aiDeleted = Math.max(0, f.aiDeleted - o.after.aiDeleted);
+        const effectiveAi = Math.max(0, (f.effectiveAi ?? 0) - o.after.effectiveAi);
+        f.aiAdded -= aiAdded;
+        f.aiDeleted -= aiDeleted;
+        if (effectiveAi) f.effectiveAi = (f.effectiveAi ?? 0) - effectiveAi;
+        const lc = data.lineChanges[ext]?.ai;
+        const lineAdded = lc ? Math.min(Math.max(0, lc.added), aiAdded) : 0;
+        const lineDeleted = lc ? Math.min(Math.max(0, lc.deleted), aiDeleted) : 0;
+        if (lc) { lc.added -= lineAdded; lc.deleted -= lineDeleted; }
+        const eb = data.effectiveLines?.[effCategory];
+        const effective = eb ? Math.min(Math.max(0, eb.ai), effectiveAi) : 0;
+        if (eb) eb.ai -= effective;
+        rec.files.push({ path: o.path, ext, category, effCategory, aiAdded, aiDeleted, effectiveAi, lineAdded, lineDeleted, effective });
+        addedByCat.set(category, (addedByCat.get(category) ?? 0) + aiAdded);
+        lines += aiAdded + aiDeleted;
+      }
+      const daily = data.daily ?? {};
+      for (const [category, amount] of addedByCat) {
+        const take = (day: string, part: number) => {
+          const b = daily[day];
+          const linesAi = Math.min(Math.max(0, b.linesAi), part);
+          b.linesAi -= linesAi;
+          const c = b.linesByCategory?.[category];
+          const categoryAi = c ? Math.min(Math.max(0, c.ai), part) : 0;
+          if (c) c.ai -= categoryAi;
+          let translation = 0;
+          if (category === 'translation' && b.linesAiTranslation !== undefined) {
+            translation = Math.min(Math.max(0, b.linesAiTranslation), part);
+            b.linesAiTranslation -= translation;
+          }
+          if (linesAi || categoryAi || translation) rec.days.push({ day, category, linesAi, categoryAi, translation });
+          return linesAi;
+        };
+        const withCat: Record<string, number> = {};
+        for (const [day, b] of Object.entries(daily)) {
+          const c = b.linesByCategory?.[category]?.ai ?? 0;
+          if (c > 0 && b.linesAi > 0) withCat[day] = Math.min(c, b.linesAi);
+        }
+        let left = amount;
+        for (const [day, part] of Object.entries(distribute(left, withCat))) left -= take(day, part);
+        if (left > 0) {
+          const legacy: Record<string, number> = {};
+          for (const [day, b] of Object.entries(daily)) if (!b.linesByCategory && b.linesAi > 0) legacy[day] = b.linesAi;
+          for (const [day, part] of Object.entries(distribute(left, legacy))) left -= take(day, part);
+        }
+      }
+      (data.lineCleanups ??= []).push(rec);
+    }
+    this.save();
+    return { batchId, files: outliers.length, branches: byBranch.size, lines };
+  }
+
+  /** Line recounts (#160), newest first, one row per run. */
+  getLineCleanups(): { batchId: string; ts: number; files: number; branches: number; lines: number }[] {
+    const out = new Map<string, { batchId: string; ts: number; files: number; branches: number; lines: number }>();
+    for (const data of Object.values(this.store)) {
+      for (const c of data?.lineCleanups ?? []) {
+        const row = out.get(c.batchId) ?? { batchId: c.batchId, ts: c.ts, files: 0, branches: 0, lines: 0 };
+        row.branches++;
+        row.files += c.files.length;
+        row.lines += c.files.reduce((n, f) => n + f.aiAdded + f.aiDeleted, 0);
+        out.set(c.batchId, row);
+      }
+    }
+    return [...out.values()].sort((a, b) => b.ts - a.ts);
+  }
+
+  /** Put back what a line recount (#160) removed, by batch id or record id. Returns the records undone. */
+  undoLineCleanup(batchOrId: string): number {
+    let n = 0;
+    for (const [key, holder] of Object.entries(this.store)) {
+      const recs = (holder?.lineCleanups ?? []).filter(c => c.batchId === batchOrId || c.id === batchOrId);
+      if (!recs.length) continue;
+      const data = this.store[this.liveKey(key)] ?? holder;
+      for (const rec of recs) {
+        for (const f of rec.files) {
+          data.files ??= {};
+          const file = (data.files[f.path] ??= { humanAdded: 0, humanDeleted: 0, aiAdded: 0, aiDeleted: 0, edits: 0, lastTs: rec.ts });
+          file.aiAdded += f.aiAdded;
+          file.aiDeleted += f.aiDeleted;
+          if (f.effectiveAi) file.effectiveAi = (file.effectiveAi ?? 0) + f.effectiveAi;
+          if (f.lineAdded || f.lineDeleted) {
+            const lc = (data.lineChanges[f.ext] ??= { human: { added: 0, deleted: 0 }, ai: { added: 0, deleted: 0 } });
+            lc.ai.added += f.lineAdded;
+            lc.ai.deleted += f.lineDeleted;
+          }
+          if (f.effective) {
+            const eb = ((data.effectiveLines ??= {})[f.effCategory] ??= { human: 0, ai: 0 });
+            eb.ai += f.effective;
+          }
+        }
+        for (const d of rec.days) {
+          const b = data.daily?.[d.day] ?? this.ensureBucket(data, d.day);
+          b.linesAi += d.linesAi;
+          if (d.categoryAi) ((b.linesByCategory ??= {})[d.category] ??= { human: 0, ai: 0 }).ai += d.categoryAi;
+          if (d.translation) b.linesAiTranslation = (b.linesAiTranslation ?? 0) + d.translation;
+        }
+        n++;
+      }
+      const keep = (holder.lineCleanups ?? []).filter(c => !recs.includes(c));
+      if (keep.length) holder.lineCleanups = keep; else delete holder.lineCleanups;
+    }
+    if (n) this.save();
+    return n;
+  }
+
+  /** Live branches of the same repository whose names differ only by case (#159). */
+  getCaseVariantBranches(): string[][] {
+    return caseVariantBranchGroups(liveBranchKeys(this.store));
+  }
+
+  /**
+   * The store key to record a checked-out branch under: a merged/folded key
+   * resolves to where its data lives now, and with `caseInsensitive` (Windows
+   * and macOS file systems) an unknown key adopts the casing of an existing
+   * branch of the same repository (#159).
+   */
+  canonicalBranchKey(key: string, caseInsensitive = false): string {
+    const live = this.liveKey(key);
+    if (!caseInsensitive || this.store[live]) return live;
+    const { repoId, name } = parseBranchKey(live);
+    const lower = name.toLowerCase();
+    const match = liveBranchKeys(this.store).find(k => {
+      const p = parseBranchKey(k);
+      return p.repoId === repoId && p.name.toLowerCase() === lower;
+    });
+    return match ?? live;
   }
 
   /** The work item id currently mapped to a branch (or null). */
@@ -3212,7 +4227,12 @@ export class Database {
     fields: Partial<Omit<WorkItem, 'id' | 'createdAt'>> = {}
   ): WorkItem {
     const wi = this.ensureWorkItem(id);
-    if (fields.title !== undefined) wi.title = fields.title;
+    if (fields.title !== undefined) {
+      wi.title = fields.title;
+      // A title typed by the user is sticky; an empty one may be derived again.
+      if (fields.titleAuto) wi.titleAuto = true; else delete wi.titleAuto;
+      if (wi.title == null) autoTitleWorkItems(this.store, { [id]: wi });
+    }
     if (fields.projectId !== undefined) wi.projectId = fields.projectId;
     if (fields.estimate !== undefined) wi.estimate = fields.estimate;
     if (fields.externalRef !== undefined) wi.externalRef = fields.externalRef;
@@ -3336,7 +4356,7 @@ export class Database {
       return { branches: 0, ledger: 0, manualEffort: 0, timeEntries: 0 };
     }
     return {
-      branches: Object.keys(this.store).filter(b => this.store[b].workItemId === id).length,
+      branches: liveBranchKeys(this.store).filter(b => this.store[b].workItemId === id).length,
       ledger: this.creditLedger.filter(e => (e.workItemId ?? null) === id).length,
       manualEffort: this.manualEffort.filter(m => m.workItemId === id).length,
       timeEntries: this.timeEntries.filter(t => (t.workItemId ?? null) === id).length
@@ -3398,7 +4418,7 @@ export class Database {
 
   /** Branch names that currently roll up into the given work item. */
   private getBranchesForWorkItem(workItemId: string): string[] {
-    return Object.keys(this.store)
+    return liveBranchKeys(this.store)
       .filter(b => this.store[b].workItemId === workItemId)
       .sort();
   }
@@ -3446,6 +4466,7 @@ export class Database {
     return {
       workItemId: wi.id,
       title: wi.title ?? null,
+      ...(wi.titleAuto ? { titleAuto: true } : {}),
       projectId: wi.projectId ?? null,
       // `estimate` is the canonical TOTAL: sum of the breakdown when present,
       // otherwise the scalar (issue #16).
@@ -3886,6 +4907,7 @@ export class Database {
     const billableMs = eff.humanCoding + eff.aiGenerating + eff.reviewing;
     return {
       branch,
+      ...parseBranchKey(branch),
       workItemId: data.workItemId,
       humanCodingMs: eff.humanCoding,
       aiGeneratingMs: eff.aiGenerating,
@@ -3927,7 +4949,7 @@ export class Database {
   }
 
   getAllBranches(): string[] {
-    return Object.keys(this.store).sort();
+    return liveBranchKeys(this.store).sort();
   }
 
   getAllBranchesSummaries(): BranchSummary[] {
@@ -4320,7 +5342,7 @@ export class Database {
   /** Branch names that roll up into a project via its work items (sorted, deduped). */
   private getBranchesForProject(projectId: string): string[] {
     const wiIds = new Set(this.getWorkItemIdsForProject(projectId));
-    return Object.keys(this.store)
+    return liveBranchKeys(this.store)
       .filter(b => {
         const id = this.store[b].workItemId;
         return !!id && wiIds.has(id);
@@ -4350,6 +5372,7 @@ export class Database {
       credits,
       roi: this.computeProjectRoi(projectId, rollup, credits),
       confidence: this.confidenceFor(branches, workItemIds, projectId, credits),
+      repoBreakdown: buildRepoOverview(branches.map(b => this.getSummaryForBranch(b)), [], { includeRepos: project?.repos }),
       ...rollup
     };
   }

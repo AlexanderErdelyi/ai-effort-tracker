@@ -53,7 +53,7 @@ export async function newChatWithHandoff(db: Database, context: vscode.Extension
     commits: await GitTracker.getRecentCommits(5),
     firstPrompt: first,
     lastPrompt: last,
-    workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    workspaceRoot: GitTracker.activeFolder()
   });
 
   await vscode.env.clipboard.writeText(handoff.prompt);

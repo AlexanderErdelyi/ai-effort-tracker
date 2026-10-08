@@ -14,7 +14,7 @@
 | ☕ Idle time | No activity |
 | Lines: Human vs AI | Copilot accepted completions |
 | Estimated AI cost | Accepted lines × model rate |
-| Work item linkage | Branch name pattern (`feature/1234-...`) |
+| Work item linkage | Branch name pattern (`feature/1234-...`, `#1234-...`, `AB#1234_...`). New items take their title from the branch (shown as "from branch") until you rename them (✎ or *Rename Work Item*) |
 
 ## Usage
 
@@ -32,6 +32,13 @@
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
+| `AI Effort Tracker: Link Current Repo to Project` | Adds the open repository to a project; a project can have several (see [Repositories](#repositories)) |
+| `AI Effort Tracker: Unlink Repository from Project` | Removes a repository from a project after confirmation. Tracked data is kept |
+| `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
+| `AI Effort Tracker: Move Entries to Another Branch` | Moves time, lines and credits of a time range (or chosen ledger rows) from one branch to another, e.g. work done on `main` before the feature branch existed (see [Moving entries between branches](#moving-entries-between-branches)) |
+| `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back, or splits a merged branch out again |
+| `AI Effort Tracker: Merge Branch Into Another…` | Merges all data of a duplicate branch (e.g. same name, different case) into another branch (see [Merging duplicate branches](#merging-duplicate-branches)) |
+| `AI Effort Tracker: Undo Line Recount` | Restores the AI line counts a data-health **Recount lines** removed (see [Line-count guard rails](#line-count-guard-rails)) |
 | `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
 | `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
 | `AI Effort Tracker: Reveal Data Folder` | Open the folder where the data is stored |
@@ -46,6 +53,7 @@ Every setting can be changed in the dashboard's **⚙ Settings** tab (see [Setti
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `aiEffortTracker.idleThresholdSeconds` | `120` | Seconds before switching to idle |
+| `aiEffortTracker.lines.exclude` | lock files, generated output | Globs of files whose changed lines are never counted (see [Line-count guard rails](#line-count-guard-rails)) |
 | `aiEffortTracker.reviewThresholdSeconds` | `10` | Seconds of no-keystroke before switching to review |
 | `aiEffortTracker.azureDevOpsOrg` | `""` | AzDO org URL for work item lookup |
 | `aiEffortTracker.githubToken` | `""` | Legacy plain-text GitHub PAT. Prefer **⚙ Settings → Integrations → Set token**, which keeps it in VS Code secure storage |
@@ -106,19 +114,22 @@ which sections are open is remembered.
 ### Filter everything at once
 
 A filter bar above the tabs sets one date range (7, 30 or 90 days, this
-billing period, all time, or custom dates), one project (or "No project") and
-one work item. Every tab reads the same filter, so switching tabs keeps your
+billing period, all time, or custom dates), one project (or "No project"),
+one work item and one repository. Every tab reads the same filter, so switching tabs keeps your
 selection, and it survives reloads. Chips show what is active; **Clear** goes
-back to 30 days, all projects.
+back to 30 days, all projects and repositories.
 
 Some tabs use only part of it, and a short note on the bar says so:
 
 - Overview: the KPI cards keep their fixed windows (today, 7 days, period) and
-  branch totals are all-time, but both follow the project and work item. The
-  budget always covers all projects.
-- Trends is not split by project; only the date range applies.
-- Estimates ignore the date range; accuracy uses every finished work item.
+  repository and branch totals are all-time, but they follow the project, work
+  item and repository. The budget always covers all projects.
+- Trends is not split by project or repository; only the date range applies.
+- Estimates ignore the date range and the repository; accuracy uses every
+  finished work item.
 - Timesheet keeps its week buttons and only applies the project and work item.
+- Branches tracked before repositories were recorded are under
+  "Unknown repository" in the repository filter.
 - Correction episodes without a work item count as "No project".
 
 ## Branch changes and tracked time
@@ -132,6 +143,81 @@ Branch detection polls Git every five seconds. Polls do not overlap, and results
 received after the tracker is disposed are ignored. Time attribution follows the
 detected transition, so changes between polls can still have up to one polling
 interval of attribution uncertainty. Sleep/stall gaps are not counted as work.
+
+### Branches per repository
+
+Branches are tracked per repository, so `main` in two repositories stays two
+branches. The dashboard shows the repository name next to each branch. In a
+multi-root workspace the repository is the one that contains the active editor's
+file; without an open file it is the last used folder.
+
+Branches tracked before this change have no repository. They keep their totals
+and still work everywhere. Once, the extension offers to assign them to the
+current repository; **AI Effort Tracker: Assign Older Branches to a Repository**
+lets you choose branches and the repository at any time. If the repository
+already has that branch, the totals are added together. Credit, time-log and
+reassignment rows move along, and nothing is merged automatically.
+
+### Moving entries between branches
+
+Work often starts on `main` (a call, a new user story, the spec) before the
+feature branch exists. **AI Effort Tracker: Move Entries to Another Branch**
+(or **⇄ Move entries to another branch…** on a branch's detail page) moves
+what was tracked on one branch to another: pick the target branch and the
+range — *Today*, *Today since HH:MM*, *Since a date* or *Everything*. A preview
+shows the active time, lines, credits and time-log rows before anything moves.
+
+- Daily time, lines, credits, chat counters and focus sessions move along.
+  When the range starts mid-day, that day is split by hour and its lines and
+  counters move proportionally (the preview says so).
+- Credit and time-log rows take over the target branch's work item.
+- In the **Credit Ledger** you can tick single rows and use
+  **⇄ Move selected to branch…** to move only those credits.
+- When you switch to a branch with nothing tracked yet and the previous branch
+  of the same repository has work from today, the extension offers to **move
+  today's entries** to the new branch (or from a start time you choose). Turn this off
+  with `aiEffortTracker.branches.offerMoveOnNewBranch`.
+- Every move is listed under **Entry moves** on the branch page and in the work
+  item's Reassignment History. **↺ Undo** (or **AI Effort Tracker: Undo Entry
+  Move**) moves exactly the same amounts back.
+
+### Merging duplicate branches
+
+Git branch names are case-sensitive, but on Windows and macOS the same branch
+can show up as `UAT-Integration` and `UAT-integration`. **Data health** flags
+branches of the same repository whose names differ only in case (branches with
+the same name in different repositories are never flagged) and offers
+**Merge**. You can also use **AI Effort Tracker: Merge Branch Into Another…** or
+**⧉ Merge into another branch…** on a branch's detail page.
+
+- Everything of the source branch moves to the target: daily time, lines,
+  credits, counters, focus sessions, ledger and time-log rows, manual time
+  adjustments and the credit log. The source disappears from the branch list.
+- If the target has no work item yet, it takes over the source's work item.
+- Activity that arrives later under the old name (for example from another
+  VS Code window) is added to the target.
+- On Windows and macOS, switching to a branch whose name only differs in case
+  from a tracked branch of the same repository keeps tracking on the existing
+  branch instead of creating a duplicate.
+- Merges are listed under **Entry moves**. **↺ Undo** (or **AI Effort Tracker:
+  Undo Entry Move**) splits the branch out again, including its work item.
+
+### Repositories
+
+The Overview has a **Repositories** section above the branches. Each row is one
+repository with its projects, branch count, active time, lines, credits and
+cost; the totals are the sum of its branches. Click a row to see its branches,
+and click a branch for its details. **Filter** narrows every tab to that
+repository, and **🔗 Project** links it to a project. The "Unknown repository"
+row holds older branches and offers **Assign to a repository…**.
+
+A project can have several repositories. The project page lists each linked
+repository with its totals, plus repositories where the project's branches ran
+but which are not linked yet (marked "not linked", with a **Link** button).
+**Unlink** removes a repository from the project; no tracked data is deleted.
+
+The MCP tools' `branch` filter accepts a plain name (all repositories) or the
+full key shown in tool results.
 
 ## Shared storage and recovery
 
@@ -494,6 +580,27 @@ estimate, projects without rates, unpriced requests and models without prices,
 future timestamps and implausible days. Most findings have a one-click fix or a
 button that opens the right command. Copilot can read the report through the MCP
 tool `data_health`.
+
+### Line-count guard rails
+
+Some edits replace a whole document: git checkout, pull, merge or reset reloads
+open files, translation files (`.xlf`) are regenerated, and agents sometimes
+rewrite a whole file. Counted line by line, each looked like thousands of AI lines.
+
+- Edits that touch 200 or more lines are recounted with a real diff, so only
+  lines that really changed count (an unchanged rewrite counts nothing).
+- A clean (not dirty) reload while git rewrites the working tree (within 30 s of a
+  checkout, pull, merge, reset or rebase, or while `index.lock` exists) is not
+  counted at all. Commits don't count as such an operation.
+- Files matching `aiEffortTracker.lines.exclude` (default: lock files, `*.min.js`,
+  `*.map`, `node_modules`, `out`, `dist`, `*.g.xlf`) never count lines; editing
+  them still counts as activity time.
+- Data health flags files whose stored AI lines are implausible: at least 2,000
+  AI lines added + deleted and 200 or more per edit. **Recount lines** replaces the
+  raw count with the diff-based effective count (or drops it when that is also
+  implausible, more than 1,000 per edit), on the file, branch and daily totals.
+  **Undo** in the message, or **AI Effort Tracker: Undo Line Recount**, puts the
+  exact numbers back.
 
 ## Code review tracking
 

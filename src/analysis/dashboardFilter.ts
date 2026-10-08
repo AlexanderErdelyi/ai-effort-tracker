@@ -1,9 +1,11 @@
 /**
  * Global dashboard filter (issue #146): one date range + project + work item
- * that every tab reads. Pure: no vscode import, `now` is injected.
+ * (+ repository, #155) that every tab reads. Pure: no vscode import, `now` is
+ * injected.
  */
 
 import { billingPeriod } from './creditOverview';
+import { repoMatches } from '../util/branchKey';
 
 export type FilterRange = '7' | '30' | '90' | 'period' | 'all' | 'custom';
 
@@ -17,17 +19,19 @@ export interface DashboardFilter {
   projectId: string;
   /** Work item id, '' for all. */
   workItemId: string;
+  /** Repository id, '__legacy__' for branches without a repository, '' for all (#155). */
+  repoId: string;
 }
 
 export const NO_PROJECT = '__none__';
 
-export const DEFAULT_FILTER: DashboardFilter = { range: '30', from: '', to: '', projectId: '', workItemId: '' };
+export const DEFAULT_FILTER: DashboardFilter = { range: '30', from: '', to: '', projectId: '', workItemId: '', repoId: '' };
 
 const RANGES: FilterRange[] = ['7', '30', '90', 'period', 'all', 'custom'];
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function str(v: unknown): string {
-  return typeof v === 'string' ? v.trim().slice(0, 200) : '';
+function str(v: unknown, max = 200): string {
+  return typeof v === 'string' ? v.trim().slice(0, max) : '';
 }
 
 function day(v: unknown): string {
@@ -45,7 +49,7 @@ export function normalizeFilter(raw: unknown): DashboardFilter {
     else if (from && to && from > to) [from, to] = [to, from];
   }
   if (range !== 'custom') { from = ''; to = ''; }
-  return { range, from, to, projectId: str(r.projectId), workItemId: str(r.workItemId) };
+  return { range, from, to, projectId: str(r.projectId), workItemId: str(r.workItemId), repoId: str(r.repoId, 1000) };
 }
 
 /** Local midnight of a YYYY-MM-DD day. */
@@ -87,8 +91,12 @@ export function inWindow(ts: number, w: { from?: number; to?: number }): boolean
   return (w.from === undefined || ts >= w.from) && (w.to === undefined || ts < w.to);
 }
 
-/** True when an entry's project / work item matches the filter's scope. */
-export function matchesScope(e: { projectId?: string | null; workItemId?: string | null }, f: DashboardFilter): boolean {
+/**
+ * True when an entry's project / work item (and branch's repository, #155)
+ * match the filter's scope. Rows without a branch only match the legacy repo.
+ */
+export function matchesScope(e: { projectId?: string | null; workItemId?: string | null; branch?: string | null }, f: DashboardFilter): boolean {
+  if (f.repoId && !repoMatches(e.branch, f.repoId)) return false;
   if (f.workItemId && (e.workItemId ?? '') !== f.workItemId) return false;
   if (f.projectId === NO_PROJECT) return !e.projectId;
   if (f.projectId && (e.projectId ?? '') !== f.projectId) return false;
@@ -96,5 +104,5 @@ export function matchesScope(e: { projectId?: string | null; workItemId?: string
 }
 
 export function isScoped(f: DashboardFilter): boolean {
-  return !!(f.projectId || f.workItemId);
+  return !!(f.projectId || f.workItemId || f.repoId);
 }

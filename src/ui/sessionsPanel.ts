@@ -37,6 +37,7 @@ export function parseSessionQuery(m: Msg): SessionQuery {
     ...(to !== undefined ? { to } : {}),
     ...(str(m.workItemId) ? { workItemId: str(m.workItemId) } : {}),
     ...(str(m.projectId) ? { projectId: str(m.projectId) } : {}),
+    ...(str(m.repoId) ? { repoId: str(m.repoId) } : {}),
     ...(str(m.branch) ? { branch: str(m.branch) } : {})
   };
   const sort = SORT_KEYS.includes(m.sort as SessionSortKey) ? m.sort as SessionSortKey : 'end';

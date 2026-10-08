@@ -5,6 +5,7 @@ import type { NetLineChange } from '../trackers/gitTracker';
 import type { CreditOverview } from '../analysis/creditOverview';
 import type { CalendarData } from '../analysis/calendar';
 import { DEFAULT_FILTER, type DashboardFilter } from '../analysis/dashboardFilter';
+import type { RepoRow } from '../analysis/repoOverview';
 
 export interface InsightsConfig {
   baselineLocPerMinute: number;
@@ -44,7 +45,8 @@ export function renderDashboardHtml(
   manualEffort: ManualEffortEntry[] = [],
   reassignments: ReassignmentRecord[] = [],
   netChange: NetLineChange | null = null,
-  filter: DashboardFilter = DEFAULT_FILTER
+  filter: DashboardFilter = DEFAULT_FILTER,
+  repos: RepoRow[] = []
 ): string {
   const data = JSON.stringify(summaries);
   const gfData = JSON.stringify(filter).replace(/</g, '\\u003c');
@@ -60,6 +62,7 @@ export function renderDashboardHtml(
   const meData = JSON.stringify(manualEffort);
   const reData = JSON.stringify(reassignments);
   const netData = JSON.stringify(netChange);
+  const repoData = JSON.stringify(repos).replace(/</g, '\\u003c');
 
   // CSS and HTML are built with string concatenation to avoid backtick nesting issues.
   const css = `
@@ -101,6 +104,7 @@ export function renderDashboardHtml(
   .bh{background:rgba(78,201,176,.2);color:var(--human);}
   .bp{background:rgba(78,201,176,.15);color:var(--added);}
   .bd{background:rgba(244,113,116,.15);color:var(--deleted);}
+  .brepo{background:var(--surface-2);color:var(--muted);margin-left:6px;font-weight:normal;}
   .mb{display:flex;height:6px;border-radius:3px;overflow:hidden;width:80px;}
   .mb span{display:block;}
   .sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px;}
@@ -272,18 +276,20 @@ let ME=${meData};
 let RE=${reData};
 let NET=${netData};
 let GF=${gfData};
+let REPOS=${repoData};
+var repoOpen={};
 const charts={};
 
-// #146 Global filter bar: one date range + project + work item for every tab.
+// #146 Global filter bar: one date range + project + work item (+ repository, #155) for every tab.
 var GF_NOTE={
-  overview:'Credits follow the date range, project and work item. Branch totals follow the project and work item but are all-time; streak and week figures are never filtered.',
-  trends:'Follows the date range. Daily activity is not split by project or work item.',
-  ledger:'Follows the date range, project and work item.',
-  optimize:'Follows the date range, project and work item.',
-  sessions:'Follows the date range, project and work item.',
-  estimates:'Follows the project and work item. The date range does not apply: accuracy uses every finished item.',
-  timesheet:'Follows the project and work item. Use the week buttons for dates.',
-  corrections:'Follows the date range, project and work item (episodes without a work item count as \u201cNo project\u201d).'
+  overview:'Credits follow the date range, project, work item and repository. Repository and branch totals follow the project, work item and repository but are all-time; streak and week figures are never filtered.',
+  trends:'Follows the date range. Daily activity is not split by project, work item or repository.',
+  ledger:'Follows the date range, project, work item and repository.',
+  optimize:'Follows the date range, project, work item and repository.',
+  sessions:'Follows the date range, project, work item and repository.',
+  estimates:'Follows the project and work item. The date range and repository do not apply: accuracy uses every finished item.',
+  timesheet:'Follows the project and work item, not the repository. Use the week buttons for dates.',
+  corrections:'Follows the date range, project, work item and repository (episodes without a work item count as \u201cNo project\u201d).'
 };
 function gfIso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function gfDayOf(ts){var d=new Date(ts);return isNaN(d.getTime())?'':gfIso(d);}
@@ -302,8 +308,10 @@ function gfScope(pid,wid){
   var p=pid||gfProjOf(wid);
   return GF.projectId==='__none__'?!p:p===GF.projectId;
 }
-function gfActive(){return GF.range!=='30'||!!GF.projectId||!!GF.workItemId;}
-function gfQuery(){var w=gfWindow(),q={};if(w.from)q.from=w.from;else q.days=3650;if(w.to)q.to=w.to;if(GF.projectId)q.projectId=GF.projectId;if(GF.workItemId)q.workItemId=GF.workItemId;return q;}
+function gfRepoOk(k){if(!GF.repoId)return true;var r=k?bkRepo(k):'';return GF.repoId==='__legacy__'?!r:r===GF.repoId;}
+function gfRepoName(id){if(id==='__legacy__')return'Unknown repository';var r=(REPOS||[]).find(function(x){return x.repoId===id;});return r?r.label:(brepo(id+'::x')||id);}
+function gfActive(){return GF.range!=='30'||!!GF.projectId||!!GF.workItemId||!!GF.repoId;}
+function gfQuery(){var w=gfWindow(),q={};if(w.from)q.from=w.from;else q.days=3650;if(w.to)q.to=w.to;if(GF.projectId)q.projectId=GF.projectId;if(GF.workItemId)q.workItemId=GF.workItemId;if(GF.repoId)q.repoId=GF.repoId;return q;}
 function gfRangeLabel(){
   var L={'7':'Last 7 days','30':'Last 30 days','90':'Last 90 days','period':'This billing period','all':'All time'};
   if(GF.range!=='custom')return L[GF.range]||GF.range;
@@ -323,18 +331,23 @@ function renderFilterBar(){
     .concat(['<option value="__none__"'+(GF.projectId==='__none__'?' selected':'')+'>No project</option>']).join('');
   var wis=(WI||[]).filter(function(w){var p=w.projectId||'';return!GF.projectId||(GF.projectId==='__none__'?!p:p===GF.projectId)||String(w.workItemId)===GF.workItemId;});
   var wo=['<option value="">All work items</option>'].concat(wis.map(function(w){return'<option value="'+esc(w.workItemId)+'"'+(String(w.workItemId)===GF.workItemId?' selected':'')+'>'+esc(gfWiName(w.workItemId))+'</option>';})).join('');
+  var rl=(REPOS||[]).map(function(r){return r.repoId;});if(GF.repoId&&rl.indexOf(GF.repoId)<0)rl.push(GF.repoId);
+  var rdup={};rl.forEach(function(id){var n=gfRepoName(id);rdup[n]=(rdup[n]||0)+1;});
+  var ro=['<option value="">All repositories</option>'].concat(rl.map(function(id){var n=gfRepoName(id);return'<option value="'+esc(id)+'"'+(id===GF.repoId?' selected':'')+' title="'+esc(id==='__legacy__'?'Branches tracked before repositories were recorded':id)+'">'+esc(rdup[n]>1&&id!=='__legacy__'?n+' \\u2013 '+id:n)+'</option>';})).join('');
   var chips=[];
+  if(GF.repoId)chips.push('<span class="gfchip" title="'+esc(GF.repoId==='__legacy__'?'':GF.repoId)+'">\\uD83D\\uDCE6 '+esc(gfRepoName(GF.repoId))+' <button data-action="gfClear" data-value="repoId" title="Remove">\\u00d7</button></span>');
   if(GF.projectId)chips.push('<span class="gfchip">'+esc(gfProjName(GF.projectId))+' <button data-action="gfClear" data-value="projectId" title="Remove">\\u00d7</button></span>');
   if(GF.workItemId)chips.push('<span class="gfchip">'+esc(gfWiName(GF.workItemId))+' <button data-action="gfClear" data-value="workItemId" title="Remove">\\u00d7</button></span>');
   var h='<span class="gfl">\\uD83D\\uDD0E Filter</span>'+rg+cust+'<span class="gfsep"></span>'
-    +'<select id="gfProj" class="sesin" title="Project">'+po+'</select><select id="gfWi" class="sesin" title="Work item">'+wo+'</select>'
-    +chips.join('')+(gfActive()?'<button class="dtab" data-action="gfClear" data-value="all" title="Back to the last 30 days, all projects">Clear</button>':'')
+    +'<select id="gfProj" class="sesin" title="Project">'+po+'</select><select id="gfWi" class="sesin" title="Work item">'+wo+'</select>'+(rl.length?'<select id="gfRepo" class="sesin" title="Repository">'+ro+'</select>':'')
+    +chips.join('')+(gfActive()?'<button class="dtab" data-action="gfClear" data-value="all" title="Back to the last 30 days, all projects and repositories">Clear</button>':'')
     +'<span class="gfnote">'+esc(gfRangeLabel())+' \\u00b7 '+esc(note)+'</span>';
   if(el._h===h)return;
   el._h=h;el.innerHTML=h;
   var on=function(id,fn){var x=document.getElementById(id);if(x)x.addEventListener('change',fn);};
   on('gfProj',function(){gfSet({projectId:this.value});});
   on('gfWi',function(){gfSet({workItemId:this.value});});
+  on('gfRepo',function(){gfSet({repoId:this.value});});
   on('gfFrom',function(){gfSet({from:this.value});});
   on('gfTo',function(){gfSet({to:this.value});});
 }
@@ -497,13 +510,19 @@ function isNumText(x){if(/\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[./]\\d{1,2}[./]\\d{2,4}/
 function alignNums(){document.querySelectorAll('table:not([data-al])').forEach(function(tb){tb.setAttribute('data-al','1');var body=tb.tBodies[0];if(!body)return;var rows=Array.prototype.slice.call(body.rows),head=tb.tHead&&tb.tHead.rows[0],n=head?head.cells.length:(rows[0]?rows[0].cells.length:0);if(!n)return;rows=rows.filter(function(r){return r.cells.length===n;});for(var c=0;c<n;c++){var num=0,bad=0;rows.forEach(function(r){var x=(r.cells[c].textContent||'').trim();if(!x||x==='\\u2014'||x==='\\u2013'||x==='-'||x==='\\u2212')return;if(isNumText(x))num++;else bad++;});if(num&&!bad){if(head&&head.cells[c])head.cells[c].classList.add('num');rows.forEach(function(r){r.cells[c].classList.add('num');});}}});}
 var alignQueued=false;if(typeof MutationObserver!=='undefined')new MutationObserver(function(){if(alignQueued)return;alignQueued=true;requestAnimationFrame(function(){alignQueued=false;alignNums();});}).observe(document.body,{childList:true,subtree:true});
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function bkRepo(k){k=String(k==null?'':k);var i=k.lastIndexOf('::');return i<0?'':k.slice(0,i);}
+function bn(k){k=String(k==null?'':k);var i=k.lastIndexOf('::');return i<0?k:k.slice(i+2);}
+function brepo(k){var p=bkRepo(k).split(/[\\\\/]+/).filter(Boolean),l=p.length?p[p.length-1]:'';try{return decodeURIComponent(l);}catch(e){return l;}}
+function bl(k){var r=brepo(k);return bn(k)+(r?' ('+r+')':'');}
+function rchip(k){var r=brepo(k);return r?'<span class="badge brepo" title="'+esc(bkRepo(k))+'">'+esc(r)+'</span>':'';}
+function bh(k){return esc(bn(k))+rchip(k);}
 function activeMsOf(x){return(x.humanCodingMs||0)+(x.aiGeneratingMs||0)+(x.reviewingMs||0);}
 function reviewCardHtml(w){
   var r=w&&w.review;if(!r)return'';
   var col=r.complete?'var(--added)':r.openIssues?'var(--deleted)':'var(--cost)';
   var files=(r.filesLeft||[]).map(function(f){return'<tr><td>'+esc(f.path)+'</td><td>'+(f.total-f.unreviewed)+'/'+f.total+'</td><td>'+f.unreviewed+' left</td></tr>';}).join('');
-  var issues=(r.issues||[]).map(function(i){return'<tr><td class="c-del">\\u2691 '+esc(i.note||'Issue')+'</td><td>'+esc(i.path)+':'+i.line+'</td><td>'+esc(i.branch)+'</td></tr>';}).join('');
-  var branches=(r.branches||[]).length>1?'<p class="mt2 t-sm muted">'+r.branches.map(function(b){return esc(b.branch)+': '+b.reviewed+'/'+b.total;}).join(' \\u00b7 ')+'</p>':'';
+  var issues=(r.issues||[]).map(function(i){return'<tr><td class="c-del">\\u2691 '+esc(i.note||'Issue')+'</td><td>'+esc(i.path)+':'+i.line+'</td><td>'+bh(i.branch)+'</td></tr>';}).join('');
+  var branches=(r.branches||[]).length>1?'<p class="mt2 t-sm muted">'+r.branches.map(function(b){return bh(b.branch)+': '+b.reviewed+'/'+b.total;}).join(' \\u00b7 ')+'</p>':'';
   return'<div class="mt3 card"><div class="hbar"><h3>\\uD83D\\uDD0D Code review</h3><button class="dtab" data-action="cmd" data-value="review.showProgress">Open Review view</button></div>'
     +'<div class="mt2 sg">'+sc('Reviewed',r.pct+'%',col)+sc('Lines reviewed',r.reviewed+' / '+r.total)+sc('Left to review',String(r.unreviewed),r.unreviewed?'var(--cost)':'var(--added)')+sc('Open issues',String(r.openIssues),r.openIssues?'var(--deleted)':'inherit')+'</div>'
     +(r.complete?'<p class="mt2 c-add">\\u2713 Every changed line on the branches of this work item is reviewed and no issues are open.</p>':'')
@@ -756,16 +775,43 @@ function ovConfHtml(){
   var A=AN&&AN.confidence;if(!A)return'';
   return'<div class="cfl">Data confidence: time '+(confBadge(A.time,'Active time','ms')||'\\u2014')+' \\u00b7 lines '+(confBadge(A.lines,'Lines','lines')||'\\u2014')+' \\u00b7 credits '+(confBadge(A.credits,'Credits','credits')||'\\u2014')+' \\u2014 \\u25CF exact \\u00b7 \\u25D0 mixed \\u00b7 \\u25CB estimated \\u00b7 \\u270E manual; hover a marker for the split</div>';
 }
+// #155 Repositories: REPOS rows (built by the extension) narrowed to the filter and re-summed.
+function repoView(){
+  var scoped=!!(GF.projectId||GF.workItemId);
+  return(REPOS||[]).filter(function(r){return!GF.repoId||r.repoId===GF.repoId;}).map(function(r){
+    var bs=scoped?r.branches.filter(function(b){return gfScope('',b.workItemId);}):r.branches;
+    var t={activeMs:0,humanMs:0,aiMs:0,reviewMs:0,linesHumanAdded:0,linesHumanDeleted:0,linesAiAdded:0,linesAiDeleted:0,costUsd:0,credits:0};
+    bs.forEach(function(b){for(var k in t)t[k]+=b[k]||0;});
+    return Object.assign({},r,t,{branches:bs,all:r.branches.length});
+  }).filter(function(r){return!scoped||r.branches.length||(GF.projectId&&!GF.workItemId&&r.projects.some(function(p){return p.id===GF.projectId;}));});
+}
+function repoSecHtml(RV){
+  if(!RV.length)return emptyState('No repositories yet','Branches are grouped by repository as soon as you work in one.');
+  var rows=RV.map(function(r){
+    var open=!!repoOpen[r.repoId];
+    var proj=r.legacy?'<span class="muted">\\u2014</span>':(r.projects.length?r.projects.map(function(p){return'<span class="badge bh">'+esc(p.name)+'</span>';}).join(' '):'<span class="muted">none</span>');
+    var acts=r.legacy?'<button class="dtab" data-action="cmd" data-value="assignLegacyBranches" title="These branches were tracked before repositories were recorded. Assign them to the repository they belong to.">Assign to a repository\\u2026</button>'
+      :'<button class="dtab" data-action="repoLink" data-id="'+esc(r.repoId)+'" title="Link this repository to a project">\\uD83D\\uDD17 Project</button>';
+    acts+='<button class="dtab'+(GF.repoId===r.repoId?' active':'')+'" data-action="gfRepo" data-value="'+esc(r.repoId)+'" title="'+(GF.repoId===r.repoId?'Show all repositories again':'Filter every tab to this repository')+'">'+(GF.repoId===r.repoId?'Unfilter':'Filter')+'</button>';
+    var head='<tr class="ptr" data-action="repoToggle" data-value="'+esc(r.repoId)+'" aria-expanded="'+open+'"><td><span class="muted">'+(open?'\\u25be':'\\u25b8')+'</span> <strong title="'+esc(r.legacy?'Branches tracked before repositories were recorded':r.repoId)+'">'+esc(r.label)+'</strong></td><td>'+proj+'</td><td>'+(r.branches.length===r.all?r.all:r.branches.length+' of '+r.all)+'</td><td>'+fmt(r.activeMs)+'</td><td class="dc">'+pp(r.linesHumanAdded,'bp')+' '+pm(r.linesHumanDeleted)+'</td><td class="dc">'+pp(r.linesAiAdded,'ba')+' '+pm(r.linesAiDeleted)+'</td><td>'+cr(r.credits)+'</td><td>$'+r.costUsd.toFixed(4)+'</td><td class="nw">'+acts+'</td></tr>';
+    if(!open)return head;
+    var sub=r.branches.map(function(b){var isCur=b.branch===currentBranch;return'<tr class="ptr'+(isCur?' cur':'')+'" data-action="detail" data-value="'+esc(b.branch)+'"><td style="padding-left:22px">'+(isCur?'\\u25b6 ':'')+esc(b.name)+'</td><td>'+(b.workItemId&&b.workItemId!=='__unassigned__'&&b.workItemId!=='unknown'?'<span class="badge ba">#'+esc(b.workItemId)+'</span>':'')+'</td><td></td><td>'+fmt(b.activeMs)+'</td><td class="dc">'+pp(b.linesHumanAdded,'bp')+' '+pm(b.linesHumanDeleted)+'</td><td class="dc">'+pp(b.linesAiAdded,'ba')+' '+pm(b.linesAiDeleted)+'</td><td>'+cr(b.credits)+'</td><td>$'+b.costUsd.toFixed(4)+'</td><td></td></tr>';}).join('');
+    return head+(sub||'<tr class="empty-row"><td colspan="9" style="padding-left:22px">No tracked branches in this repository yet.</td></tr>');
+  }).join('');
+  return'<div class="ox"><table><thead><tr><th>Repository</th><th>Projects</th><th>Branches</th><th>Active</th><th>Human +/-</th><th>AI +/-</th><th>Credits</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +'<p class="mt2 t-sm muted">Click a repository to see its branches. A repository total is the sum of its branches.</p>';
+}
 function renderOverview(){
   const el=document.getElementById('overview');
-  var sig=JSON.stringify([allData,AN,CFG,currentBranch,GF,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
+  var sig=JSON.stringify([allData,AN,CFG,currentBranch,GF,REPOS,repoOpen,(WI||[]).map(function(w){return w.workItemId+':'+(w.title||'');})]);
   if(sig===ovSig&&el.firstChild)return;
   ovSig=sig;
-  var OD=allData.filter(function(d){return gfScope('',d.workItemId);});
+  var OD=allData.filter(function(d){return gfScope('',d.workItemId)&&gfRepoOk(d.branch);});
+  var RV=repoView();
   const T=OD.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
   var rows=OD.map(function(d){
     var tot=tms(d),hp=tot>0?d.humanCodingMs/tot*100:0,ap=tot>0?d.aiGeneratingMs/tot*100:0,rp=tot>0?d.reviewingMs/tot*100:0,isCur=d.branch===currentBranch;
-    return '<tr class="ptr '+(isCur?'cur':'')+'" data-action="detail" data-value="'+d.branch+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+d.branch+'</strong></td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
+    return '<tr class="ptr '+(isCur?'cur':'')+'" data-action="detail" data-value="'+esc(d.branch)+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+esc(bn(d.branch))+'</strong></td><td'+(brepo(d.branch)?' title="'+esc(bkRepo(d.branch))+'">'+esc(brepo(d.branch)):' class="muted" title="Tracked before repositories were recorded">unknown')+'</td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
   }).join('');
   var AS=AN||{};var stk=AS.streak||{current:0,longest:0};var wk=AS.week||{thisWeek:{activeMs:0,lines:0,aiShare:0},lastWeek:{activeMs:0,lines:0,aiShare:0}};
   function dlt(n,p){if(p===0)return n>0?'<span class="c-add">\\u25b2 new</span>':'';var d=(n-p)/p*100;var up=d>=0;return'<span style="color:'+(up?'var(--added)':'var(--deleted)')+'">'+(up?'\\u25b2':'\\u25bc')+' '+Math.abs(d).toFixed(0)+'%</span>';}
@@ -812,12 +858,13 @@ function renderOverview(){
     +'<div class="ovb"><button class="dtab" data-action="cmd" data-value="assignBranchToWorkItem">\\uD83D\\uDD17 Assign Work Item</button><button class="dtab" data-action="cmd" data-value="weeklyReport">\\uD83D\\uDCC4 Weekly Report</button><button class="dtab" data-action="cmd" data-value="exportCsv">\\u2B07 Export CSV</button></div></div>';
   el.innerHTML=top+ovCreditsHtml()
     +ovSec('activity','\\u23F1 Activity','this week vs last week \\u00b7 streak \\u00b7 totals',weekK+timeK+'<div class="cr"><div class="card"><h3>Time per Branch</h3><div class="cw"><canvas id="cBar"></canvas></div></div><div class="card"><h3>AI % per Branch</h3><div class="cw"><canvas id="cAi"></canvas></div></div></div>',true)
-    +ovSec('branches','\\uD83C\\uDF3F Branches',(OD.length===allData.length?OD.length:OD.length+' of '+allData.length)+' tracked','<div class="ox"><table><thead><tr><th>Branch</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
+    +ovSec('repos','\\uD83D\\uDCE6 Repositories',RV.length+' tracked',repoSecHtml(RV),true)
+    +ovSec('branches','\\uD83C\\uDF3F Branches',(OD.length===allData.length?OD.length:OD.length+' of '+allData.length)+' tracked','<div class="ox"><table><thead><tr><th>Branch</th><th>Repository</th><th>Work Item</th><th>Active</th><th>Split</th><th>Human +/-</th><th>AI +/-</th><th>AI %</th><th>Cost</th></tr></thead><tbody>'+rows+'</tbody></table></div>',true)
     +ovCorrHtml()
     +ovSec('hotspots','\\uD83D\\uDD25 Most-edited files',tf.length?tf.length+' files':'','<div class="ox">'+hot+'</div>',false)
     +ovSec('keys','\\u2328\\ufe0f Keystrokes vs AI \\u00b7 token estimate','',kt,false);
   renderOvChart();
-  var labels=OD.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
+  var labels=OD.map(function(d){var l=bl(d.branch);return l.length>22?l.slice(0,20)+'\\u2026':l;});
   dc('bar');
   charts.bar=new Chart(document.getElementById('cBar'),{type:'bar',data:{labels:labels,datasets:[{label:'Human',data:OD.map(function(d){return Math.round(d.humanCodingMs/60000);}),backgroundColor:'rgba(78,201,176,.7)'},{label:'AI Gen',data:OD.map(function(d){return Math.round(d.aiGeneratingMs/60000);}),backgroundColor:'rgba(197,134,192,.7)'},{label:'Review',data:OD.map(function(d){return Math.round(d.reviewingMs/60000);}),backgroundColor:'rgba(220,220,170,.7)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()}}}}});
   dc('ai');
@@ -962,7 +1009,7 @@ function calDayHtml(key,byDate){
   var items=d.items.map(function(it){
     var w=it.workItemId?(WI||[]).find(function(x){return String(x.workItemId)===String(it.workItemId);}):null;
     var wl=it.workItemId?'<a class="lnk" data-action="ovWi" data-value="'+esc(it.workItemId)+'">#'+esc(it.workItemId)+(w&&w.title?' '+esc(w.title):'')+'</a>':'<span class="sub">unassigned</span>';
-    var bl=it.branch?'<span class="lnk" data-action="detail" data-value="'+esc(it.branch)+'">'+esc(it.branch)+'</span>':'<span class="sub">\\u2014</span>';
+    var bl=it.branch?'<span class="lnk" data-action="detail" data-value="'+esc(it.branch)+'">'+bh(it.branch)+'</span>':'<span class="sub">\\u2014</span>';
     return'<tr><td>'+bl+'</td><td>'+wl+'</td><td>'+fmt(it.activeMs)+'</td><td>+'+it.lines+'</td><td>'+(Math.round(it.credits*10)/10)+'</td></tr>';
   }).join('');
   var work='<div class="bdc" style="grid-column:1/-1"><h4>Worked on</h4><div class="ox"><table><thead><tr><th>Branch</th><th>Work item</th><th>Time</th><th>Lines</th><th>Credits</th></tr></thead><tbody>'+items+'</tbody></table></div></div>';
@@ -1070,7 +1117,7 @@ function projectRowsHtml(){
   var rows=PROJ.map(function(p){
     var act=activeMsOf(p);
     var roi=(p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
-    var reposTxt=(p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+    var reposTxt=(p.repos&&p.repos.length)?'<span title="'+esc(p.repos.join('\\n'))+'">'+esc(p.repos.map(function(r){return brepo(r+'::x');}).join(', '))+'</span>':ROI_NONE;
     return'<tr data-action="proj" data-value="'+esc(p.projectId)+'"><td><strong>'+esc(p.name)+'</strong></td><td class="mono">'+reposTxt+'</td><td>'+p.workItemIds.length+'</td><td>'+fmt(act)+'</td><td>'+((p.credits&&p.credits.credits)||0).toFixed(1)+'</td><td>'+roi+'</td></tr>';
   });
   var none=wiOfProject('__none__');
@@ -1121,7 +1168,7 @@ function budgetCardHtml(w,cur){
   var cats=(b.categories||[]).filter(function(c){return c.budgetHours>0||c.usedHours>0;});
   var catHtml=cats.some(function(c){return c.budgetHours>0;})?'<table class="mt3"><thead><tr><th>Category</th><th>Estimate</th><th>Used (by line share)</th><th>%</th></tr></thead><tbody>'+cats.map(function(c){return'<tr><td>'+esc(CAT[c.category]||c.category)+'</td><td>'+(c.budgetHours?budVal('time',c.budgetHours):'\\u2014')+'</td><td>'+budVal('time',c.usedHours)+'</td><td style="color:'+(c.pct==null?'inherit':c.pct>=100?'var(--deleted)':'inherit')+'">'+(c.pct==null?'\\u2014':c.pct+'%')+'</td></tr>';}).join('')+'</tbody></table>':'';
   var br=b.branches||[];
-  var brHtml=br.length>1?'<table class="mt3"><thead><tr><th>Branch</th><th>Hours</th><th>Credits</th></tr></thead><tbody>'+br.map(function(x){return'<tr><td>'+esc(x.branch)+'</td><td>'+budVal('time',x.hours)+' ('+x.hoursPct+'%)</td><td>'+budVal('credits',x.credits)+' ('+x.creditsPct+'%)</td></tr>';}).join('')+'</tbody></table>':'';
+  var brHtml=br.length>1?'<table class="mt3"><thead><tr><th>Branch</th><th>Hours</th><th>Credits</th></tr></thead><tbody>'+br.map(function(x){return'<tr><td>'+bh(x.branch)+'</td><td>'+budVal('time',x.hours)+' ('+x.hoursPct+'%)</td><td>'+budVal('credits',x.credits)+' ('+x.creditsPct+'%)</td></tr>';}).join('')+'</tbody></table>':'';
   return'<div class="mt3 card">'+head
     +'<table class="mt2"><tbody>'+rows+'</tbody></table>'
     +'<p style="margin-top:8px;font-size:.85em;cursor:help" title="'+esc('Average per day over the last '+bn.days+' days, counting days without work too.'+(bn.costPerDay!=null?'\\nCost/day = hours/day \\u00d7 cost rate + credits/day \\u00d7 credit price.':'')+'\\nRun-out = what is left of a budget \\u00f7 its daily pace; the budget that runs out first is shown.')+'">'+pace+proj+'</p>'
@@ -1150,6 +1197,17 @@ function wiRowsHtml(items){
   if(!rows.length)return'<tr class="empty-row"><td colspan="7">No work items here yet.</td></tr>';
   return rows.join('');
 }
+function projRepoHtml(p){
+  var RB=p.repoBreakdown||[],linked=p.repos||[];
+  var rows=RB.map(function(r){
+    var isLinked=linked.indexOf(r.repoId)>=0;
+    var act=r.legacy?'':isLinked?'<button class="dtab" data-action="repoUnlink" data-pid="'+esc(p.projectId)+'" data-id="'+esc(r.repoId)+'" title="Unlink this repository from the project">Unlink</button>'
+      :'<button class="dtab" data-action="repoLink" data-id="'+esc(r.repoId)+'" title="Branches of this project ran here, but the repository is not linked">\\uD83D\\uDD17 Link</button>';
+    return'<tr><td><strong title="'+esc(r.legacy?'Branches tracked before repositories were recorded':r.repoId)+'">'+esc(r.label)+'</strong>'+(isLinked||r.legacy?'':' <span class="badge" title="Not linked to this project">not linked</span>')+'</td><td>'+r.branches.length+'</td><td>'+fmt(r.activeMs)+'</td><td class="dc">'+pp(r.linesHumanAdded,'bp')+'</td><td class="dc">'+pp(r.linesAiAdded,'ba')+'</td><td>'+cr(r.credits)+'</td><td>$'+r.costUsd.toFixed(4)+'</td><td class="nw">'+act+'</td></tr>';
+  }).join('')||'<tr class="empty-row"><td colspan="8">No repository linked yet. Open one and use \\u201cLink Current Repo\\u201d.</td></tr>';
+  return'<h3 class="mt4" style="margin-bottom:6px">\\uD83D\\uDCE6 Repositories</h3><div class="ox"><table><thead><tr><th>Repository</th><th>Branches</th><th>Active</th><th>Human +</th><th>AI +</th><th>Credits</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 12px"><button class="dtab" data-action="cmd" data-value="linkRepoToProject" title="Link the repository open in this window">\\uD83D\\uDD17 Link Current Repo</button></div>';
+}
 function renderProjectDetail(){
   var el=document.getElementById('projects');
   var p=PROJ.find(function(x){return x.projectId===selProj;});
@@ -1160,7 +1218,7 @@ function renderProjectDetail(){
   var act=isNone?items.reduce(function(a,w){return a+activeMsOf(w);},0):activeMsOf(p);
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
   var roi=(!isNone&&p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
-  var repos=(!isNone&&p.repos&&p.repos.length)?esc(p.repos.join(', ')):ROI_NONE;
+  var repos=isNone?'':projRepoHtml(p);
   var PCF=(!isNone&&p.confidence)||null;
   function PC(k,what,unit){return PCF?confBadge(PCF[k],what,unit):'';}
   var setRates=isNone?'':'<button class="dtab" data-action="ratesSet" data-id="'+esc(p.projectId)+'" title="Edit this project\\u2019s rates">\\u270E Edit Rates</button>';
@@ -1170,7 +1228,7 @@ function renderProjectDetail(){
     +'<div class="st"><div class="lbl">Credits'+PC('credits','Credits','credits')+'</div><div class="c-cost val">'+credits.toFixed(1)+'</div></div>'
     +'<div class="st"><div class="lbl">ROI Net'+PC('roi','ROI','ms')+'</div><div class="val">'+roi+'</div></div></div>'+(PCF?cfLegend():'')
     +translationSummaryHtml(p)
-    +'<p class="sub" style="margin:12px 0 6px">Repos: '+repos+'</p>'
+    +repos
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
     +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th title="Worst budget dimension (time, credits or cost); sorted by risk">Budget</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
 }
@@ -1243,15 +1301,39 @@ function timeLogCardHtml(entries,btnAttrs){
     +'<table class="mt2"><thead><tr><th>Time</th><th>Duration</th><th>Kind</th><th>Note</th><th></th></tr></thead><tbody>'+timeLogRowsHtml(entries)+'</tbody></table>'
     +'<p class="mt2 t-sm muted">Discrete time entries grouped by day. Manual entries roll up into Active Time &amp; ROI above (no double count).</p></div>';
 }
-function reFor(wid){return (RE||[]).filter(function(r){return r.toWorkItemId===wid||r.fromWorkItemId===wid;});}function reassignRowsHtml(wid){
+function reFor(wid){return (RE||[]).filter(function(r){return r.toWorkItemId===wid||r.fromWorkItemId===wid;});}
+// Entry moves between branches (#156): "A \\u2192 B" with what moved and an Undo button.
+function moveStatsText(s){
+  if(!s)return'';var p=[];
+  if(s.activeMs)p.push(fmt(s.activeMs)+' active');
+  if(s.linesHuman||s.linesAi)p.push((s.linesHuman+s.linesAi)+' lines');
+  if(s.ledgerRows)p.push(Number(s.credits).toFixed(1)+' credits');
+  if(s.timeEntries)p.push(s.timeEntries+' time-log');
+  return p.join(' \\u00b7 ');
+}
+function moveRowHtml(r,when){
+  var undone=(r.kind==='move'||r.kind==='merge')&&(RE||[]).some(function(x){return x.kind==='move-undo'&&x.undoOf===r.id;});
+  var st=moveStatsText(r.move&&r.move.stats);
+  var label=r.kind==='move-undo'?'\\u21BA Undo':r.kind==='merge'?'\\u29C9 Branches merged':'\\u21C4 Entries moved'+(r.range&&r.range.fromTs>0?' since '+esc(new Date(r.range.fromTs).toLocaleString()):'');
+  var act=(r.kind==='move'||r.kind==='merge')?(undone?'<span class="badge bp">undone</span>':' <button class="dtab" data-action="moveUndo" data-id="'+esc(r.id)+'" title="'+(r.kind==='merge'?'Split the merged branch out again':'Move these entries back')+'">\\u21BA Undo</button>'):'';
+  var note=r.note?' \\u2014 '+esc(r.note):'';
+  return'<tr><td class="nw">'+esc(when)+'</td><td><strong>'+bh(r.branch)+'</strong> \\u2192 <strong>'+bh(r.toBranch||'')+'</strong></td><td class="nw">'+label+'</td><td style="max-width:260px" title="'+esc(st)+'">'+esc(st)+note+act+'</td></tr>';
+}
+function branchMovesHtml(branch){
+  var list=(RE||[]).filter(function(r){return(r.kind==='move'||r.kind==='merge'||r.kind==='move-undo')&&(r.branch===branch||r.toBranch===branch);}).slice(0,5);
+  if(!list.length)return'';
+  return'<div class="mb3 card"><h3>\\u21C4 Entry moves</h3><table class="mt2"><thead><tr><th>When</th><th>From \\u2192 To</th><th>Kind</th><th>Moved</th></tr></thead><tbody>'+list.map(function(r){return moveRowHtml(r,new Date(r.ts).toLocaleString());}).join('')+'</tbody></table></div>';
+}
+function reassignRowsHtml(wid){
   var list=reFor(wid);
   if(!list.length)return'<tr class="empty-row"><td colspan="4">No reassignments touch this work item yet.</td></tr>';
   return list.map(function(r){
     var when=new Date(r.ts).toLocaleString();
+    if(r.kind==='move'||r.kind==='merge'||r.kind==='move-undo')return moveRowHtml(r,when);
     var from=r.fromWorkItemId?('#'+esc(r.fromWorkItemId)):'\\u2014';
     var dir=from+' \\u2192 #'+esc(r.toWorkItemId);
     var note=r.note?esc(r.note):'';
-    return'<tr><td class="nw">'+esc(when)+'</td><td><strong>'+esc(r.branch)+'</strong></td><td class="nw">'+dir+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td></tr>';
+    return'<tr><td class="nw">'+esc(when)+'</td><td><strong>'+bh(r.branch)+'</strong></td><td class="nw">'+dir+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td></tr>';
   }).join('');
 }
 function renderWorkItemDetail(){
@@ -1273,7 +1355,7 @@ function renderWorkItemDetail(){
   });
   if(!branchRows.length)branchRows=['<tr class="empty-row"><td colspan="5">No branches roll up into this work item yet.</td></tr>'];
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
-    +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div class="t-sm muted">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
+    +'<div class="sg"><div class="st"><div class="lbl">Work Item <button class="dtab" data-action="wiRename" data-id="'+esc(w.workItemId)+'" title="Rename work item" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+(w.titleAuto?' <span class="badge bp" title="Taken from the branch name \\u2014 rename to set your own title">from branch</span>':'')+'</div><div class="t-sm muted">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
     +'<div class="st tip" title="'+esc(T.estimate)+'"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
     +sc('Actual'+confBadge(WC.time,'Time','ms'),fmt(activeMsOf(w)),'inherit',T.actual)
     +sc('Net ROI / AI gain'+confBadge(WC.roi,'ROI','ms'),fmtMoney(I.netGain,I.currency),moneyColor(I.netGain),T.netGain)+'</div>'
@@ -1300,7 +1382,7 @@ function renderWorkItemDetail(){
     +'<div class="card"><h3>Branches</h3><table class="mt2"><thead><tr><th>Branch</th><th>Active</th><th>AI %</th><th>Cost</th><th></th></tr></thead><tbody>'+branchRows.join('')+'</tbody></table><p class="mt2 t-sm muted">Click a branch to open its full detail, or \\u201c\\u2192 Move\\u201d to re-home it to another work item.</p></div>'
     +'<div class="mt3 card"><h3>Manual Effort</h3><table class="mt2"><thead><tr><th>When</th><th>Time</th><th>Lines</th><th>Note</th><th></th></tr></thead><tbody>'+manualRowsHtml(w.workItemId)+'</tbody></table><p class="mt2 t-sm muted">Manual entries are hand-recorded corrections folded into the totals above.</p></div>'
     +timeLogCardHtml(w.timeEntries||[],'data-id="'+esc(w.workItemId)+'"')
-    +'<div class="mt3 card"><h3>Reassignment History</h3><table class="mt2"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p class="mt2 t-sm muted">Audit trail of branch \\u2192 work item moves touching this work item (newest first).</p></div>';
+    +'<div class="mt3 card"><h3>Reassignment History</h3><table class="mt2"><thead><tr><th>When</th><th>Branch</th><th>From \\u2192 To</th><th>Note</th></tr></thead><tbody>'+reassignRowsHtml(w.workItemId)+'</tbody></table><p class="mt2 t-sm muted">Audit trail of branch \\u2192 work item moves and entry moves between branches touching this work item (newest first).</p></div>';
   renderBudgetChart(w);
 }
 function renderProjectsView(){
@@ -1312,20 +1394,23 @@ function renderProjectsView(){
 // editing/deleting a row here corrects every derived total automatically.
 // Open deep-analysis rows and the last rendered markup survive the periodic 5s
 // refresh: unchanged data is not re-rendered, changed data re-opens the rows.
-var ledOpen={},ledHtml='';
+var ledOpen={},ledHtml='',ledSel={};
 function renderLedger(){
   var el=document.getElementById('ledger');
+  Object.keys(ledSel).forEach(function(id){if(!(LEDGER||[]).some(function(e){return e.id===id;}))delete ledSel[id];});
+  var nSel=Object.keys(ledSel).length;
   var add='<button class="dtab" data-action="cmd" data-value="logCredits">\\uFF0B Add Entry</button> <button class="dtab" data-action="cmd" data-value="importRealCredits" title="Import recorded credits from a Copilot Chat Debug export">\\u2B07 Import Real Credits</button>';
   add+=' <button class="dtab" data-action="cmd" data-value="importDebugSession">Import Debug Session</button>';
+  add+=' <button class="dtab" data-action="ledMove" title="Move the ticked rows (e.g. spec work done on main) to another branch \\u2014 they take over that branch\\u2019s work item"'+(nSel?'':' disabled')+'>\\u21C4 Move selected'+(nSel?' ('+nSel+')':'')+' to branch\\u2026</button>';
   if(!LEDGER||!LEDGER.length){
     ledHtml='';ledOpen={};
     el.innerHTML='<div class="hbar mb3"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'+emptyState('No credit entries yet','Credits are captured from the chat debug log as you use Copilot. Use \\u201cAdd Entry\\u201d to record one by hand.');
     return;
   }
-  var LV=LEDGER.filter(function(e){return gfInTs(e.ts)&&gfScope(e.projectId,e.workItemId);});
+  var LV=LEDGER.filter(function(e){return gfInTs(e.ts)&&gfScope(e.projectId,e.workItemId)&&gfRepoOk(e.branch);});
   var rows=(LV.length?LV:[]).map(function(e){
     var when=new Date(e.ts).toLocaleString();
-    var attr=e.branch?esc(e.branch):'\\u2014';
+    var attr=e.branch?bh(e.branch):'\\u2014';
     if(e.workItemId)attr+=' <span class="badge ba">#'+esc(e.workItemId)+'</span>';
     var cost=(e.cost!=null)?fmtMoney(Number(e.cost),projCurrency(e.projectId),4):'\\u2014';
     var note=e.note?esc(e.note):'';
@@ -1334,11 +1419,11 @@ function renderLedger(){
     if(e.debugUsage)src+='<span class="badge bp" title="'+Number(e.credits).toFixed(6)+' ledger credits">'+(e.debugUsage.creditsOverridden?'manually adjusted':e.debugUsage.unpricedRequests?'partial: '+e.debugUsage.unpricedRequests+' unpriced':'recorded')+'</span>';
     if(e.debugUsage&&e.debugUsage.logWarnings)src+='<span class="badge bd">log warnings</span>';
     var dbtn=e.analysis?'<button class="dtab" data-action="ledDetail" data-id="'+esc(e.id)+'" title="Deep analysis \\u2014 lines, tools, token cost">\\uD83D\\uDD0D</button> ':'';
-    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td class="nw">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td class="nw">'+Number(e.credits).toFixed(1)+cfRowBadge(e)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td class="nw">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
+    return'<tr id="led-'+esc(e.id)+'"'+(e.analysis?' style="cursor:pointer" data-action="ledDetail" data-id="'+esc(e.id)+'"':'')+'><td><input type="checkbox" data-action="ledSel" data-id="'+esc(e.id)+'" title="Select to move to another branch"'+(ledSel[e.id]?' checked':'')+'></td><td class="nw">'+esc(when)+'</td><td>'+esc(e.model)+'</td><td class="nw">'+Number(e.credits).toFixed(1)+cfRowBadge(e)+'</td><td>'+cost+'</td><td>'+src+'</td><td>'+attr+'</td><td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td><td class="nw">'+dbtn+'<button class="dtab" data-action="ledEdit" data-id="'+esc(e.id)+'" title="Edit entry">\\u270E</button> <button class="dtab" data-action="ledDel" data-id="'+esc(e.id)+'" title="Delete entry">\\uD83D\\uDDD1</button></td></tr>';
   }).join('');
   var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><h2>\\uD83E\\uDDFE Credit Ledger</h2>'+add+'</div>'
     +'<p class="sub">Every credit entry, newest first. Edit or delete any row to correct the ledger \\u2014 totals and ROI recompute automatically.'+(LV.length!==LEDGER.length?' Showing '+LV.length+' of '+LEDGER.length+' entries.':'')+'</p>'+cfLegend()
-    +'<div class="card">'+(LV.length?'':emptyState('No entries match the filter','Widen the date range or clear the project and work item in the filter bar.'))+'<table><thead><tr><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+    +'<div class="card">'+(LV.length?'':emptyState('No entries match the filter','Widen the date range or clear the project and work item in the filter bar.'))+'<table><thead><tr><th></th><th>When</th><th>Model</th><th>Credits</th><th>Cost</th><th>Source</th><th>Attribution</th><th>Note</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
   if(html===ledHtml&&el.querySelector('table'))return;
   ledHtml=html;
   el.innerHTML=html;
@@ -1425,7 +1510,7 @@ function openLedgerDetail(id){
     +'<span>\\uD83D\\uDD27 <strong>'+(an.toolCalls||0)+'</strong> tool calls</span>'
     +(an.durationMs?'<span>\\u23F1 <strong>'+fmt(an.durationMs)+'</strong> model time</span>':'')
     +'</div>';
-  var html='<td colspan="8" style="background:var(--surface);padding:12px 16px">'
+  var html='<td colspan="9" style="background:var(--surface);padding:12px 16px">'
     +'<div style="font-weight:600;margin-bottom:4px">\\uD83D\\uDD0D Deep analysis</div>'
     +effHtml
     +'<div style="background:var(--vscode-editorWidget-background,rgba(128,128,128,.08));border-left:3px solid var(--ai);padding:6px 10px;border-radius:4px;margin:6px 0;font-size:.88em">'+tip+'</div>'
@@ -1450,7 +1535,7 @@ function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
   if(!d) return;
   var tab=document.getElementById('dtab');
-  tab.textContent=branch.length>22?branch.slice(0,20)+'\u2026':branch;
+  var tl=bl(branch);tab.textContent=tl.length>22?tl.slice(0,20)+'\u2026':tl;tab.title=bl(branch);
   tab.dataset.branch=branch;
   showTab('detail');
   var extRows=Object.entries(d.byExt||{}).sort(function(a,b){return(b[1].human.added+b[1].ai.added)-(a[1].human.added+a[1].ai.added);}).map(function(e){var ext=e[0],s=e[1],ta=s.human.added+s.ai.added,pct=ta>0?((s.ai.added/ta)*100).toFixed(0):0;return'<tr><td><span class="extb">.'+ext+'</span></td><td class="dc">'+pp(s.human.added,'bp')+' '+pm(s.human.deleted)+'</td><td class="dc">'+pp(s.ai.added,'ba')+' '+pm(s.ai.deleted)+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';}).join('')||'<tr class="empty-row"><td colspan="4">No changes recorded yet</td></tr>';
@@ -1507,7 +1592,7 @@ function showDetail(branch){
   }
   var effectiveHtml='<div class="mb3 card"><h3>\\u2705 Effective changed lines</h3><div class="mt3 sg"><div class="st"><div class="lbl">Human</div><div class="c-human val">'+(d.effectiveLinesHuman||0)+'</div></div><div class="st"><div class="lbl">AI</div><div class="c-ai val">'+(d.effectiveLinesAi||0)+'</div></div><div class="st"><div class="lbl">Total</div><div class="val">'+((d.effectiveLinesHuman||0)+(d.effectiveLinesAi||0))+'</div></div></div><p class="mt3 t-sm muted">Canonical meaningful line versions used for productivity, equivalent time, generated value and estimate actuals. Unchanged full-file rewrite noise is excluded; later corrections count as additional effective work.</p></div>';
   effectiveHtml+=translationSummaryHtml(d);
-  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+bh(d.branch)+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0"><button class="dtab" data-action="moveEntries" data-id="'+esc(d.branch)+'" title="Move time, lines and credits of a time range (e.g. spec work done here before the feature branch existed) to another branch. Can be undone.">\\u21C4 Move entries to another branch\\u2026</button><button class="dtab" data-action="mergeBranch" data-id="'+esc(d.branch)+'" title="Merge everything of this branch into another one (e.g. the same branch tracked with different casing) and remove it from the list. Can be undone.">\\u29C9 Merge into another branch\\u2026</button></div>'+branchMovesHtml(d.branch)+'  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
   // Honor the user's current sub-tab instead of the hard-coded Insights default, so a
@@ -1536,7 +1621,7 @@ function showDS(id,btn){
   document.querySelectorAll('.dtab').forEach(function(b){b.classList.remove('active');});
   document.getElementById('ds-'+id).classList.add('active');
   btn.classList.add('active');
-  if(id==='lines'){var bn=document.getElementById('dtab').textContent;var d=allData.find(function(x){return x.branch===bn||bn.startsWith(x.branch.slice(0,16));});if(d)renderLinesChart(d);}
+  if(id==='lines'){var bk=document.getElementById('dtab').dataset.branch;var d=allData.find(function(x){return x.branch===bk;});if(d)renderLinesChart(d);}
   if(id==='time'&&charts.donut)charts.donut.resize();
 }
 
@@ -1589,7 +1674,7 @@ function renderOptimize(){
   var cb=Object.keys(o.cacheBreaks).map(function(k){var b=o.cacheBreaks[k];return'<tr><td>'+esc(causes[k]||k)+'</td><td>'+b.count+'</td><td>'+n2(b.credits)+'</td><td>'+n2(b.estimatedWaste)+'</td></tr>';});
   var srv=o.tools.servers.map(function(s){return'<tr><td>'+esc(s.server)+'</td><td>'+s.toolsOffered+'</td><td>'+s.offeredInPct+'%</td><td>'+s.usedTools+'</td><td>'+s.calls+'</td><td>'+(s.failed?'<span class="badge bd">'+s.failed+'</span>':'0')+'</td></tr>';});
   var tools=o.tools.topTools.slice(0,12).map(function(x){return'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.server)+'</td><td>'+x.calls+'</td><td>'+(x.failed||0)+'</td></tr>';});
-  var ses=(OPT.sessions||[]).map(function(s){return'<tr><td title="'+esc(s.sessionId)+'">'+esc(s.end.slice(0,16).replace('T',' '))+'</td><td>'+s.turns+'</td><td>'+n2(s.credits)+'</td><td class="nw">'+s.models.map(esc).join('<br>')+'</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>'+s.avoidableCacheBreaks+'</td><td>'+esc((s.workItems.length?'#'+s.workItems.join(', #'):'')||s.branches.join(', '))+'</td></tr>';});
+  var ses=(OPT.sessions||[]).map(function(s){return'<tr><td title="'+esc(s.sessionId)+'">'+esc(s.end.slice(0,16).replace('T',' '))+'</td><td>'+s.turns+'</td><td>'+n2(s.credits)+'</td><td class="nw">'+s.models.map(esc).join('<br>')+'</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>'+s.avoidableCacheBreaks+'</td><td>'+esc((s.workItems.length?'#'+s.workItems.join(', #'):'')||s.branches.map(bl).join(', '))+'</td></tr>';});
   el.innerHTML=ctl+tip+stats+'<h3 style="margin:8px 0 12px">Findings</h3>'+fh
     +'<div class="cr"><div class="card"><h3>By model</h3>'+optTable(['Model','Calls','Credits','Per call','Cache hit'],models,'No calls')+'</div>'
     +'<div class="card"><h3>Prompt-cache misses</h3>'+optTable(['Cause','Count','Credits','Avoidable \\u2248'],cb,'None')+'</div></div>'
@@ -1833,6 +1918,7 @@ function corrVisible(e){
   if(!gfInTs(e.start))return false;
   if(GF.workItemId&&String(e.workItemId||'')!==GF.workItemId)return false;
   if(GF.projectId&&!GF.workItemId&&!gfScope('',e.workItemId))return false;
+  if(!gfRepoOk(e.branch))return false;
   if(corrSrc!=='all'&&e.source!==corrSrc)return false;
   if(corrFilter==='todo')return e.items.some(function(i){return!i.category;});
   if(corrFilter==='lessons')return e.items.some(function(i){return corrIsLesson(i.category);});
@@ -2086,7 +2172,7 @@ function sesDetailHtml(id){
     var add=0,rem=0;(t.filesEdited||[]).forEach(function(f){add+=f.added||0;rem+=f.removed||0;});
     var cb=(t.cacheBreaks||[]).filter(function(b){return b.cause!=='new-context';}).map(function(b){return esc(b.cause);}).join(', ');
     var p=P[t.turnId];
-    return'<tr><td class="nw">'+sesWhen(t.at)+'</td><td style="max-width:320px">'+(p?esc(p):'<span class="muted">\\u2014</span>')+'</td><td>'+esc((t.models||[]).join(', '))+'</td><td>'+t.calls+'</td><td>'+n2(t.credits)+'</td><td>'+t.cacheHitPct+'%</td><td>'+(tools||'\\u2014')+'</td><td>+'+add+' / \\u2212'+rem+'</td><td>'+(cb||'\\u2014')+'</td><td>'+esc(t.workItemId?('#'+t.workItemId):(t.branch||''))+'</td><td><button class="dtab" data-action="ledEdit" data-id="'+esc(t.entryId||'')+'" title="Edit / reassign this turn\\u2019s credits to another work item">\\u270E</button></td></tr>';
+    return'<tr><td class="nw">'+sesWhen(t.at)+'</td><td style="max-width:320px">'+(p?esc(p):'<span class="muted">\\u2014</span>')+'</td><td>'+esc((t.models||[]).join(', '))+'</td><td>'+t.calls+'</td><td>'+n2(t.credits)+'</td><td>'+t.cacheHitPct+'%</td><td>'+(tools||'\\u2014')+'</td><td>+'+add+' / \\u2212'+rem+'</td><td>'+(cb||'\\u2014')+'</td><td>'+esc(t.workItemId?('#'+t.workItemId):(t.branch?bl(t.branch):''))+'</td><td><button class="dtab" data-action="ledEdit" data-id="'+esc(t.entryId||'')+'" title="Edit / reassign this turn\\u2019s credits to another work item">\\u270E</button></td></tr>';
   });
   return'<div style="padding:6px 0"><div style="font-size:.8em;color:var(--muted);margin-bottom:6px">Session '+esc(id)+' <button class="dtab" style="padding:1px 8px;margin-left:8px" data-action="handoff" data-id="'+esc(id)+'" title="Open a new chat pre-filled with a summary of this one (work item, branch, files, commits)">\u21aa New chat with handoff</button></div>'
     +optTable(['Turn','Prompt','Models','Calls','Credits','Cache hit','Top tools','Lines','Cache misses','Work item','' ],rows,'No turns')+'</div>';
@@ -2095,7 +2181,7 @@ function renderSessions(){
   var el=document.getElementById('sessions');
   var S=SES&&!SES.error?SES:{rows:[],total:0,offset:0,totals:{credits:0,turns:0,lowOutput:0},models:[],branches:[],titles:{}};
   var ctl='<div class="rng" style="flex-wrap:wrap;gap:6px;align-items:center">'
-    +sesSelect('sesBranch','All branches',S.branches.map(function(b){return[b,b];}),sesQ.branch)
+    +sesSelect('sesBranch','All branches',S.branches.map(function(b){return[b,bl(b)];}),sesQ.branch)
     +sesSelect('sesModel','All models',S.models.map(function(m){return[m,m];}),sesQ.model)
     +'<label>Min credits <input type="number" min="0" step="1" id="sesMin" class="sesin" style="width:70px" value="'+(sesQ.minCredits||'')+'"></label>'
     +'<label><input type="checkbox" id="sesLow"'+(sesQ.lowOutputOnly?' checked':'')+'> Expensive, low output only</label>'
@@ -2114,7 +2200,7 @@ function renderSessions(){
     var open=!!sesOpen[s.sessionId];
     var title=T[s.sessionId]?esc(T[s.sessionId]):'<span class="muted">'+esc(s.sessionId.slice(0,8))+'\\u2026</span>';
     var flag=s.expensiveLowOutput?' <span class="badge bd" title="Top-quartile credits in this period but fewer than 10 lines changed">\\uD83D\\uDCB8 low output</span>':'';
-    var where=s.workItems.length?'#'+s.workItems.join(', #'):s.branches.join(', ');
+    var where=s.workItems.length?'#'+s.workItems.join(', #'):s.branches.map(bl).join(', ');
     var row='<tr data-action="sesRow" data-id="'+esc(s.sessionId)+'" class="ptr"><td style="max-width:280px" title="'+esc(s.sessionId)+'">'+(open?'\\u25BE ':'\\u25B8 ')+title+flag+'</td><td class="nw">'+sesWhen(s.end)+'</td><td class="nw">'+fmtMin(s.durationMin)+'</td><td>'+esc(where)+'</td><td>'+esc(s.models.join(', '))+'</td><td>'+s.turns+'</td><td>'+s.calls+'</td><td>'+n2(s.credits)+'</td><td>'+n2(s.creditsPerTurn)+'</td><td>'+s.cacheHitPct+'%</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td class="nw">+'+s.linesAdded+' / \\u2212'+s.linesRemoved+'</td><td>'+s.avoidableCacheBreaks+'</td></tr>';
     return open?row+'<tr><td colspan="'+cols.length+'">'+sesDetailHtml(s.sessionId)+'</td></tr>':row;
   }).join('')||'<tr class="empty-row"><td colspan="'+cols.length+'">No sessions match these filters.</td></tr>';
@@ -2161,6 +2247,7 @@ window.addEventListener('message',function(e){
     if(msg.manualEffort!==undefined&&msg.manualEffort)ME=msg.manualEffort;
     if(msg.reassignments!==undefined&&msg.reassignments)RE=msg.reassignments;
     if(msg.netChange!==undefined)NET=msg.netChange;
+    if(msg.repos!==undefined&&msg.repos)REPOS=msg.repos;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
@@ -2227,11 +2314,20 @@ document.addEventListener('click',function(e){
   else if(a==='pprojects'){projView='list';selProj=null;selWi=null;renderProjectList();}
   else if(a==='cmd')vscode.postMessage({type:'cmd',value:v});
   else if(a==='gfRange'){gfSet({range:v});}
-  else if(a==='gfClear'){if(v==='all')gfSet({range:'30',projectId:'',workItemId:''});else{var gp={};gp[v]='';gfSet(gp);}}
+  else if(a==='gfClear'){if(v==='all')gfSet({range:'30',projectId:'',workItemId:'',repoId:''});else{var gp={};gp[v]='';gfSet(gp);}}
+  else if(a==='gfRepo'){e.stopPropagation();gfSet({repoId:GF.repoId===v?'':v});}
+  else if(a==='repoToggle'){repoOpen[v]=!repoOpen[v];ovSig='';renderOverview();}
+  else if(a==='repoLink'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'linkRepoToProject',arg:t.dataset.id});}
+  else if(a==='repoUnlink'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'unlinkRepoFromProject',arg:t.dataset.pid+'\\u0000'+t.dataset.id});}
   else if(a==='ovWi'){selWi=String(v);projView='workitem';showTab('projects');}
   else if(a==='ledEdit')vscode.postMessage({type:'cmd',value:'editLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDel')vscode.postMessage({type:'cmd',value:'deleteLedgerEntry',arg:t.dataset.id});
   else if(a==='ledDetail')toggleLedgerDetail(t.dataset.id);
+  else if(a==='ledSel'){if(t.checked)ledSel[t.dataset.id]=true;else delete ledSel[t.dataset.id];renderLedger();}
+  else if(a==='ledMove'){var lids=Object.keys(ledSel);if(lids.length){vscode.postMessage({type:'cmd',value:'moveEntries',arg:{ledgerIds:lids}});ledSel={};renderLedger();}}
+  else if(a==='moveEntries')vscode.postMessage({type:'cmd',value:'moveEntries',arg:t.dataset.id});
+  else if(a==='mergeBranch')vscode.postMessage({type:'cmd',value:'mergeBranches',arg:t.dataset.id});
+  else if(a==='moveUndo')vscode.postMessage({type:'cmd',value:'undoEntryMove',arg:t.dataset.id});
   else if(a==='meAdd')vscode.postMessage({type:'cmd',value:'addManualEffort',arg:t.dataset.id});
   else if(a==='meEdit')vscode.postMessage({type:'cmd',value:'editManualEffort',arg:t.dataset.id});
   else if(a==='meDel')vscode.postMessage({type:'cmd',value:'deleteManualEffort',arg:t.dataset.id});
@@ -2248,6 +2344,7 @@ document.addEventListener('click',function(e){
   else if(a==='estSet')vscode.postMessage({type:'cmd',value:'setWorkItemEstimate',arg:t.dataset.id});
   else if(a==='budSet')vscode.postMessage({type:'cmd',value:'setWorkItemBudget',arg:t.dataset.id});
   else if(a==='wiDone')vscode.postMessage({type:'cmd',value:'markWorkItemDone',arg:t.dataset.id});
+  else if(a==='wiRename')vscode.postMessage({type:'cmd',value:'renameWorkItem',arg:t.dataset.id});
   else if(a==='wiReopen')vscode.postMessage({type:'cmd',value:'reopenWorkItem',arg:t.dataset.id});
   else if(a==='wiOpen'){e.preventDefault();selWi=t.dataset.id;projView='workitem';showTab('projects');}
   else if(a==='estRefresh')requestEstimates();

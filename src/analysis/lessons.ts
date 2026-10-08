@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { groupEpisodes, type Correction } from './corrections';
+import { branchLabel } from '../util/branchKey';
 import { NON_LESSON_CATEGORIES, normalizeCategory, scopeMatches, suggestScope } from './correctionLabels';
 
 /**
@@ -171,7 +172,7 @@ export function lessonGroups(corrections: readonly Correction[], rules: readonly
     const g = groups.get(key) ?? { category: c.category!, scope, items: [] as Correction[], episodes: new Set<string>(), work: new Set<string>(), repos: new Set<string>(), notes: new Map<string, number>() };
     g.items.push(c);
     g.episodes.add(episodeOf.get(c.id) ?? c.id);
-    g.work.add(c.workItemId ? `#${c.workItemId}` : c.branch || 'unknown');
+    g.work.add(c.workItemId ? `#${c.workItemId}` : c.branch ? branchLabel(c.branch) : 'unknown');
     if (c.repo) g.repos.add(c.repo);
     const note = c.note?.trim();
     if (note) g.notes.set(note, (g.notes.get(note) ?? 0) + 1);

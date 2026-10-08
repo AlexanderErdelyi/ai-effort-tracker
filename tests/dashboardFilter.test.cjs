@@ -16,10 +16,10 @@ test('normalizeFilter coerces untrusted input', () => {
   assert.deepEqual(F.normalizeFilter(undefined), F.DEFAULT_FILTER);
   assert.deepEqual(F.normalizeFilter({ range: 'bogus', projectId: 7 }), F.DEFAULT_FILTER);
   assert.deepEqual(F.normalizeFilter({ range: '7', from: '2026-01-01', projectId: ' P1 ', workItemId: '42' }),
-    { range: '7', from: '', to: '', projectId: 'P1', workItemId: '42' });
+    { range: '7', from: '', to: '', projectId: 'P1', workItemId: '42', repoId: '' });
   assert.equal(F.normalizeFilter({ range: 'custom' }).range, '30');
   assert.deepEqual(F.normalizeFilter({ range: 'custom', from: '2026-03-10', to: '2026-03-01' }),
-    { range: 'custom', from: '2026-03-01', to: '2026-03-10', projectId: '', workItemId: '' });
+    { range: 'custom', from: '2026-03-01', to: '2026-03-10', projectId: '', workItemId: '', repoId: '' });
   assert.equal(F.normalizeFilter({ range: 'custom', from: 'March', to: '2026-03-01' }).from, '');
 });
 

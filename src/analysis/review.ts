@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { branchKey, refsInclude } from '../util/branchKey';
 
 /**
  * Code review tracking (#106-#109). Pure logic: no VS Code, no file I/O.
@@ -662,16 +663,15 @@ export function reviewIssues(
     let fromBranches: Set<string> | null = null;
     if (wanted) {
       fromBranches = new Set();
-      for (const b of wanted) {
-        const cov = repo.coverage[b];
-        if (!cov) continue;
+      for (const [b, cov] of Object.entries(repo.coverage)) {
+        if (!refsInclude(wanted, repoId, b)) continue;
         for (const f of cov.files) fromBranches.add(f.path);
         for (const i of cov.issues) fromBranches.add(i.path);
       }
     }
     for (const { root, current } of roots) {
       // A checked-out branch of the requested scope: every flagged file in it counts.
-      const relevant = wanted && !(current && wanted.includes(current)) ? fromBranches : null;
+      const relevant = wanted && !(current && refsInclude(wanted, repoId, current)) ? fromBranches : null;
       for (const [rel, marks] of Object.entries(repo.files)) {
         if (!marks.some(m => m.status === 'issue') || !pathOk(rel) || (relevant && !relevant.has(rel))) continue;
         const text = io.readFile(joinPath(root, rel));
@@ -704,7 +704,8 @@ export function reviewIssues(
     }
     const current = roots[0]?.current ?? null;
     const root = roots[0]?.root ?? null;
-    const snapBranches = (wanted ?? Object.keys(repo.coverage)).filter(b => repo.coverage[b] && !roots.some(x => x.current === b));
+    const snapBranches = Object.keys(repo.coverage)
+      .filter(b => (!wanted || refsInclude(wanted, repoId, b)) && !roots.some(x => x.current === b));
     for (const b of snapBranches) {
       const cov = repo.coverage[b];
       for (const i of cov.issues) {
@@ -722,7 +723,7 @@ export function reviewIssues(
     }
   }
   live.sort((a, b) => String(a.file).localeCompare(String(b.file)) || Number(a.startLine) - Number(b.startLine));
-  if (wanted) checkedOut = checkedOut.filter(c => live.some(l => l.root === c.root) || (c.branch && wanted.includes(c.branch)));
+  if (wanted) checkedOut = checkedOut.filter(c => live.some(l => l.root === c.root) || (c.branch && refsInclude(wanted, c.repo, c.branch)));
   const scope = args.workItemId ? { workItemId: args.workItemId, title: workItems[args.workItemId]?.title ?? null, branches: wanted }
     : args.branch ? { branch: args.branch } : 'all repositories';
   return {
@@ -774,8 +775,10 @@ export function reviewStatus(
   }
   const byWi = new Map<string, string[]>();
   const loose: string[] = [];
-  for (const r of Object.values(store.repos)) {
-    for (const b of Object.keys(r.coverage)) {
+  for (const [repoId, r] of Object.entries(store.repos)) {
+    for (const name of Object.keys(r.coverage)) {
+      // Branches tracked since #154 are keyed by repository; legacy ones by name.
+      const b = branches[branchKey(repoId, name)] ? branchKey(repoId, name) : name;
       const wi = branches[b]?.workItemId;
       if (wi && wi !== '__unassigned__') { if (!byWi.get(wi)?.includes(b)) byWi.set(wi, [...(byWi.get(wi) ?? []), b]); }
       else if (!loose.includes(b)) loose.push(b);
@@ -861,7 +864,7 @@ export function rollupCoverage(store: ReviewStoreData, branches: readonly string
   let asOf: number | null = null;
   for (const [repo, r] of Object.entries(store.repos)) {
     for (const [branch, cov] of Object.entries(r.coverage)) {
-      if (!wanted.has(branch)) continue;
+      if (!refsInclude(wanted, repo, branch)) continue;
       rows.push({ repo, branch, total: cov.total, reviewed: cov.reviewed, issueLines: cov.issueLines, openIssues: cov.issues.length, pct: coveragePct(cov.reviewed, cov.total), at: cov.at });
       asOf = Math.max(asOf ?? 0, cov.at);
       for (const f of cov.files) {

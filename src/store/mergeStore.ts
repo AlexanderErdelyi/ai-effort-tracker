@@ -279,5 +279,22 @@ export function mergeStores(baseline: PersistedStore, snapshot: PersistedStore, 
       }
     }
   }
+  mergeWorkItemTitles(base, local, disk, result);
   return result;
+}
+
+/** A manual work item title edited in either window beats a derived one (#157). */
+function mergeWorkItemTitles(base: PersistedStore, local: PersistedStore, disk: PersistedStore, result: PersistedStore): void {
+  for (const [id, wi] of Object.entries(result.workItems)) {
+    const before = base.workItems[id];
+    const changedManual = (x: PersistedStore['workItems'][string] | undefined) => !!x && x.title != null && !x.titleAuto &&
+      (x.title !== before?.title || !!before?.titleAuto);
+    const winner = [local.workItems[id], disk.workItems[id]].find(changedManual);
+    if (winner) {
+      wi.title = winner.title;
+      delete wi.titleAuto;
+    } else if (wi.title == null) {
+      delete wi.titleAuto;
+    }
+  }
 }
