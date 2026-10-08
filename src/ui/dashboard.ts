@@ -277,6 +277,7 @@ let RE=${reData};
 let NET=${netData};
 let GF=${gfData};
 let REPOS=${repoData};
+let PP=null;
 var repoOpen={};
 const charts={};
 
@@ -289,7 +290,8 @@ var GF_NOTE={
   sessions:'Follows the date range, project, work item and repository.',
   estimates:'Follows the project and work item. The date range and repository do not apply: accuracy uses every finished item.',
   timesheet:'Follows the project and work item, not the repository. Use the week buttons for dates.',
-  corrections:'Follows the date range, project, work item and repository (episodes without a work item count as \u201cNo project\u201d).'
+  corrections:'Follows the date range, project, work item and repository (episodes without a work item count as \u201cNo project\u201d).',
+  projects:'Project and work-item lists follow the date range (time, lines, credits, cost, ROI, repositories); budgets, estimates and the work-item detail page are all-time. The project, work item and repository selectors do not apply here.'
 };
 function gfIso(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function gfDayOf(ts){var d=new Date(ts);return isNaN(d.getTime())?'':gfIso(d);}
@@ -795,7 +797,7 @@ function repoSecHtml(RV){
     acts+='<button class="dtab'+(GF.repoId===r.repoId?' active':'')+'" data-action="gfRepo" data-value="'+esc(r.repoId)+'" title="'+(GF.repoId===r.repoId?'Show all repositories again':'Filter every tab to this repository')+'">'+(GF.repoId===r.repoId?'Unfilter':'Filter')+'</button>';
     var head='<tr class="ptr" data-action="repoToggle" data-value="'+esc(r.repoId)+'" aria-expanded="'+open+'"><td><span class="muted">'+(open?'\\u25be':'\\u25b8')+'</span> <strong title="'+esc(r.legacy?'Branches tracked before repositories were recorded':r.repoId)+'">'+esc(r.label)+'</strong></td><td>'+proj+'</td><td>'+(r.branches.length===r.all?r.all:r.branches.length+' of '+r.all)+'</td><td>'+fmt(r.activeMs)+'</td><td class="dc">'+pp(r.linesHumanAdded,'bp')+' '+pm(r.linesHumanDeleted)+'</td><td class="dc">'+pp(r.linesAiAdded,'ba')+' '+pm(r.linesAiDeleted)+'</td><td>'+cr(r.credits)+'</td><td>$'+r.costUsd.toFixed(4)+'</td><td class="nw">'+acts+'</td></tr>';
     if(!open)return head;
-    var sub=r.branches.map(function(b){var isCur=b.branch===currentBranch;return'<tr class="ptr'+(isCur?' cur':'')+'" data-action="detail" data-value="'+esc(b.branch)+'"><td style="padding-left:22px">'+(isCur?'\\u25b6 ':'')+esc(b.name)+'</td><td>'+(b.workItemId&&b.workItemId!=='__unassigned__'&&b.workItemId!=='unknown'?'<span class="badge ba">#'+esc(b.workItemId)+'</span>':'')+'</td><td></td><td>'+fmt(b.activeMs)+'</td><td class="dc">'+pp(b.linesHumanAdded,'bp')+' '+pm(b.linesHumanDeleted)+'</td><td class="dc">'+pp(b.linesAiAdded,'ba')+' '+pm(b.linesAiDeleted)+'</td><td>'+cr(b.credits)+'</td><td>$'+b.costUsd.toFixed(4)+'</td><td></td></tr>';}).join('');
+    var sub=r.branches.map(function(b){var isCur=b.branch===currentBranch;return'<tr class="ptr'+(isCur?' cur':'')+'" data-action="detail" data-value="'+esc(b.branch)+'"><td style="padding-left:22px">'+(isCur?'\\u25b6 ':'')+esc(b.name)+'</td><td>'+(b.workItemId&&b.workItemId!=='__unassigned__'&&b.workItemId!=='unknown'?'<span class="badge ba">#'+esc(b.workItemId)+'</span>':'')+'</td><td></td><td>'+fmt(b.activeMs)+'</td><td class="dc">'+pp(b.linesHumanAdded,'bp')+' '+pm(b.linesHumanDeleted)+'</td><td class="dc">'+pp(b.linesAiAdded,'ba')+' '+pm(b.linesAiDeleted)+'</td><td>'+cr(b.credits)+'</td><td>$'+b.costUsd.toFixed(4)+'</td><td class="nw">'+(r.legacy?'<button class="dtab" data-action="branchRepo" data-id="'+esc(b.branch)+'" title="Assign only this branch to the repository it belongs to (you can undo it)">\\uD83D\\uDCE6 Repo\\u2026</button>':'')+'</td></tr>';}).join('');
     return head+(sub||'<tr class="empty-row"><td colspan="9" style="padding-left:22px">No tracked branches in this repository yet.</td></tr>');
   }).join('');
   return'<div class="ox"><table><thead><tr><th>Repository</th><th>Projects</th><th>Branches</th><th>Active</th><th>Human +/-</th><th>AI +/-</th><th>Credits</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
@@ -1090,6 +1092,23 @@ function wiOfProject(pid){
   if(pid==='__none__')return WI.filter(function(w){return!w.projectId;});
   return WI.filter(function(w){return w.projectId===pid;});
 }
+// #163: the project list and project detail follow the global date range. "All"
+// keeps the all-time summaries untouched; any other range overlays the period
+// figures computed server-side (db.getProjectPeriod). Budgets and estimates stay all-time.
+var ppReq='';
+function ppOn(){return GF.range!=='all';}
+function ppKey(){return GF.range+'|'+(GF.from||'')+'|'+(GF.to||'');}
+function ppReady(){if(!ppOn())return true;if(PP&&PP.key===ppKey())return true;var k=ppKey();if(ppReq!==k){ppReq=k;vscode.postMessage({type:'projectPeriod'});}return false;}
+var PP_ZERO={humanCodingMs:0,aiGeneratingMs:0,reviewingMs:0,linesHumanAdded:0,linesAiAdded:0,creditsTotal:0,creditCost:0};
+var PP_CLEAR={effectiveLinesHuman:undefined,effectiveLinesAi:undefined,effectiveByCategory:null,confidence:null};
+function ppWi(w){if(!ppOn()||!PP)return w;return Object.assign({},w,PP_ZERO,PP.workItems[w.workItemId]||{},PP_CLEAR);}
+function ppProj(p){
+  if(!ppOn()||!PP)return p;
+  var f=PP.projects[p.projectId]||Object.assign({repoBreakdown:[]},PP_ZERO);
+  return Object.assign({},p,f,{credits:Object.assign({},p.credits||{},{credits:f.creditsTotal||0})},PP_CLEAR,f.roi?{}:{roi:null});
+}
+function ppHead(){return'<div class="t-sm muted" style="margin-bottom:8px">\\uD83D\\uDCC5 <strong>'+esc(gfRangeLabel())+'</strong>'+(ppOn()?' \\u00b7 time, lines, credits, cost and ROI in this range; budgets and estimates are all-time':'')+'</div>';}
+function ppLoading(el){el.innerHTML=projToolbar()+ppHead()+'<p class="muted">Loading project figures for '+esc(gfRangeLabel())+'\\u2026</p>';}
 var CUR_SYM={USD:'$',EUR:'\\u20ac',GBP:'\\u00a3',JPY:'\\u00a5',CHF:'CHF ',CAD:'CA$',AUD:'A$',INR:'\\u20b9',CNY:'\\u00a5',SEK:'kr ',NOK:'kr ',DKK:'kr ',PLN:'z\\u0142 '};
 function curSym(cur){return CUR_SYM[String(cur||'USD').toUpperCase()]||null;}
 // Format money in the subject's effective currency (issue #45): symbol when known,
@@ -1114,13 +1133,14 @@ function projToolbar(){
     +'</div>';
 }
 function projectRowsHtml(){
-  var rows=PROJ.map(function(p){
+  var rows=PROJ.map(function(p0){
+    var p=ppProj(p0);
     var act=activeMsOf(p);
     var roi=(p.roi&&p.roi.netValue!=null)?fmtMoney(p.roi.netValue,p.roi.currency):ROI_NONE;
     var reposTxt=(p.repos&&p.repos.length)?'<span title="'+esc(p.repos.join('\\n'))+'">'+esc(p.repos.map(function(r){return brepo(r+'::x');}).join(', '))+'</span>':ROI_NONE;
     return'<tr data-action="proj" data-value="'+esc(p.projectId)+'"><td><strong>'+esc(p.name)+'</strong></td><td class="mono">'+reposTxt+'</td><td>'+p.workItemIds.length+'</td><td>'+fmt(act)+'</td><td>'+((p.credits&&p.credits.credits)||0).toFixed(1)+'</td><td>'+roi+'</td></tr>';
   });
-  var none=wiOfProject('__none__');
+  var none=wiOfProject('__none__').map(ppWi);
   if(none.length){
     var act=none.reduce(function(a,w){return a+activeMsOf(w);},0);
     var cr=none.reduce(function(a,w){return a+(w.creditsTotal||0);},0);
@@ -1131,7 +1151,8 @@ function projectRowsHtml(){
 }
 function renderProjectList(){
   var el=document.getElementById('projects');
-  el.innerHTML=projToolbar()
+  if(!ppReady())return ppLoading(el);
+  el.innerHTML=projToolbar()+ppHead()
     +'<table><thead><tr><th>Project</th><th>Repos</th><th>Work Items</th><th>Active</th><th>Credits</th><th>ROI Net</th></tr></thead><tbody>'+projectRowsHtml()+'</tbody></table>'
     +'<p class="mt3 t-sm muted">Project ROI net = value produced \\u2212 cost from the project\\u2019s effective rates. \\u201c\\u2014\\u201d means a required rate is not configured (set it with \\u201cSet Rates\\u201d).</p>';
 }
@@ -1210,10 +1231,12 @@ function projRepoHtml(p){
 }
 function renderProjectDetail(){
   var el=document.getElementById('projects');
-  var p=PROJ.find(function(x){return x.projectId===selProj;});
+  var p0=PROJ.find(function(x){return x.projectId===selProj;});
   var isNone=selProj==='__none__';
-  if(!p&&!isNone){projView='list';return renderProjectList();}
-  var items=wiOfProject(selProj).slice().sort(function(a,b){return budRisk(b)-budRisk(a);});
+  if(!p0&&!isNone){projView='list';return renderProjectList();}
+  if(!ppReady())return ppLoading(el);
+  var p=p0?ppProj(p0):p0;
+  var items=wiOfProject(selProj).map(ppWi).sort(function(a,b){return budRisk(b)-budRisk(a);});
   var name=isNone?'\\uD83D\\uDCE5 Unassigned':esc(p.name);
   var act=isNone?items.reduce(function(a,w){return a+activeMsOf(w);},0):activeMsOf(p);
   var credits=isNone?items.reduce(function(a,w){return a+(w.creditsTotal||0);},0):((p.credits&&p.credits.credits)||0);
@@ -1222,7 +1245,7 @@ function renderProjectDetail(){
   var PCF=(!isNone&&p.confidence)||null;
   function PC(k,what,unit){return PCF?confBadge(PCF[k],what,unit):'';}
   var setRates=isNone?'':'<button class="dtab" data-action="ratesSet" data-id="'+esc(p.projectId)+'" title="Edit this project\\u2019s rates">\\u270E Edit Rates</button>';
-  el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'
+  el.innerHTML='<button class="back" data-action="pprojects">\\u2190 Projects</button>'+ppHead()
     +'<div class="sg"><div class="st"><div class="lbl">Project</div><div class="val" style="font-size:.95em;word-break:break-word">'+name+'</div></div>'
     +'<div class="st"><div class="lbl">Active Time'+PC('time','Time','ms')+'</div><div class="val">'+fmt(act)+'</div></div>'
     +'<div class="st"><div class="lbl">Credits'+PC('credits','Credits','credits')+'</div><div class="c-cost val">'+credits.toFixed(1)+'</div></div>'
@@ -1230,7 +1253,7 @@ function renderProjectDetail(){
     +translationSummaryHtml(p)
     +repos
     +'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">'+setRates+'<button class="dtab" data-action="cmd" data-value="createWorkItem">\\uFF0B New Work Item</button><button class="dtab" data-action="cmd" data-value="assignWorkItemToProject">\\uD83D\\uDCC1 Assign Work Item</button></div>'
-    +'<table><thead><tr><th>Work Item</th><th>Estimate</th><th title="Worst budget dimension (time, credits or cost); sorted by risk">Budget</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
+    +'<table><thead><tr><th>Work Item</th><th>Estimate'+(ppOn()?' <span class="t-xs muted">(all-time)</span>':'')+'</th><th title="Worst budget dimension (time, credits or cost); sorted by risk. Budgets always cover the whole work item">Budget'+(ppOn()?' <span class="t-xs muted">(all-time)</span>':'')+'</th><th>Actual</th><th>AI %</th><th>Credits</th><th>ROI</th></tr></thead><tbody>'+wiRowsHtml(items)+'</tbody></table>';
 }
 function meModeLabel(m){return {humanCoding:'Human coding',aiGenerating:'AI generating',reviewing:'Reviewing',idle:'Idle'}[m]||m;}
 function meFor(wid){return (ME||[]).filter(function(e){return e.workItemId===wid;});}
@@ -1592,7 +1615,7 @@ function showDetail(branch){
   }
   var effectiveHtml='<div class="mb3 card"><h3>\\u2705 Effective changed lines</h3><div class="mt3 sg"><div class="st"><div class="lbl">Human</div><div class="c-human val">'+(d.effectiveLinesHuman||0)+'</div></div><div class="st"><div class="lbl">AI</div><div class="c-ai val">'+(d.effectiveLinesAi||0)+'</div></div><div class="st"><div class="lbl">Total</div><div class="val">'+((d.effectiveLinesHuman||0)+(d.effectiveLinesAi||0))+'</div></div></div><p class="mt3 t-sm muted">Canonical meaningful line versions used for productivity, equivalent time, generated value and estimate actuals. Unchanged full-file rewrite noise is excluded; later corrections count as additional effective work.</p></div>';
   effectiveHtml+=translationSummaryHtml(d);
-  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+bh(d.branch)+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0"><button class="dtab" data-action="moveEntries" data-id="'+esc(d.branch)+'" title="Move time, lines and credits of a time range (e.g. spec work done here before the feature branch existed) to another branch. Can be undone.">\\u21C4 Move entries to another branch\\u2026</button><button class="dtab" data-action="mergeBranch" data-id="'+esc(d.branch)+'" title="Merge everything of this branch into another one (e.g. the same branch tracked with different casing) and remove it from the list. Can be undone.">\\u29C9 Merge into another branch\\u2026</button></div>'+branchMovesHtml(d.branch)+'  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+bh(d.branch)+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div><div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0"><button class="dtab" data-action="moveEntries" data-id="'+esc(d.branch)+'" title="Move time, lines and credits of a time range (e.g. spec work done here before the feature branch existed) to another branch. Can be undone.">\\u21C4 Move entries to another branch\\u2026</button><button class="dtab" data-action="mergeBranch" data-id="'+esc(d.branch)+'" title="Merge everything of this branch into another one (e.g. the same branch tracked with different casing) and remove it from the list. Can be undone.">\\u29C9 Merge into another branch\\u2026</button>'+(!d.repoId&&d.branch!=='unknown'?'<button class="dtab" data-action="branchRepo" data-id="'+esc(d.branch)+'" title="This branch was tracked before repositories were recorded. Assign it to the repository it belongs to. Can be undone.">\\uD83D\\uDCE6 Assign to a repository\\u2026</button>':'')+'</div>'+branchMovesHtml(d.branch)+'  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
   // Honor the user's current sub-tab instead of the hard-coded Insights default, so a
@@ -1656,26 +1679,36 @@ function optTable(head,rows,empty){
 }
 function renderOptimize(){
   var el=document.getElementById('optimize');
+  dc('optTrend');
   var ctl='<div class="rng">'+'<button class="dtab" data-action="optRefresh">\\u21bb Refresh</button></div>';
   var tip='<p class="mb4 t-md muted">Based on Copilot debug logs (models, tokens, cache, tools). Savings are list-price <strong>estimates</strong>. Ask Copilot in agent mode, e.g. <em>\\u201cUse the AI Effort Tracker usage insights to tell me how to use fewer credits\\u201d</em> \\u2013 the <strong>AI Effort Tracker usage insights</strong> MCP server gives it this data.</p>';
   if(!OPT){el.innerHTML=ctl+tip+(optLoading?loadingState('Analysing\\u2026'):emptyState('No usage data yet','Insights come from Copilot requests captured in the chat debug log. Use Copilot chat, then press Refresh.'));bindOptWi();return;}
   if(OPT.error){el.innerHTML=ctl+tip+'<p class="c-del">'+esc(OPT.error)+'</p>';bindOptWi();return;}
   var o=OPT.overview,t=o.totals,f=OPT.findings;
   var waste=Object.keys(o.cacheBreaks).reduce(function(n,k){return n+(o.cacheBreaks[k].estimatedWaste||0);},0);
-  var stats='<div class="sg">'+sc('Credits',n2(t.credits),'var(--cost)')+sc('Model calls',t.calls.toLocaleString())+sc('Cache hit',t.cacheHitPct+'%')+sc('Credits / turn',n2(t.creditsPerTurn))
-    +sc('Sessions',String(t.sessions))+sc('Turns',String(t.turns))+sc('Avoidable cache cost',n2(waste),'var(--deleted)')+sc('Subagent credits',n2(o.subagents.credits))+'</div>';
+  var cmp=OPT.comparison,cm=cmp&&cmp.metrics,cur=cmp&&cmp.current;
+  var stats='<div class="sg">'+sc('Credits',n2(t.credits)+optDelta('credits'),'var(--cost)')+sc('Model calls',t.calls.toLocaleString()+optDelta('calls'))+sc('Cache hit',t.cacheHitPct+'%'+optDelta('cacheHitPct'))+sc('Credits / turn',n2(t.creditsPerTurn)+optDelta('creditsPerTurn'))
+    +sc('Sessions',String(t.sessions)+optDelta('sessions'))+sc('Turns',String(t.turns)+optDelta('turns'))+sc('Avoidable cache cost',n2(waste)+optDelta('avoidable'),'var(--deleted)')
+    +(cur?sc('Avoidable % of credits',(cur.avoidablePct==null?'\\u2013':n2(cur.avoidablePct)+'%')+optDelta('avoidablePct'),'var(--deleted)','Avoidable cache cost as a share of all credits in the period. Lower is better.'):'')
+    +(cur?sc('Premium model share',(cur.premiumSharePct==null?'\\u2013':n2(cur.premiumSharePct)+'%')+optDelta('premiumSharePct'),'','Share of credits spent on models priced above the median of the model catalog. Lower is cheaper; check quality before switching.'):'')
+    +sc('Subagent credits',n2(o.subagents.credits)+optDelta('subagentCredits'))+'</div>';
+  var cmpNote=cmp?'<p class="cfl">'+(cmp.hasPrevious?'\\u25B2\\u25BC vs. previous period '+esc(cmp.previousPeriod.from)+' \\u2013 '+esc(cmp.previousPeriod.to)+': <span style="color:var(--added)">green = better</span>, <span style="color:var(--deleted)">red = worse</span>, grey = volume or no real change.'+(cmp.partial?' '+esc(cmp.note):''):esc(cmp.note))+'</p>':'';
+  var ftr={};((cmp&&cmp.findings)||[]).forEach(function(r){ftr[r.id]=r;});
   var fh=f.length?f.map(function(x){
-    return'<div class="mb3 card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline"><strong>'+sevBadge(x.severity)+' '+esc(x.title)+'</strong>'
+    return'<div class="mb3 card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline"><strong>'+sevBadge(x.severity)+' '+esc(x.title)+' '+optFindingBadge(ftr[x.id])+'</strong>'
       +(x.creditsAtStake!=null?'<span class="nw c-cost">\\u2248 '+n2(x.creditsAtStake)+' credits</span>':'')+'</div>'
       +'<p class="mt2">'+esc(x.detail)+'</p><p class="mt2"><strong>Try:</strong> '+esc(x.recommendation)+'</p></div>';
   }).join(''):'<div class="mb3 card">No optimization opportunities detected for this period.</div>';
+  var gone=((cmp&&cmp.findings)||[]).filter(function(r){return r.status==='resolved';});
+  if(gone.length)fh+='<div class="mb3 card"><h3>No longer detected (resolved vs. previous period)</h3><div style="display:flex;flex-direction:column;gap:6px">'+gone.map(function(r){return'<div class="kvrow"><span><span class="badge bh">\\u2714 resolved</span> '+esc(r.title)+'</span>'+(r.previousCreditsAtStake!=null?'<span class="muted nw">was \\u2248 '+n2(r.previousCreditsAtStake)+' credits</span>':'')+'</div>';}).join('')+'</div></div>';
+  var tr=OPT.trend,trendCard=tr&&tr.points&&tr.points.length>1?'<div class="mb3 card"><h3>Trend ('+(tr.granularity==='week'?'per week':'per day')+')</h3><p class="t-sm muted mb2">Getting better = credits / turn, avoidable cache cost and premium share go down, cache hit goes up. Gaps = no calls. Click a legend entry to show or hide a line.</p><div class="cw" style="height:240px"><canvas id="cOptTrend"></canvas></div></div>':'';
   var models=Object.keys(o.byModel).map(function(m){var b=o.byModel[m];return'<tr><td>'+esc(m)+'</td><td>'+b.calls+'</td><td>'+n2(b.credits)+'</td><td>'+n2(b.creditsPerCall)+'</td><td>'+b.cacheHitPct+'%</td></tr>';});
   var causes={'new-context':'New chat / subagent (expected)','model-switch':'Model switch','idle-expiry':'Pause > 5 min','toolset-change':'Tools changed','other':'Other (summarization, instructions\\u2026)'};
   var cb=Object.keys(o.cacheBreaks).map(function(k){var b=o.cacheBreaks[k];return'<tr><td>'+esc(causes[k]||k)+'</td><td>'+b.count+'</td><td>'+n2(b.credits)+'</td><td>'+n2(b.estimatedWaste)+'</td></tr>';});
   var srv=o.tools.servers.map(function(s){return'<tr><td>'+esc(s.server)+'</td><td>'+s.toolsOffered+'</td><td>'+s.offeredInPct+'%</td><td>'+s.usedTools+'</td><td>'+s.calls+'</td><td>'+(s.failed?'<span class="badge bd">'+s.failed+'</span>':'0')+'</td></tr>';});
   var tools=o.tools.topTools.slice(0,12).map(function(x){return'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.server)+'</td><td>'+x.calls+'</td><td>'+(x.failed||0)+'</td></tr>';});
   var ses=(OPT.sessions||[]).map(function(s){return'<tr><td title="'+esc(s.sessionId)+'">'+esc(s.end.slice(0,16).replace('T',' '))+'</td><td>'+s.turns+'</td><td>'+n2(s.credits)+'</td><td class="nw">'+s.models.map(esc).join('<br>')+'</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>'+s.avoidableCacheBreaks+'</td><td>'+esc((s.workItems.length?'#'+s.workItems.join(', #'):'')||s.branches.map(bl).join(', '))+'</td></tr>';});
-  el.innerHTML=ctl+tip+stats+'<h3 style="margin:8px 0 12px">Findings</h3>'+fh
+  el.innerHTML=ctl+tip+stats+cmpNote+trendCard+'<h3 style="margin:8px 0 12px">Findings</h3>'+fh
     +'<div class="cr"><div class="card"><h3>By model</h3>'+optTable(['Model','Calls','Credits','Per call','Cache hit'],models,'No calls')+'</div>'
     +'<div class="card"><h3>Prompt-cache misses</h3>'+optTable(['Cause','Count','Credits','Avoidable \\u2248'],cb,'None')+'</div></div>'
     +'<div class="cr"><div class="card"><h3>Tool sources (max '+o.tools.maxToolsOffered+' tools offered, '+o.tools.toolSearchCalls+' tool searches)</h3>'+optTable(['Server','Offered','In % of calls','Tools used','Calls','Failed'],srv,'No tool data yet')+'</div>'
@@ -1683,7 +1716,49 @@ function renderOptimize(){
     +renderEfficiency(OPT.efficiency)+renderToolProfile(OPT.toolProfile)
     +'<div class="card"><h3>Recent chat sessions</h3>'+optTable(['Last activity','Turns','Credits','Models','Max context','Avoidable cache misses','Work item / branch'],ses,'No sessions')+'</div>'
     +'<p class="mt2 t-sm muted">'+esc(o.dataCoverage.note)+' Timing captured for '+o.dataCoverage.withTimingPct+'% of calls.</p>';
+  renderOptTrend(trendCard?tr:null);
   bindOptWi();
+}
+// #162 Delta badge vs. the previous period for one Optimize stat card.
+function optDelta(k){
+  var c=OPT&&OPT.comparison;if(!c)return'';
+  var m=c.metrics&&c.metrics[k];if(!m)return'';
+  var pts=m.unit==='points';
+  var fv=function(v){return v==null?'\\u2013':(pts?n2(v)+'%':n2(v));};
+  var prevTip='Previous period '+c.previousPeriod.from+' \\u2013 '+c.previousPeriod.to+': '+fv(m.previous)+(m.better==='neutral'?' (volume \\u2013 neither better nor worse)':m.better==='lower'?' (lower is better)':' (higher is better)');
+  if(m.delta==null)return'<div class="t-xs muted" title="'+esc(prevTip)+'">\\u2013 vs. previous</div>';
+  var arrow=m.direction==='up'?'\\u25B2':m.direction==='down'?'\\u25BC':'=';
+  var col=m.verdict==='better'?'var(--added)':m.verdict==='worse'?'var(--deleted)':'var(--muted)';
+  var amt=m.direction==='flat'?'no change':pts?(m.delta>0?'+':'')+n2(m.delta)+' pp':m.deltaPct!=null?(m.deltaPct>0?'+':'')+m.deltaPct+'%':(m.delta>0?'+':'')+n2(m.delta);
+  return'<div class="t-xs" style="color:'+col+';font-weight:normal" title="'+esc(prevTip)+'">'+arrow+' '+amt+'</div>';
+}
+function optFindingBadge(r){
+  if(!r||!r.status)return'';
+  var was=r.previousCreditsAtStake!=null?' (was \\u2248 '+n2(r.previousCreditsAtStake)+')':'';
+  if(r.status==='new')return'<span class="badge ba" title="Not detected in the previous period">new</span>';
+  if(r.status==='better')return'<span class="badge bh" title="Less at stake than in the previous period">\\u25BC better'+was+'</span>';
+  if(r.status==='worse')return'<span class="badge bd" title="More at stake than in the previous period">\\u25B2 worse'+was+'</span>';
+  return'<span class="badge b-muted" title="About the same as in the previous period">same'+was+'</span>';
+}
+function renderOptTrend(tr){
+  dc('optTrend');
+  var cv=document.getElementById('cOptTrend');if(!tr||!cv)return;
+  var P=tr.points,lb=P.map(function(p){return(tr.granularity==='week'?'wk ':'')+fday(p.start);});
+  var line=function(label,key,color,axis,hidden){return{label:label,data:P.map(function(p){return p[key];}),borderColor:color,backgroundColor:color,borderWidth:2,pointRadius:P.length>40?0:2,tension:.25,spanGaps:false,yAxisID:axis,hidden:!!hidden};};
+  var pctKeys={'Cache hit %':1,'Avoidable % of credits':1,'Premium share %':1};
+  charts.optTrend=new Chart(cv,{type:'line',data:{labels:lb,datasets:[
+      line('Credits / turn','creditsPerTurn','rgba(244,162,97,.95)','y'),
+      line('Avoidable cache cost','avoidable','rgba(244,113,116,.6)','y',true),
+      line('Cache hit %','cacheHitPct','rgba(78,201,176,.95)','y2'),
+      line('Avoidable % of credits','avoidablePct','rgba(244,113,116,.95)','y2'),
+      line('Premium share %','premiumSharePct','rgba(197,134,192,.95)','y2')]},
+    options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      plugins:{legend:{position:'bottom',labels:{color:fg(),boxWidth:10,boxHeight:10}},tooltip:{callbacks:{
+        label:function(c){return c.parsed.y==null?c.dataset.label+': \\u2013':c.dataset.label+': '+n2(c.parsed.y)+(pctKeys[c.dataset.label]?'%':'');},
+        footer:function(items){var i=items[0]&&items[0].dataIndex;if(i==null)return'';var p=P[i];return p.calls+' calls \\u00b7 '+p.turns+' turns \\u00b7 '+n2(p.credits)+' credits';}}}},
+      scales:{x:{ticks:{color:dfg(),maxTicksLimit:12,maxRotation:0},grid:{display:false}},
+        y:{beginAtZero:true,ticks:{color:dfg()},grid:{color:gc},title:{display:true,text:'credits',color:dfg()}},
+        y2:{beginAtZero:true,max:100,position:'right',ticks:{color:dfg(),callback:function(v){return v+'%';}},grid:{drawOnChartArea:false}}}}});
 }
 function bindOptWi(){}
 // #99 Model efficiency per task type: heat map (green = cheapest in the row).
@@ -2234,6 +2309,7 @@ window.addEventListener('message',function(e){
   if(msg.type==='settingsData'){setLoading=false;SET=msg;var kept=setResult(msg.result);var stv=document.querySelector('.view.active');if(!kept&&stv&&stv.id==='settings')renderSettings();return;}
   if(msg.type==='healthData'){healthLoading=false;HEALTH=msg.report;var hv=document.querySelector('.view.active');if(hv&&hv.id==='health')renderHealth();return;}
   if(msg.type==='estimatesData'){estLoading=false;EST=msg;var ev=document.querySelector('.view.active');if(ev&&ev.id==='estimates')renderEstimates();return;}
+  if(msg.type==='projectPeriodData'){PP=msg.data;ppReq='';var pv=document.querySelector('.view.active');if(pv&&pv.id==='projects'&&projView!=='workitem')renderProjectsView();return;}
   if(msg.type==='optimizeData'){optLoading=false;OPT=msg;var ov=document.querySelector('.view.active');if(ov&&ov.id==='optimize')renderOptimize();return;}
   if(msg.type==='update'){
     allData=msg.summaries;currentBranch=msg.currentBranch;
@@ -2248,6 +2324,7 @@ window.addEventListener('message',function(e){
     if(msg.reassignments!==undefined&&msg.reassignments)RE=msg.reassignments;
     if(msg.netChange!==undefined)NET=msg.netChange;
     if(msg.repos!==undefined&&msg.repos)REPOS=msg.repos;
+    if(msg.projectPeriod!==undefined)PP=msg.projectPeriod;
     var av=document.querySelector('.view.active');
     if(av&&av.id==='overview')renderOverview();
     else if(av&&av.id==='trends')renderTrends();
@@ -2327,6 +2404,7 @@ document.addEventListener('click',function(e){
   else if(a==='ledMove'){var lids=Object.keys(ledSel);if(lids.length){vscode.postMessage({type:'cmd',value:'moveEntries',arg:{ledgerIds:lids}});ledSel={};renderLedger();}}
   else if(a==='moveEntries')vscode.postMessage({type:'cmd',value:'moveEntries',arg:t.dataset.id});
   else if(a==='mergeBranch')vscode.postMessage({type:'cmd',value:'mergeBranches',arg:t.dataset.id});
+  else if(a==='branchRepo'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'assignBranchToRepo',arg:t.dataset.id});}
   else if(a==='moveUndo')vscode.postMessage({type:'cmd',value:'undoEntryMove',arg:t.dataset.id});
   else if(a==='meAdd')vscode.postMessage({type:'cmd',value:'addManualEffort',arg:t.dataset.id});
   else if(a==='meEdit')vscode.postMessage({type:'cmd',value:'editManualEffort',arg:t.dataset.id});

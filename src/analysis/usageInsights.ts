@@ -95,7 +95,8 @@ function group<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
   return map;
 }
 
-function range(f: InsightFilter, now: number): { from: number; to: number } {
+/** Inclusive [from, to] window (ms) a filter covers. */
+export function range(f: InsightFilter, now: number): { from: number; to: number } {
   const to = f.to ?? now;
   return { from: f.from ?? to - (f.days ?? 30) * DAY, to };
 }

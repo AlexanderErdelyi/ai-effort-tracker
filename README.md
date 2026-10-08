@@ -35,6 +35,7 @@
 | `AI Effort Tracker: Link Current Repo to Project` | Adds the open repository to a project; a project can have several (see [Repositories](#repositories)) |
 | `AI Effort Tracker: Unlink Repository from Project` | Removes a repository from a project after confirmation. Tracked data is kept |
 | `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
+| `AI Effort Tracker: Assign a Branch to a Repository` | Assigns one older branch without a repository to a repository; asks first when that repository already has the branch, and can be undone |
 | `AI Effort Tracker: Move Entries to Another Branch` | Moves time, lines and credits of a time range (or chosen ledger rows) from one branch to another, e.g. work done on `main` before the feature branch existed (see [Moving entries between branches](#moving-entries-between-branches)) |
 | `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back, or splits a merged branch out again |
 | `AI Effort Tracker: Merge Branch Into Another…` | Merges all data of a duplicate branch (e.g. same name, different case) into another branch (see [Merging duplicate branches](#merging-duplicate-branches)) |
@@ -131,6 +132,12 @@ Some tabs use only part of it, and a short note on the bar says so:
 - Branches tracked before repositories were recorded are under
   "Unknown repository" in the repository filter.
 - Correction episodes without a work item count as "No project".
+- Projects: the project list and project detail (work items and
+  repositories) show time, lines, credits, cost and ROI for the date range;
+  "All" shows the all-time totals. Budgets, estimates and the work-item detail
+  page stay all-time. Range figures come from the daily records, so time
+  corrections without a date are only in "All". The project, work item and
+  repository selectors do not apply here.
 
 ## Branch changes and tracked time
 
@@ -157,6 +164,16 @@ current repository; **AI Effort Tracker: Assign Older Branches to a Repository**
 lets you choose branches and the repository at any time. If the repository
 already has that branch, the totals are added together. Credit, time-log and
 reassignment rows move along, and nothing is merged automatically.
+
+To assign a single branch, use **📦 Repo…** on its row under "Unknown
+repository" in the Repositories overview, **📦 Assign to a repository…** on its
+detail page, or **AI Effort Tracker: Assign a Branch to a Repository**. The
+picker lists the current repository first, then every tracked or
+project-linked repository, and marks those that already track a branch with
+that name. If one does, you confirm before the data is added to it. A single
+assignment is listed under **Entry moves** and can be undone with **↺ Undo**.
+Only branches without a repository can be assigned this way; to combine two
+repository branches, use **Merge** (see below).
 
 ### Moving entries between branches
 
@@ -209,7 +226,8 @@ repository with its projects, branch count, active time, lines, credits and
 cost; the totals are the sum of its branches. Click a row to see its branches,
 and click a branch for its details. **Filter** narrows every tab to that
 repository, and **🔗 Project** links it to a project. The "Unknown repository"
-row holds older branches and offers **Assign to a repository…**.
+row holds older branches and offers **Assign to a repository…** for all of them,
+or **📦 Repo…** on a single branch row.
 
 A project can have several repositories. The project page lists each linked
 repository with its totals, plus repositories where the project's branches ran
@@ -393,7 +411,16 @@ debug-log usage to show where credits go and how to use fewer of them:
   duplicate MCP servers, `tool_search` rounds and failing tools;
 - ranked findings with an estimated number of credits at stake, e.g. read-only or
   question turns that ran on a premium model, chats that grew past 100K tokens,
-  mostly high reasoning effort.
+  mostly high reasoning effort;
+- **am I getting better?** every stat card shows the change against the equally
+  long period directly before (▲/▼, green = better, red = worse, grey = volume or
+  no real change, "–" when nothing was recorded before). Efficiency metrics are
+  judged: credits per turn, avoidable cache cost (absolute and % of credits) and
+  premium model share should go down, cache hit should go up. Findings are marked
+  *new*, *better*, *worse* or *same*, and findings that disappeared are listed as
+  resolved. A **trend chart** (per day up to 31 days, per week beyond) follows the
+  date filter (7d / 30d / 90d / custom). "Premium" = models priced above the
+  median of the model catalog.
 
 Savings are **estimates**: the recorded charge is scaled by Copilot's list prices
 (captured from `models.json`) for the alternative, so discounts that applied are
@@ -412,8 +439,9 @@ or *"Analyse my usage for work item 1987"*. All tools are read-only except
 
 | Tool | Returns |
 |------|---------|
-| `usage_overview` | Totals by model/agent/effort, cache misses by cause, tool sources |
+| `usage_overview` | Totals by model/agent/effort, cache misses by cause, tool sources, plus a `comparison` with the previous period |
 | `optimization_findings` | Ranked recommendations with evidence and credits at stake |
+| `usage_trends` | Better or worse? Efficiency metrics vs. the previous period (deltas + verdicts), findings new/resolved, and a per-day/per-week trend |
 | `list_work_items` | Credits per work item plus budget status (used %, projection, warning/over), to choose a scope |
 | `list_sessions` | Recent chat sessions with models, context size, avoidable cache misses; `includeTitles` adds chat titles |
 | `session_detail` | Per-turn breakdown of one chat; `includePrompts` adds short prompt excerpts |
