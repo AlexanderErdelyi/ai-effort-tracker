@@ -32,6 +32,7 @@
 | `AI Effort Tracker: Start Tracking Session` | Manually start tracking |
 | `AI Effort Tracker: Stop Tracking Session` | Pause tracking |
 | `AI Effort Tracker: Export Report (JSON)` | Export branch report as JSON |
+| `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
 | `AI Effort Tracker: Export Full Backup…` | Save all data and settings to one file (see [Your data](#your-data-backups-restore-and-moving-to-another-machine)) |
 | `AI Effort Tracker: Restore Data from Backup…` | Restore from a backup file or an automatic checkpoint, with a safety copy first |
 | `AI Effort Tracker: Reveal Data Folder` | Open the folder where the data is stored |
@@ -132,6 +133,23 @@ Branch detection polls Git every five seconds. Polls do not overlap, and results
 received after the tracker is disposed are ignored. Time attribution follows the
 detected transition, so changes between polls can still have up to one polling
 interval of attribution uncertainty. Sleep/stall gaps are not counted as work.
+
+### Branches per repository
+
+Branches are tracked per repository, so `main` in two repositories stays two
+branches. The dashboard shows the repository name next to each branch. In a
+multi-root workspace the repository is the one that contains the active editor's
+file; without an open file it is the last used folder.
+
+Branches tracked before this change have no repository. They keep their totals
+and still work everywhere. Once, the extension offers to assign them to the
+current repository; **AI Effort Tracker: Assign Older Branches to a Repository**
+lets you choose branches and the repository at any time. If the repository
+already has that branch, the totals are added together. Credit, time-log and
+reassignment rows move along, and nothing is merged automatically.
+
+The MCP tools' `branch` filter accepts a plain name (all repositories) or the
+full key shown in tool results.
 
 ## Shared storage and recovery
 

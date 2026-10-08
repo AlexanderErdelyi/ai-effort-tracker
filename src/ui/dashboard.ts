@@ -101,6 +101,7 @@ export function renderDashboardHtml(
   .bh{background:rgba(78,201,176,.2);color:var(--human);}
   .bp{background:rgba(78,201,176,.15);color:var(--added);}
   .bd{background:rgba(244,113,116,.15);color:var(--deleted);}
+  .brepo{background:var(--surface-2);color:var(--muted);margin-left:6px;font-weight:normal;}
   .mb{display:flex;height:6px;border-radius:3px;overflow:hidden;width:80px;}
   .mb span{display:block;}
   .sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px;}
@@ -497,13 +498,19 @@ function isNumText(x){if(/\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[./]\\d{1,2}[./]\\d{2,4}/
 function alignNums(){document.querySelectorAll('table:not([data-al])').forEach(function(tb){tb.setAttribute('data-al','1');var body=tb.tBodies[0];if(!body)return;var rows=Array.prototype.slice.call(body.rows),head=tb.tHead&&tb.tHead.rows[0],n=head?head.cells.length:(rows[0]?rows[0].cells.length:0);if(!n)return;rows=rows.filter(function(r){return r.cells.length===n;});for(var c=0;c<n;c++){var num=0,bad=0;rows.forEach(function(r){var x=(r.cells[c].textContent||'').trim();if(!x||x==='\\u2014'||x==='\\u2013'||x==='-'||x==='\\u2212')return;if(isNumText(x))num++;else bad++;});if(num&&!bad){if(head&&head.cells[c])head.cells[c].classList.add('num');rows.forEach(function(r){r.cells[c].classList.add('num');});}}});}
 var alignQueued=false;if(typeof MutationObserver!=='undefined')new MutationObserver(function(){if(alignQueued)return;alignQueued=true;requestAnimationFrame(function(){alignQueued=false;alignNums();});}).observe(document.body,{childList:true,subtree:true});
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function bkRepo(k){k=String(k==null?'':k);var i=k.lastIndexOf('::');return i<0?'':k.slice(0,i);}
+function bn(k){k=String(k==null?'':k);var i=k.lastIndexOf('::');return i<0?k:k.slice(i+2);}
+function brepo(k){var p=bkRepo(k).split(/[\\\\/]+/).filter(Boolean);return p.length?p[p.length-1]:'';}
+function bl(k){var r=brepo(k);return bn(k)+(r?' ('+r+')':'');}
+function rchip(k){var r=brepo(k);return r?'<span class="badge brepo" title="'+esc(bkRepo(k))+'">'+esc(r)+'</span>':'';}
+function bh(k){return esc(bn(k))+rchip(k);}
 function activeMsOf(x){return(x.humanCodingMs||0)+(x.aiGeneratingMs||0)+(x.reviewingMs||0);}
 function reviewCardHtml(w){
   var r=w&&w.review;if(!r)return'';
   var col=r.complete?'var(--added)':r.openIssues?'var(--deleted)':'var(--cost)';
   var files=(r.filesLeft||[]).map(function(f){return'<tr><td>'+esc(f.path)+'</td><td>'+(f.total-f.unreviewed)+'/'+f.total+'</td><td>'+f.unreviewed+' left</td></tr>';}).join('');
-  var issues=(r.issues||[]).map(function(i){return'<tr><td class="c-del">\\u2691 '+esc(i.note||'Issue')+'</td><td>'+esc(i.path)+':'+i.line+'</td><td>'+esc(i.branch)+'</td></tr>';}).join('');
-  var branches=(r.branches||[]).length>1?'<p class="mt2 t-sm muted">'+r.branches.map(function(b){return esc(b.branch)+': '+b.reviewed+'/'+b.total;}).join(' \\u00b7 ')+'</p>':'';
+  var issues=(r.issues||[]).map(function(i){return'<tr><td class="c-del">\\u2691 '+esc(i.note||'Issue')+'</td><td>'+esc(i.path)+':'+i.line+'</td><td>'+bh(i.branch)+'</td></tr>';}).join('');
+  var branches=(r.branches||[]).length>1?'<p class="mt2 t-sm muted">'+r.branches.map(function(b){return bh(b.branch)+': '+b.reviewed+'/'+b.total;}).join(' \\u00b7 ')+'</p>':'';
   return'<div class="mt3 card"><div class="hbar"><h3>\\uD83D\\uDD0D Code review</h3><button class="dtab" data-action="cmd" data-value="review.showProgress">Open Review view</button></div>'
     +'<div class="mt2 sg">'+sc('Reviewed',r.pct+'%',col)+sc('Lines reviewed',r.reviewed+' / '+r.total)+sc('Left to review',String(r.unreviewed),r.unreviewed?'var(--cost)':'var(--added)')+sc('Open issues',String(r.openIssues),r.openIssues?'var(--deleted)':'inherit')+'</div>'
     +(r.complete?'<p class="mt2 c-add">\\u2713 Every changed line on the branches of this work item is reviewed and no issues are open.</p>':'')
@@ -765,7 +772,7 @@ function renderOverview(){
   const T=OD.reduce(function(a,d){return{human:a.human+d.humanCodingMs,ai:a.ai+d.aiGeneratingMs,review:a.review+d.reviewingMs,lhA:a.lhA+d.linesHumanAdded,lhD:a.lhD+d.linesHumanDeleted,laA:a.laA+d.linesAiAdded,laD:a.laD+d.linesAiDeleted,cost:a.cost+d.estimatedCostUsd};},{human:0,ai:0,review:0,lhA:0,lhD:0,laA:0,laD:0,cost:0});
   var rows=OD.map(function(d){
     var tot=tms(d),hp=tot>0?d.humanCodingMs/tot*100:0,ap=tot>0?d.aiGeneratingMs/tot*100:0,rp=tot>0?d.reviewingMs/tot*100:0,isCur=d.branch===currentBranch;
-    return '<tr class="ptr '+(isCur?'cur':'')+'" data-action="detail" data-value="'+d.branch+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+d.branch+'</strong></td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
+    return '<tr class="ptr '+(isCur?'cur':'')+'" data-action="detail" data-value="'+esc(d.branch)+'"><td>'+(isCur?'\\u25b6 ':'')+'<strong>'+esc(bn(d.branch))+'</strong>'+rchip(d.branch)+'</td><td>'+(d.workItemId?'<span class="badge ba">#'+d.workItemId+'</span>':'\\u2014')+'</td><td>'+fmt(tot)+'</td><td><div class="mb"><span style="width:'+hp+'%;background:var(--human)"></span><span style="width:'+ap+'%;background:var(--ai)"></span><span style="width:'+rp+'%;background:var(--review)"></span></div></td><td class="dc">'+pp(d.linesHumanAdded,'bp')+' '+pm(d.linesHumanDeleted)+'</td><td class="dc">'+pp(d.linesAiAdded,'ba')+' '+pm(d.linesAiDeleted)+'</td><td><span class="badge '+(aiPct(d)>50?'ba':'bh')+'">'+aiPct(d)+'%</span></td><td>$'+d.estimatedCostUsd.toFixed(4)+'</td></tr>';
   }).join('');
   var AS=AN||{};var stk=AS.streak||{current:0,longest:0};var wk=AS.week||{thisWeek:{activeMs:0,lines:0,aiShare:0},lastWeek:{activeMs:0,lines:0,aiShare:0}};
   function dlt(n,p){if(p===0)return n>0?'<span class="c-add">\\u25b2 new</span>':'';var d=(n-p)/p*100;var up=d>=0;return'<span style="color:'+(up?'var(--added)':'var(--deleted)')+'">'+(up?'\\u25b2':'\\u25bc')+' '+Math.abs(d).toFixed(0)+'%</span>';}
@@ -817,7 +824,7 @@ function renderOverview(){
     +ovSec('hotspots','\\uD83D\\uDD25 Most-edited files',tf.length?tf.length+' files':'','<div class="ox">'+hot+'</div>',false)
     +ovSec('keys','\\u2328\\ufe0f Keystrokes vs AI \\u00b7 token estimate','',kt,false);
   renderOvChart();
-  var labels=OD.map(function(d){return d.branch.length>16?d.branch.slice(0,14)+'\\u2026':d.branch;});
+  var labels=OD.map(function(d){var l=bl(d.branch);return l.length>22?l.slice(0,20)+'\\u2026':l;});
   dc('bar');
   charts.bar=new Chart(document.getElementById('cBar'),{type:'bar',data:{labels:labels,datasets:[{label:'Human',data:OD.map(function(d){return Math.round(d.humanCodingMs/60000);}),backgroundColor:'rgba(78,201,176,.7)'},{label:'AI Gen',data:OD.map(function(d){return Math.round(d.aiGeneratingMs/60000);}),backgroundColor:'rgba(197,134,192,.7)'},{label:'Review',data:OD.map(function(d){return Math.round(d.reviewingMs/60000);}),backgroundColor:'rgba(220,220,170,.7)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:fg()}}},scales:{x:{ticks:{color:dfg()},grid:{color:gc},stacked:true},y:{ticks:{color:dfg()},grid:{color:gc},stacked:true,title:{display:true,text:'min',color:dfg()}}}}});
   dc('ai');
@@ -962,7 +969,7 @@ function calDayHtml(key,byDate){
   var items=d.items.map(function(it){
     var w=it.workItemId?(WI||[]).find(function(x){return String(x.workItemId)===String(it.workItemId);}):null;
     var wl=it.workItemId?'<a class="lnk" data-action="ovWi" data-value="'+esc(it.workItemId)+'">#'+esc(it.workItemId)+(w&&w.title?' '+esc(w.title):'')+'</a>':'<span class="sub">unassigned</span>';
-    var bl=it.branch?'<span class="lnk" data-action="detail" data-value="'+esc(it.branch)+'">'+esc(it.branch)+'</span>':'<span class="sub">\\u2014</span>';
+    var bl=it.branch?'<span class="lnk" data-action="detail" data-value="'+esc(it.branch)+'">'+bh(it.branch)+'</span>':'<span class="sub">\\u2014</span>';
     return'<tr><td>'+bl+'</td><td>'+wl+'</td><td>'+fmt(it.activeMs)+'</td><td>+'+it.lines+'</td><td>'+(Math.round(it.credits*10)/10)+'</td></tr>';
   }).join('');
   var work='<div class="bdc" style="grid-column:1/-1"><h4>Worked on</h4><div class="ox"><table><thead><tr><th>Branch</th><th>Work item</th><th>Time</th><th>Lines</th><th>Credits</th></tr></thead><tbody>'+items+'</tbody></table></div></div>';
@@ -1121,7 +1128,7 @@ function budgetCardHtml(w,cur){
   var cats=(b.categories||[]).filter(function(c){return c.budgetHours>0||c.usedHours>0;});
   var catHtml=cats.some(function(c){return c.budgetHours>0;})?'<table class="mt3"><thead><tr><th>Category</th><th>Estimate</th><th>Used (by line share)</th><th>%</th></tr></thead><tbody>'+cats.map(function(c){return'<tr><td>'+esc(CAT[c.category]||c.category)+'</td><td>'+(c.budgetHours?budVal('time',c.budgetHours):'\\u2014')+'</td><td>'+budVal('time',c.usedHours)+'</td><td style="color:'+(c.pct==null?'inherit':c.pct>=100?'var(--deleted)':'inherit')+'">'+(c.pct==null?'\\u2014':c.pct+'%')+'</td></tr>';}).join('')+'</tbody></table>':'';
   var br=b.branches||[];
-  var brHtml=br.length>1?'<table class="mt3"><thead><tr><th>Branch</th><th>Hours</th><th>Credits</th></tr></thead><tbody>'+br.map(function(x){return'<tr><td>'+esc(x.branch)+'</td><td>'+budVal('time',x.hours)+' ('+x.hoursPct+'%)</td><td>'+budVal('credits',x.credits)+' ('+x.creditsPct+'%)</td></tr>';}).join('')+'</tbody></table>':'';
+  var brHtml=br.length>1?'<table class="mt3"><thead><tr><th>Branch</th><th>Hours</th><th>Credits</th></tr></thead><tbody>'+br.map(function(x){return'<tr><td>'+bh(x.branch)+'</td><td>'+budVal('time',x.hours)+' ('+x.hoursPct+'%)</td><td>'+budVal('credits',x.credits)+' ('+x.creditsPct+'%)</td></tr>';}).join('')+'</tbody></table>':'';
   return'<div class="mt3 card">'+head
     +'<table class="mt2"><tbody>'+rows+'</tbody></table>'
     +'<p style="margin-top:8px;font-size:.85em;cursor:help" title="'+esc('Average per day over the last '+bn.days+' days, counting days without work too.'+(bn.costPerDay!=null?'\\nCost/day = hours/day \\u00d7 cost rate + credits/day \\u00d7 credit price.':'')+'\\nRun-out = what is left of a budget \\u00f7 its daily pace; the budget that runs out first is shown.')+'">'+pace+proj+'</p>'
@@ -1251,7 +1258,7 @@ function reFor(wid){return (RE||[]).filter(function(r){return r.toWorkItemId===w
     var from=r.fromWorkItemId?('#'+esc(r.fromWorkItemId)):'\\u2014';
     var dir=from+' \\u2192 #'+esc(r.toWorkItemId);
     var note=r.note?esc(r.note):'';
-    return'<tr><td class="nw">'+esc(when)+'</td><td><strong>'+esc(r.branch)+'</strong></td><td class="nw">'+dir+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td></tr>';
+    return'<tr><td class="nw">'+esc(when)+'</td><td><strong>'+bh(r.branch)+'</strong></td><td class="nw">'+dir+'</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+note+'">'+note+'</td></tr>';
   }).join('');
 }
 function renderWorkItemDetail(){
@@ -1325,7 +1332,7 @@ function renderLedger(){
   var LV=LEDGER.filter(function(e){return gfInTs(e.ts)&&gfScope(e.projectId,e.workItemId);});
   var rows=(LV.length?LV:[]).map(function(e){
     var when=new Date(e.ts).toLocaleString();
-    var attr=e.branch?esc(e.branch):'\\u2014';
+    var attr=e.branch?bh(e.branch):'\\u2014';
     if(e.workItemId)attr+=' <span class="badge ba">#'+esc(e.workItemId)+'</span>';
     var cost=(e.cost!=null)?fmtMoney(Number(e.cost),projCurrency(e.projectId),4):'\\u2014';
     var note=e.note?esc(e.note):'';
@@ -1450,7 +1457,7 @@ function showDetail(branch){
   var d=allData.find(function(x){return x.branch===branch;});
   if(!d) return;
   var tab=document.getElementById('dtab');
-  tab.textContent=branch.length>22?branch.slice(0,20)+'\u2026':branch;
+  var tl=bl(branch);tab.textContent=tl.length>22?tl.slice(0,20)+'\u2026':tl;tab.title=bl(branch);
   tab.dataset.branch=branch;
   showTab('detail');
   var extRows=Object.entries(d.byExt||{}).sort(function(a,b){return(b[1].human.added+b[1].ai.added)-(a[1].human.added+a[1].ai.added);}).map(function(e){var ext=e[0],s=e[1],ta=s.human.added+s.ai.added,pct=ta>0?((s.ai.added/ta)*100).toFixed(0):0;return'<tr><td><span class="extb">.'+ext+'</span></td><td class="dc">'+pp(s.human.added,'bp')+' '+pm(s.human.deleted)+'</td><td class="dc">'+pp(s.ai.added,'ba')+' '+pm(s.ai.deleted)+'</td><td><span class="badge '+(pct>50?'ba':'bh')+'">'+pct+'%</span></td></tr>';}).join('')||'<tr class="empty-row"><td colspan="4">No changes recorded yet</td></tr>';
@@ -1507,7 +1514,7 @@ function showDetail(branch){
   }
   var effectiveHtml='<div class="mb3 card"><h3>\\u2705 Effective changed lines</h3><div class="mt3 sg"><div class="st"><div class="lbl">Human</div><div class="c-human val">'+(d.effectiveLinesHuman||0)+'</div></div><div class="st"><div class="lbl">AI</div><div class="c-ai val">'+(d.effectiveLinesAi||0)+'</div></div><div class="st"><div class="lbl">Total</div><div class="val">'+((d.effectiveLinesHuman||0)+(d.effectiveLinesAi||0))+'</div></div></div><p class="mt3 t-sm muted">Canonical meaningful line versions used for productivity, equivalent time, generated value and estimate actuals. Unchanged full-file rewrite noise is excluded; later corrections count as additional effective work.</p></div>';
   effectiveHtml+=translationSummaryHtml(d);
-  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+d.branch+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
+  document.getElementById('detail').innerHTML='<button class="back" data-action="tab" data-value="overview">\\u2190 Overview</button><div class="sg"><div class="st"><div class="lbl">Branch</div><div class="val" style="font-size:.9em;word-break:break-all">'+bh(d.branch)+'</div></div><div class="st"><div class="lbl">Work Item</div><div class="val">'+(d.workItemId?'#'+d.workItemId:'\\u2014')+'</div></div><div class="st"><div class="lbl">Active Time</div><div class="val">'+fmt(tot)+'</div></div><div class="st"><div class="lbl">Est. Cost</div><div class="c-cost val">$'+d.estimatedCostUsd.toFixed(4)+'</div></div></div>  <div class="dtabs"><button class="dtab active" data-action="ds" data-value="insights">\\uD83D\\uDCCA Insights</button><button class="dtab" data-action="ds" data-value="time">\\u23f1 Time</button><button class="dtab" data-action="ds" data-value="lines">\\uD83D\\uDCDD Lines</button><button class="dtab" data-action="ds" data-value="types">\\uD83D\\uDCC1 File Types</button></div><div id="ds-insights" class="ds active">'+insHtml+'</div><div id="ds-time" class="ds"><div class="cr"><div class="card"><h3>Time Breakdown</h3><div class="cw"><canvas id="cDonut"></canvas></div></div><div class="card" style="display:flex;flex-direction:column;gap:10px;justify-content:center">'+timeNote+timeRows+'</div></div></div>  <div id="ds-lines" class="ds">'+effectiveHtml+netHtml+'<div style="font-weight:600;font-size:.9em;margin-bottom:6px">\\u270D\\uFE0F Written / rewritten (cumulative churn)</div><div class="sg"><div class="st"><div class="lbl">Human +Lines</div><div class="c-add val">+'+d.linesHumanAdded+'</div></div><div class="st"><div class="lbl">Human -Lines</div><div class="c-del val">-'+d.linesHumanDeleted+'</div></div><div class="st"><div class="lbl">AI +Lines</div><div class="c-ai val">+'+d.linesAiAdded+'</div></div><div class="st"><div class="lbl">AI -Lines</div><div class="c-del val">-'+d.linesAiDeleted+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDCAC Chat Typed (chars)</div><div class="c-rev val">'+(d.chatCharsHuman||0)+'</div></div><div class="st"><div class="lbl">\\u2328\\ufe0f Keystrokes</div><div class="c-human val">'+(d.humanKeystrokes||0)+'</div></div><div class="st"><div class="lbl">\\uD83E\\uDD16 AI chars</div><div class="c-ai val">'+(d.aiChars||0)+'</div></div><div class="st"><div class="lbl">\\uD83D\\uDD22 Est. tokens</div><div class="c-cost val">~'+Math.round(((d.humanChars||0)+(d.aiChars||0)+(d.chatCharsHuman||0))/4)+'</div></div></div><div class="mt4 card"><h3>Lines by Extension</h3><div class="cw"><canvas id="cLines"></canvas></div></div></div><div id="ds-types" class="ds"><div class="cr">'+netCatCard+'<div class="card"><h3>By Category (churn)</h3><table><thead><tr><th>Category</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+catRows+'</tbody></table></div><div class="card"><h3>By Extension (churn)</h3><table><thead><tr><th>Ext</th><th>Human +/-</th><th>AI +/-</th><th>AI%</th></tr></thead><tbody>'+extRows+'</tbody></table></div></div></div>'+timeLogCardHtml(d.timeEntries||[],'data-branch="'+esc(d.branch)+'"');  dc('donut');
   charts.donut=new Chart(document.getElementById('cDonut'),{type:'doughnut',data:{labels:['Human','AI Gen','Review','Idle'],datasets:[{data:[d.humanCodingMs,d.aiGeneratingMs,d.reviewingMs,d.idleMs],backgroundColor:['rgba(78,201,176,.8)','rgba(197,134,192,.8)','rgba(220,220,170,.8)','rgba(77,77,77,.8)'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'bottom',labels:{color:fg(),padding:12}}}}});
   renderLinesChart(d);
   // Honor the user's current sub-tab instead of the hard-coded Insights default, so a
@@ -1536,7 +1543,7 @@ function showDS(id,btn){
   document.querySelectorAll('.dtab').forEach(function(b){b.classList.remove('active');});
   document.getElementById('ds-'+id).classList.add('active');
   btn.classList.add('active');
-  if(id==='lines'){var bn=document.getElementById('dtab').textContent;var d=allData.find(function(x){return x.branch===bn||bn.startsWith(x.branch.slice(0,16));});if(d)renderLinesChart(d);}
+  if(id==='lines'){var bk=document.getElementById('dtab').dataset.branch;var d=allData.find(function(x){return x.branch===bk;});if(d)renderLinesChart(d);}
   if(id==='time'&&charts.donut)charts.donut.resize();
 }
 
@@ -1589,7 +1596,7 @@ function renderOptimize(){
   var cb=Object.keys(o.cacheBreaks).map(function(k){var b=o.cacheBreaks[k];return'<tr><td>'+esc(causes[k]||k)+'</td><td>'+b.count+'</td><td>'+n2(b.credits)+'</td><td>'+n2(b.estimatedWaste)+'</td></tr>';});
   var srv=o.tools.servers.map(function(s){return'<tr><td>'+esc(s.server)+'</td><td>'+s.toolsOffered+'</td><td>'+s.offeredInPct+'%</td><td>'+s.usedTools+'</td><td>'+s.calls+'</td><td>'+(s.failed?'<span class="badge bd">'+s.failed+'</span>':'0')+'</td></tr>';});
   var tools=o.tools.topTools.slice(0,12).map(function(x){return'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.server)+'</td><td>'+x.calls+'</td><td>'+(x.failed||0)+'</td></tr>';});
-  var ses=(OPT.sessions||[]).map(function(s){return'<tr><td title="'+esc(s.sessionId)+'">'+esc(s.end.slice(0,16).replace('T',' '))+'</td><td>'+s.turns+'</td><td>'+n2(s.credits)+'</td><td class="nw">'+s.models.map(esc).join('<br>')+'</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>'+s.avoidableCacheBreaks+'</td><td>'+esc((s.workItems.length?'#'+s.workItems.join(', #'):'')||s.branches.join(', '))+'</td></tr>';});
+  var ses=(OPT.sessions||[]).map(function(s){return'<tr><td title="'+esc(s.sessionId)+'">'+esc(s.end.slice(0,16).replace('T',' '))+'</td><td>'+s.turns+'</td><td>'+n2(s.credits)+'</td><td class="nw">'+s.models.map(esc).join('<br>')+'</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td>'+s.avoidableCacheBreaks+'</td><td>'+esc((s.workItems.length?'#'+s.workItems.join(', #'):'')||s.branches.map(bl).join(', '))+'</td></tr>';});
   el.innerHTML=ctl+tip+stats+'<h3 style="margin:8px 0 12px">Findings</h3>'+fh
     +'<div class="cr"><div class="card"><h3>By model</h3>'+optTable(['Model','Calls','Credits','Per call','Cache hit'],models,'No calls')+'</div>'
     +'<div class="card"><h3>Prompt-cache misses</h3>'+optTable(['Cause','Count','Credits','Avoidable \\u2248'],cb,'None')+'</div></div>'
@@ -2086,7 +2093,7 @@ function sesDetailHtml(id){
     var add=0,rem=0;(t.filesEdited||[]).forEach(function(f){add+=f.added||0;rem+=f.removed||0;});
     var cb=(t.cacheBreaks||[]).filter(function(b){return b.cause!=='new-context';}).map(function(b){return esc(b.cause);}).join(', ');
     var p=P[t.turnId];
-    return'<tr><td class="nw">'+sesWhen(t.at)+'</td><td style="max-width:320px">'+(p?esc(p):'<span class="muted">\\u2014</span>')+'</td><td>'+esc((t.models||[]).join(', '))+'</td><td>'+t.calls+'</td><td>'+n2(t.credits)+'</td><td>'+t.cacheHitPct+'%</td><td>'+(tools||'\\u2014')+'</td><td>+'+add+' / \\u2212'+rem+'</td><td>'+(cb||'\\u2014')+'</td><td>'+esc(t.workItemId?('#'+t.workItemId):(t.branch||''))+'</td><td><button class="dtab" data-action="ledEdit" data-id="'+esc(t.entryId||'')+'" title="Edit / reassign this turn\\u2019s credits to another work item">\\u270E</button></td></tr>';
+    return'<tr><td class="nw">'+sesWhen(t.at)+'</td><td style="max-width:320px">'+(p?esc(p):'<span class="muted">\\u2014</span>')+'</td><td>'+esc((t.models||[]).join(', '))+'</td><td>'+t.calls+'</td><td>'+n2(t.credits)+'</td><td>'+t.cacheHitPct+'%</td><td>'+(tools||'\\u2014')+'</td><td>+'+add+' / \\u2212'+rem+'</td><td>'+(cb||'\\u2014')+'</td><td>'+esc(t.workItemId?('#'+t.workItemId):(t.branch?bl(t.branch):''))+'</td><td><button class="dtab" data-action="ledEdit" data-id="'+esc(t.entryId||'')+'" title="Edit / reassign this turn\\u2019s credits to another work item">\\u270E</button></td></tr>';
   });
   return'<div style="padding:6px 0"><div style="font-size:.8em;color:var(--muted);margin-bottom:6px">Session '+esc(id)+' <button class="dtab" style="padding:1px 8px;margin-left:8px" data-action="handoff" data-id="'+esc(id)+'" title="Open a new chat pre-filled with a summary of this one (work item, branch, files, commits)">\u21aa New chat with handoff</button></div>'
     +optTable(['Turn','Prompt','Models','Calls','Credits','Cache hit','Top tools','Lines','Cache misses','Work item','' ],rows,'No turns')+'</div>';
@@ -2095,7 +2102,7 @@ function renderSessions(){
   var el=document.getElementById('sessions');
   var S=SES&&!SES.error?SES:{rows:[],total:0,offset:0,totals:{credits:0,turns:0,lowOutput:0},models:[],branches:[],titles:{}};
   var ctl='<div class="rng" style="flex-wrap:wrap;gap:6px;align-items:center">'
-    +sesSelect('sesBranch','All branches',S.branches.map(function(b){return[b,b];}),sesQ.branch)
+    +sesSelect('sesBranch','All branches',S.branches.map(function(b){return[b,bl(b)];}),sesQ.branch)
     +sesSelect('sesModel','All models',S.models.map(function(m){return[m,m];}),sesQ.model)
     +'<label>Min credits <input type="number" min="0" step="1" id="sesMin" class="sesin" style="width:70px" value="'+(sesQ.minCredits||'')+'"></label>'
     +'<label><input type="checkbox" id="sesLow"'+(sesQ.lowOutputOnly?' checked':'')+'> Expensive, low output only</label>'
@@ -2114,7 +2121,7 @@ function renderSessions(){
     var open=!!sesOpen[s.sessionId];
     var title=T[s.sessionId]?esc(T[s.sessionId]):'<span class="muted">'+esc(s.sessionId.slice(0,8))+'\\u2026</span>';
     var flag=s.expensiveLowOutput?' <span class="badge bd" title="Top-quartile credits in this period but fewer than 10 lines changed">\\uD83D\\uDCB8 low output</span>':'';
-    var where=s.workItems.length?'#'+s.workItems.join(', #'):s.branches.join(', ');
+    var where=s.workItems.length?'#'+s.workItems.join(', #'):s.branches.map(bl).join(', ');
     var row='<tr data-action="sesRow" data-id="'+esc(s.sessionId)+'" class="ptr"><td style="max-width:280px" title="'+esc(s.sessionId)+'">'+(open?'\\u25BE ':'\\u25B8 ')+title+flag+'</td><td class="nw">'+sesWhen(s.end)+'</td><td class="nw">'+fmtMin(s.durationMin)+'</td><td>'+esc(where)+'</td><td>'+esc(s.models.join(', '))+'</td><td>'+s.turns+'</td><td>'+s.calls+'</td><td>'+n2(s.credits)+'</td><td>'+n2(s.creditsPerTurn)+'</td><td>'+s.cacheHitPct+'%</td><td>'+Math.round(s.maxInputTokens/1000)+'K</td><td class="nw">+'+s.linesAdded+' / \\u2212'+s.linesRemoved+'</td><td>'+s.avoidableCacheBreaks+'</td></tr>';
     return open?row+'<tr><td colspan="'+cols.length+'">'+sesDetailHtml(s.sessionId)+'</td></tr>':row;
   }).join('')||'<tr class="empty-row"><td colspan="'+cols.length+'">No sessions match these filters.</td></tr>';

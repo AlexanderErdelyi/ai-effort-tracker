@@ -8,6 +8,7 @@ import { extractUserMessages, parseDebugLog, type DebugUserMessage } from '../ut
 import { parseChatAliases } from '../util/chatAliases';
 import { parseModelPrices, parseToolset } from '../util/modelCatalog';
 import { BranchSwitch, branchAt } from '../util/reflog';
+import { branchNameOf } from '../util/branchKey';
 
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024;
@@ -282,7 +283,7 @@ export class DebugLogUsageTracker implements vscode.Disposable {
             if (!this.bindings.has(key)) {
               // If a branch switch happened between polls (or before this window
               // started), use the git reflog; park the turn when it is unknowable.
-              const unambiguous = branch && branch !== 'HEAD' && turn.timestamp >= this.startedAt &&
+              const unambiguous = branch && branchNameOf(branch) !== 'HEAD' && turn.timestamp >= this.startedAt &&
                 (this.previousBranch === branch || this.previousBranch === undefined) &&
                 turn.timestamp >= this.lastPoll;
               let bound = unambiguous ? branch : undefined;

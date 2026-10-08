@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { blockContext, changedLines, normalizeLine } from './review';
+import { branchLabel, branchMatches } from '../util/branchKey';
 
 /**
  * Knowledge loop, step 1 (#131): capture how AI-written code gets corrected.
@@ -422,7 +423,7 @@ export function listCorrections(data: CorrectionStoreData, args: ListCorrections
   const matches = data.corrections.filter(c =>
     c.t >= since
     && (!args.workItemId || c.workItemId === args.workItemId)
-    && (!args.branch || c.branch === args.branch)
+    && (!args.branch || branchMatches(c.branch, args.branch))
     && (!path || c.path.toLowerCase().replace(/\\/g, '/').includes(path))
     && (!repo || c.repo.toLowerCase().includes(repo))
     && (!args.source || c.source === args.source)
@@ -538,7 +539,7 @@ export function correctionsMarkdown(result: ReturnType<typeof listCorrections>):
     return out.join('\n');
   }
   if (result.corrections.length < result.total) out.push(`Showing the newest ${result.corrections.length}.`, '');
-  const where = (e: CorrectionEpisode) => `${new Date(e.end).toLocaleString()} · branch ${e.branch}${e.workItemId ? ` · work item ${e.workItemId}` : ''}`;
+  const where = (e: CorrectionEpisode) => `${new Date(e.end).toLocaleString()} · branch ${branchLabel(e.branch)}${e.workItemId ? ` · work item ${e.workItemId}` : ''}`;
 
   out.push(`## Your changes to AI code (${human.reduce((n, e) => n + e.correctionIds.length, 0)})`, '');
   if (!human.length) out.push('None yet. These are the most useful ones for learning rules.', '');
@@ -547,7 +548,7 @@ export function correctionsMarkdown(result: ReturnType<typeof listCorrections>):
       const c = byId.get(id);
       if (!c) continue;
       out.push(`### ${c.kind} in ${c.path}:${c.line}`, '');
-      out.push(`- When: ${new Date(c.t).toLocaleString()} · branch ${c.branch}${c.workItemId ? ` · work item ${c.workItemId}` : ''}`);
+      out.push(`- When: ${new Date(c.t).toLocaleString()} · branch ${branchLabel(c.branch)}${c.workItemId ? ` · work item ${c.workItemId}` : ''}`);
       if (c.context) out.push(`- In: ${c.toContext && c.toContext !== c.context ? `${c.context} → ${c.toContext}` : c.context}`);
       out.push(`- AI lines touched: ${c.aiLines} · +${c.added} / -${c.removed}${c.fromLine ? ` · moved from line ${c.fromLine}` : ''}`);
       if (c.origin?.text) out.push(`- Code came from: ${oneLine(c.origin.text)}`);

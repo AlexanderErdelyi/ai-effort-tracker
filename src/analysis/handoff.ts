@@ -1,4 +1,5 @@
 import type { LedgerEntry, UsageData } from '../store/database';
+import { branchNameOf } from '../util/branchKey';
 
 /**
  * Chat handoff (issue #100). Pure builder for a "continue in a new chat" prompt
@@ -118,7 +119,7 @@ export function buildHandoffPrompt(f: HandoffFacts, prompts: { first?: string; l
   if (f.workItemId) {
     lines.push(`- Work item: #${f.workItemId}${f.workItemTitle ? ` ${f.workItemTitle}` : ''}${f.externalRef ? ` (${f.externalRef})` : ''}`);
   }
-  if (f.branch) lines.push(`- Branch: ${f.branch}`);
+  if (f.branch) lines.push(`- Branch: ${branchNameOf(f.branch)}`);
   if (f.files.length) {
     lines.push('- Files changed in that chat:');
     for (const x of f.files) lines.push(`  - ${x.path} (+${x.added}/-${x.removed})`);

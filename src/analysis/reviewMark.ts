@@ -3,6 +3,7 @@ import {
   type MarkStatus, type RepoReview, type ReviewIssuesIo, type ReviewMark, type ReviewStoreData
 } from './review';
 import { ALL_CATEGORIES, type FileCategory } from '../util/categoryRules';
+import { refsInclude } from '../util/branchKey';
 
 export type ReviewMarkStatus = 'reviewed' | 'issue' | 'clear';
 
@@ -107,7 +108,7 @@ export function reviewMark(
       const branch = io.currentBranch(root);
       checkedOut.push({ repo: repoId, root, branch });
       if (repoFilter && !repoId.toLowerCase().includes(repoFilter) && !root.toLowerCase().includes(repoFilter)) continue;
-      if (wanted && !(branch && wanted.includes(branch))) continue;
+      if (wanted && !(branch && refsInclude(wanted, repoId, branch))) continue;
       candidates.push({ repoId, repo, root, branch, seen: branch ? repo.coverage[branch]?.at ?? 0 : 0 });
     }
   }

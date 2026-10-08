@@ -5,6 +5,7 @@ import * as vscode from 'vscode';
 import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity } from '../util/fileTypes';
 import type { FileCategory } from '../util/fileTypes';
+import { branchKey, branchNameOf, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
 import {
   resolveEffectiveRates,
   computeRoiFigures,
@@ -49,7 +50,12 @@ export interface ExtStats {
 }
 
 export interface BranchSummary {
+  /** Store key: `<repoId>::<name>`, or just the name for legacy keys (#154). */
   branch: string;
+  /** Repository of the branch, null for legacy entries tracked before #154. */
+  repoId: string | null;
+  /** Git branch name without the repository. */
+  name: string;
   workItemId: string | null;
   humanCodingMs: number;
   aiGeneratingMs: number;
@@ -589,6 +595,12 @@ interface BranchData {
   effectiveLinesVersion?: number;
   // line changes keyed by ext → source → { added, deleted }
   lineChanges: Record<string, { human: LineStats; ai: LineStats }>;
+  /**
+   * Set on a branch whose data was folded into another branch key (#154). The
+   * record stays as a zeroed tombstone so late deltas from other windows land
+   * here and {@link migrateStore} folds them into `movedTo`.
+   */
+  movedTo?: string;
 }
 
 type Store = Record<string, BranchData>;
@@ -1115,12 +1127,12 @@ export function assignUnmappedBranches(
 ): string[] {
   const adopted: string[] = [];
   for (const [name, data] of Object.entries(branches)) {
-    if (!data || typeof data !== 'object' || data.workItemIdManual) continue;
+    if (!data || typeof data !== 'object' || data.workItemIdManual || data.movedTo) continue;
     const parked = data.workItemId === UNASSIGNED_WORK_ITEM_ID;
     // Only touch orphaned or auto-parked branches; never override a real mapping.
     if (data.workItemId != null && !parked) continue;
 
-    const detected = detect(name);
+    const detected = detect(branchNameOf(name));
     if (parked && (!detected || NON_WORK_ITEM_IDS.has(detected))) continue;
     if (detected && !NON_WORK_ITEM_IDS.has(detected)) {
       if (parked) adopted.push(name);
@@ -1139,7 +1151,7 @@ export function assignUnmappedBranches(
     }
 
     // Detached-HEAD `unknown` (and other reserved buckets) stay standalone.
-    if (RESERVED_BRANCH_BUCKETS.has(name)) continue;
+    if (RESERVED_BRANCH_BUCKETS.has(branchNameOf(name))) continue;
 
     // Everything else that carries effort but has no work item lands in the holding item.
     data.workItemId = UNASSIGNED_WORK_ITEM_ID;
@@ -1181,9 +1193,9 @@ export function autoTitleWorkItems(branches: Store, workItems: Record<string, Wo
   const linked = new Map<string, string[]>();
   for (const [name, data] of Object.entries(branches)) {
     const id = data?.workItemId;
-    if (!id || NON_WORK_ITEM_IDS.has(id)) continue;
+    if (!id || NON_WORK_ITEM_IDS.has(id) || data.movedTo) continue;
     const list = linked.get(id);
-    if (list) list.push(name); else linked.set(id, [name]);
+    if (list) list.push(branchNameOf(name)); else linked.set(id, [branchNameOf(name)]);
   }
   let changed = false;
   for (const wi of Object.values(workItems)) {
@@ -1217,6 +1229,143 @@ export function relinkAdoptedLedger(
     e.projectId = workItems[id]?.projectId ?? null;
   }
 }
+
+/** Branch fields that describe identity, not tracked effort (#154 folds). */
+const FOLD_META = new Set(['workItemId', 'workItemIdManual', 'movedTo', 'effectiveLinesVersion', 'effectiveCategory']);
+const plainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+const numericArray = (v: unknown): v is number[] => Array.isArray(v) && v.every(x => typeof x === 'number');
+
+function foldValue(dst: unknown, src: unknown, key: string): unknown {
+  if (src === undefined || src === null) return dst;
+  if (dst === undefined || dst === null) return JSON.parse(JSON.stringify(src));
+  if (typeof src === 'number' && typeof dst === 'number') return key === 'lastTs' ? Math.max(dst, src) : dst + src;
+  if (numericArray(src) && numericArray(dst)) {
+    return Array.from({ length: Math.max(src.length, dst.length) }, (_, i) => (dst[i] ?? 0) + (src[i] ?? 0));
+  }
+  if (Array.isArray(src) && Array.isArray(dst)) {
+    const all = [...dst, ...JSON.parse(JSON.stringify(src))];
+    return key === 'focusSessions' ? all.sort((a, b) => (a?.ts ?? 0) - (b?.ts ?? 0)).slice(-500) : all;
+  }
+  if (plainObject(src) && plainObject(dst)) {
+    for (const [k, v] of Object.entries(src)) {
+      if (FOLD_META.has(k)) { if (k === 'effectiveCategory' && dst[k] === undefined) dst[k] = v; continue; }
+      dst[k] = foldValue(dst[k], v, k);
+    }
+    return dst;
+  }
+  return dst;
+}
+
+/**
+ * Add every tracked counter of `src` into `dst` (#154): numbers and per-hour
+ * arrays are summed, timestamps take the max, focus sessions are combined. The
+ * work item of `dst` wins unless it is unmapped or only auto-parked.
+ */
+export function foldBranchData(dst: BranchData, src: BranchData): void {
+  foldValue(dst, src, '');
+  dst.effectiveLinesVersion = Math.max(dst.effectiveLinesVersion ?? 0, src.effectiveLinesVersion ?? 0) || undefined;
+  if (dst.effectiveLinesVersion === undefined) delete dst.effectiveLinesVersion;
+  const dstAuto = dst.workItemId == null || (dst.workItemId === UNASSIGNED_WORK_ITEM_ID && !dst.workItemIdManual);
+  if (dstAuto && src.workItemId != null && !(src.workItemId === UNASSIGNED_WORK_ITEM_ID && !src.workItemIdManual)) {
+    dst.workItemId = src.workItemId;
+    if (src.workItemIdManual) dst.workItemIdManual = true;
+  }
+}
+
+function zeroed(value: unknown, key: string): unknown {
+  if (typeof value === 'number') return FOLD_META.has(key) ? value : 0;
+  if (numericArray(value)) return value.map(() => 0);
+  if (Array.isArray(value)) return [];
+  if (plainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = zeroed(v, k);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * A zeroed copy of a folded branch that points at its new key (#154). It keeps
+ * the counter shape so a concurrent window's delta (disk + local - base) still
+ * lands on it instead of being dropped by the merge.
+ */
+export function branchTombstone(src: BranchData, movedTo: string): BranchData {
+  const t = zeroed(src, '') as BranchData;
+  delete t.timeAdjustment;
+  delete t.effectiveLegacyBaseline;
+  delete t.creditsLog;
+  t.movedTo = movedTo;
+  t.time ??= { humanCoding: 0, aiGenerating: 0, reviewing: 0, idle: 0 };
+  t.copilotAcceptances ??= 0;
+  t.lineChanges ??= {};
+  return t;
+}
+
+function hasEffort(value: unknown, key = ''): boolean {
+  if (FOLD_META.has(key)) return false;
+  if (typeof value === 'number') return value !== 0;
+  if (Array.isArray(value)) return numericArray(value) ? value.some(v => v !== 0) : value.length > 0;
+  if (plainObject(value)) return Object.entries(value).some(([k, v]) => hasEffort(v, k));
+  return false;
+}
+
+/** Final key a (possibly chained) tombstone points at, or undefined. */
+export function resolveMovedBranch(branches: Store, key: string): string | undefined {
+  let current = key;
+  for (let hops = 0; hops < 16; hops++) {
+    const next = branches[current]?.movedTo;
+    if (!next) return current === key ? undefined : current;
+    if (next === key) return undefined;
+    current = next;
+  }
+  return undefined;
+}
+
+/**
+ * Fold the data of branch `from` into branch `to` and leave a tombstone (#154,
+ * reused by branch moves/merges). Credit, time-log and reassignment rows follow.
+ * Returns false when nothing was moved.
+ */
+export function moveBranchKey(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>, from: string, to: string): boolean {
+  const src = store.branches[from];
+  if (!src || from === to || src.movedTo) return false;
+  const dst = store.branches[to];
+  if (dst?.movedTo) return false;
+  if (dst) foldBranchData(dst, src);
+  else store.branches[to] = JSON.parse(JSON.stringify({ ...src, movedTo: undefined }));
+  store.branches[from] = branchTombstone(src, to);
+  rewriteMovedBranchRows(store);
+  return true;
+}
+
+/** Fold late deltas from tombstones into their targets and repoint row references (#154). */
+export function foldBranchTombstones(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>): void {
+  for (const [key, data] of Object.entries(store.branches)) {
+    if (!data?.movedTo) continue;
+    const target = resolveMovedBranch(store.branches, key);
+    if (!target) { delete data.movedTo; continue; }
+    if (!hasEffort(data)) continue;
+    foldBranchData(store.branches[target], data);
+    store.branches[key] = branchTombstone(data, data.movedTo);
+  }
+  rewriteMovedBranchRows(store);
+}
+
+function rewriteMovedBranchRows(store: Pick<PersistedStore, 'branches' | 'creditLedger' | 'timeEntries' | 'reassignments'>): void {
+  const target = (b: string | null | undefined) => b && store.branches[b]?.movedTo ? resolveMovedBranch(store.branches, b) : undefined;
+  for (const rows of [store.creditLedger, store.timeEntries, store.reassignments] as { branch?: string | null }[][]) {
+    for (const row of rows ?? []) {
+      const to = target(row.branch);
+      if (to) row.branch = to;
+    }
+  }
+}
+
+/** Keys of real (non-tombstone) branches. */
+export function liveBranchKeys(branches: Store): string[] {
+  return Object.keys(branches).filter(k => !branches[k]?.movedTo);
+}
+
 export function newLedgerId(): string {
   try {
     return crypto.randomUUID();
@@ -1368,6 +1517,8 @@ export function migrateStore(parsed: unknown): PersistedStore {
   const adopted = assignUnmappedBranches(branches, workItems, extractWorkItemId);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
   relinkAdoptedLedger(adopted, branches, workItems, creditLedger);
+  // #154: late deltas on folded branch keys follow the branch they moved to.
+  foldBranchTombstones({ branches, creditLedger, timeEntries, reassignments });
   autoTitleWorkItems(branches, workItems);
   const writer = isEnvelope(parsed) && typeof (parsed as PersistedStore).writer === 'string'
     ? (parsed as PersistedStore).writer : undefined;
@@ -2153,7 +2304,9 @@ export class Database {
     }
   }
 
-  private ensureBranch(branch: string): BranchData {
+  private ensureBranch(key: string): BranchData {
+    // A folded branch key (#154) keeps receiving late writes on its new key.
+    const branch = this.store[key]?.movedTo ? resolveMovedBranch(this.store, key) ?? key : key;
     if (!this.store[branch]) {
       this.store[branch] = {
         workItemId: null,
@@ -3128,6 +3281,42 @@ export class Database {
    * (see {@link reassignBranchToWorkItem}) this is a no-op so the user's choice
    * survives later auto-detection passes (issue #10).
    */
+  /**
+   * Branches tracked before #154 without a repository (except the reserved
+   * `unknown` bucket). They keep working; {@link assignBranchesToRepo} moves
+   * them under a repository.
+   */
+  getLegacyBranches(): string[] {
+    return liveBranchKeys(this.store)
+      .filter(k => repoOfKey(k) === null && !RESERVED_BRANCH_BUCKETS.has(k))
+      .sort();
+  }
+
+  /**
+   * Move legacy branches under a repository (#154): `main` becomes
+   * `<repoId>::main`, folded into it when that key already has data. Credit,
+   * time-log and reassignment rows follow. Returns the number moved.
+   */
+  assignBranchesToRepo(keys: readonly string[], repoId: string): number {
+    if (!repoId) return 0;
+    const store = { branches: this.store, creditLedger: this.creditLedger, timeEntries: this.timeEntries, reassignments: this.reassignments };
+    let moved = 0;
+    for (const key of keys) {
+      if (repoOfKey(key) !== null || RESERVED_BRANCH_BUCKETS.has(key)) continue;
+      if (moveBranchKey(store, key, branchKey(repoId, key))) moved++;
+    }
+    if (moved) {
+      autoTitleWorkItems(this.store, this.workItems);
+      this.save();
+    }
+    return moved;
+  }
+
+  /** Store key for a full key or plain branch name (unique match or `preferRepo`). */
+  resolveBranch(ref: string, preferRepo?: string | null): string | undefined {
+    return resolveBranchRef(ref, liveBranchKeys(this.store), preferRepo);
+  }
+
   setWorkItemForBranch(branch: string, workItemId: string) {
     const data = this.ensureBranch(branch);
     // Never clobber a manual override with auto-detection.
@@ -3422,7 +3611,7 @@ export class Database {
       return { branches: 0, ledger: 0, manualEffort: 0, timeEntries: 0 };
     }
     return {
-      branches: Object.keys(this.store).filter(b => this.store[b].workItemId === id).length,
+      branches: liveBranchKeys(this.store).filter(b => this.store[b].workItemId === id).length,
       ledger: this.creditLedger.filter(e => (e.workItemId ?? null) === id).length,
       manualEffort: this.manualEffort.filter(m => m.workItemId === id).length,
       timeEntries: this.timeEntries.filter(t => (t.workItemId ?? null) === id).length
@@ -3484,7 +3673,7 @@ export class Database {
 
   /** Branch names that currently roll up into the given work item. */
   private getBranchesForWorkItem(workItemId: string): string[] {
-    return Object.keys(this.store)
+    return liveBranchKeys(this.store)
       .filter(b => this.store[b].workItemId === workItemId)
       .sort();
   }
@@ -3973,6 +4162,7 @@ export class Database {
     const billableMs = eff.humanCoding + eff.aiGenerating + eff.reviewing;
     return {
       branch,
+      ...parseBranchKey(branch),
       workItemId: data.workItemId,
       humanCodingMs: eff.humanCoding,
       aiGeneratingMs: eff.aiGenerating,
@@ -4014,7 +4204,7 @@ export class Database {
   }
 
   getAllBranches(): string[] {
-    return Object.keys(this.store).sort();
+    return liveBranchKeys(this.store).sort();
   }
 
   getAllBranchesSummaries(): BranchSummary[] {
@@ -4407,7 +4597,7 @@ export class Database {
   /** Branch names that roll up into a project via its work items (sorted, deduped). */
   private getBranchesForProject(projectId: string): string[] {
     const wiIds = new Set(this.getWorkItemIdsForProject(projectId));
-    return Object.keys(this.store)
+    return liveBranchKeys(this.store)
       .filter(b => {
         const id = this.store[b].workItemId;
         return !!id && wiIds.has(id);

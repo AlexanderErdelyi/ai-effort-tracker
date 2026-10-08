@@ -4,6 +4,7 @@ import * as path from 'path';
 import { Database, normalizeRepoId, extractWorkItemId } from '../store/database';
 import { TimeTracker } from './timeTracker';
 import { BranchSwitch, parseReflog } from '../util/reflog';
+import { branchKey, branchNameOf, pickRepoFolder } from '../util/branchKey';
 
 /** Real net line change of a branch vs its base (issue: churn vs net). */
 export interface NetLineChange {
@@ -44,7 +45,7 @@ export class GitTracker implements vscode.Disposable {
       if (branch !== prev) {
         this.timeTracker.setBranch(branch);
         // Manual mappings remain sticky in the database.
-        const workItemId = GitTracker.extractWorkItemId(branch);
+        const workItemId = GitTracker.extractWorkItemId(branchNameOf(branch));
         if (workItemId) {
           this.db.setWorkItemForBranch(branch, workItemId);
         }
@@ -54,27 +55,62 @@ export class GitTracker implements vscode.Disposable {
     }
   }
 
+  private static lastFolder: string | undefined;
+  private static repoIds = new Map<string, Promise<string>>();
+
+  /**
+   * Workspace folder of the repository being worked on (#154): in a multi-root
+   * workspace the folder of the active editor, so `main` of each repository is
+   * tracked separately.
+   */
+  static activeFolder(): string | undefined {
+    const folders = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
+    const doc = vscode.window.activeTextEditor?.document.uri;
+    const picked = pickRepoFolder(doc?.scheme === 'file' ? doc.fsPath : undefined, folders, GitTracker.lastFolder);
+    if (picked) GitTracker.lastFolder = picked;
+    return picked;
+  }
+
+  /**
+   * Store key of the checked-out branch: `<repoId>::<branch>` (#154). Use
+   * {@link getCurrentBranchName} where git or the user needs the plain name.
+   */
   static async getCurrentBranch(): Promise<string | undefined> {
-    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!wsFolder) return undefined;
+    const folder = GitTracker.activeFolder();
+    if (!folder) return undefined;
+    const name = await GitTracker.branchNameIn(folder);
+    if (!name) return undefined;
+    return branchKey(await GitTracker.repoIdOf(folder), name);
+  }
+
+  /** Plain git name of the checked-out branch (`HEAD` when detached). */
+  static async getCurrentBranchName(): Promise<string | undefined> {
+    const folder = GitTracker.activeFolder();
+    return folder ? GitTracker.branchNameIn(folder) : undefined;
+  }
+
+  private static branchNameIn(folder: string): Promise<string | undefined> {
     return new Promise(resolve => {
-      cp.exec('git rev-parse --abbrev-ref HEAD', { cwd: wsFolder, timeout: 4000, windowsHide: true }, (err, stdout) => {
-        resolve(err ? undefined : stdout.trim());
+      cp.exec('git rev-parse --abbrev-ref HEAD', { cwd: folder, timeout: 4000, windowsHide: true }, (err, stdout) => {
+        resolve(err ? undefined : stdout.trim() || undefined);
       });
     });
   }
 
-  /** HEAD branch switches from the reflog (oldest first); empty when unavailable. */
+  /** HEAD branch switches from the reflog (oldest first) as store keys; empty when unavailable. */
   static async getBranchSwitches(): Promise<BranchSwitch[]> {
-    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const wsFolder = GitTracker.activeFolder();
     if (!wsFolder) return [];
     const out = await GitTracker.exec('git reflog show --date=unix --format=%gd%x09%gs -n 5000 HEAD', wsFolder);
-    return out ? parseReflog(out) : [];
+    if (!out) return [];
+    const repoId = await GitTracker.repoIdOf(wsFolder);
+    const key = (name: string | undefined) => name ? branchKey(repoId, name) : undefined;
+    return parseReflog(out).map(s => ({ ts: s.ts, from: key(s.from), to: key(s.to) }));
   }
 
   /** Recent commits on HEAD as "abc1234 subject", newest first; empty when unavailable. */
   static async getRecentCommits(count = 5): Promise<string[]> {
-    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const wsFolder = GitTracker.activeFolder();
     if (!wsFolder) return [];
     const n = Math.max(1, Math.min(20, Math.round(count)));
     const out = await GitTracker.exec(`git log -n ${n} --format=%h%x20%s`, wsFolder);
@@ -120,7 +156,7 @@ export class GitTracker implements vscode.Disposable {
    * returns `undefined` on any git/fs error so it never blocks the dashboard.
    */
   static async getNetLineChange(): Promise<NetLineChange | undefined> {
-    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const wsFolder = GitTracker.activeFolder();
     if (!wsFolder) return undefined;
     const branch = await GitTracker.getCurrentBranch();
     if (!branch) return undefined;
@@ -187,19 +223,29 @@ export class GitTracker implements vscode.Disposable {
    * {@link Database.getProjectForRepo}. Prefers the git `origin` remote URL
    * (normalized to `host/owner/repo`); when there is no remote (local-only repo)
    * it falls back to the workspace folder path. Returns `undefined` only when
-   * there is no open workspace folder at all.
+   * there is no open workspace folder at all. In a multi-root workspace this is
+   * the repository of the active editor (#154).
    */
   static async getRepoId(): Promise<string | undefined> {
-    const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!wsFolder) return undefined;
-    const remote = await new Promise<string | undefined>(resolve => {
-      cp.exec('git config --get remote.origin.url', { cwd: wsFolder }, (err, stdout) => {
-        const url = err ? '' : stdout.trim();
-        resolve(url || undefined);
+    const wsFolder = GitTracker.activeFolder();
+    return wsFolder ? GitTracker.repoIdOf(wsFolder) : undefined;
+  }
+
+  private static repoIdOf(folder: string): Promise<string> {
+    let id = GitTracker.repoIds.get(folder);
+    if (!id) {
+      id = new Promise<string>(resolve => {
+        cp.exec('git config --get remote.origin.url', { cwd: folder, timeout: 4000, windowsHide: true }, (err, stdout) => {
+          const remote = err ? '' : stdout.trim();
+          // A timed-out lookup must not pin the path fallback for the session.
+          if (err?.killed) GitTracker.repoIds.delete(folder);
+          // Fall back to the workspace folder path when the repo has no origin remote.
+          resolve(normalizeRepoId(remote || path.normalize(folder)));
+        });
       });
-    });
-    // Fall back to the workspace folder path when the repo has no origin remote.
-    return normalizeRepoId(remote ?? path.normalize(wsFolder));
+      GitTracker.repoIds.set(folder, id);
+    }
+    return id;
   }
 
   dispose() {

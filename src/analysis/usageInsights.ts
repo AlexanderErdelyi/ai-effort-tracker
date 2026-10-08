@@ -1,5 +1,6 @@
 import type { LedgerEntry, UsageData } from '../store/database';
 import { listCost, serverOf, type ModelPrice } from '../util/modelCatalog';
+import { branchMatches } from '../util/branchKey';
 
 /**
  * Pure, deterministic usage analysis over the effort store. No I/O, no vscode
@@ -112,7 +113,7 @@ function streamOf(sessionId: string, spanId: string, agent: string, subagent: bo
 function matches(e: LedgerEntry, f: InsightFilter, from: number, to: number): boolean {
   if (!e.debugUsage) return false;
   if (e.ts < from - DAY || e.ts > to) return false;
-  if (f.branch && e.branch !== f.branch) return false;
+  if (f.branch && !branchMatches(e.branch, f.branch)) return false;
   if (f.workItemId && e.workItemId !== f.workItemId) return false;
   if (f.projectId === '__none__' ? !!e.projectId : f.projectId && e.projectId !== f.projectId) return false;
   if (f.sessionId && e.debugUsage.sessionId !== f.sessionId) return false;
