@@ -14,7 +14,7 @@
 | ☕ Idle time | No activity |
 | Lines: Human vs AI | Copilot accepted completions |
 | Estimated AI cost | Accepted lines × model rate |
-| Work item linkage | Branch name pattern (`feature/1234-...`) |
+| Work item linkage | Branch name pattern (`feature/1234-...`, `#1234-...`, `AB#1234_...`). New items take their title from the branch (shown as "from branch") until you rename them (✎ or *Rename Work Item*) |
 
 ## Usage
 

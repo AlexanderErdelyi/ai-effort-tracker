@@ -481,7 +481,8 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
     vscode.commands.registerCommand('aiEffortTracker.createWorkItem', () => createWorkItem()),
-    vscode.commands.registerCommand('aiEffortTracker.editWorkItem', () => editWorkItem()),
+    vscode.commands.registerCommand('aiEffortTracker.editWorkItem', (id?: unknown) => editWorkItem(typeof id === 'string' ? id : undefined)),
+    vscode.commands.registerCommand('aiEffortTracker.renameWorkItem', (id?: unknown) => renameWorkItem(typeof id === 'string' ? id : undefined)),
     vscode.commands.registerCommand('aiEffortTracker.assignWorkItemToProject', (workItemId?: string) => assignWorkItemToProject(workItemId)),
     vscode.commands.registerCommand('aiEffortTracker.weeklyReport', () => generateWeeklyReport(db)),
     vscode.commands.registerCommand('aiEffortTracker.exportCsv', () => exportCsv(db)),
@@ -2605,21 +2606,36 @@ async function createWorkItem() {
  * Edit an existing work item (issue #27): change its title and optionally
  * reassign its project. Excludes the synthetic holding buckets.
  */
-async function editWorkItem() {
-  const wi = await pickWorkItem('Edit which work item?');
+async function editWorkItem(workItemId?: string) {
+  const wi = workItemId || await pickWorkItem('Edit which work item?');
   if (!wi) return;
   const existing = db.getWorkItem(wi);
-  const title = await vscode.window.showInputBox({
-    prompt: `Title for work item #${wi}`,
-    value: existing?.title ?? ''
-  });
-  if (title === undefined) return;
-  db.upsertWorkItem(wi, { title: title.trim() ? title.trim() : null });
+  if (!await promptWorkItemTitle(wi)) return;
 
   const sel = await pickProjectOrNone(`Project for #${wi} (Esc to keep current)`, existing?.projectId ?? null);
   if (sel !== undefined) db.setProjectForWorkItem(wi, sel);
 
   vscode.window.showInformationMessage(`Work item #${wi} updated.`);
+  refreshDashboard();
+}
+
+/** Ask for a work item title; empty lets it be derived from its branch again (#157). */
+async function promptWorkItemTitle(wi: string): Promise<boolean> {
+  const existing = db.getWorkItem(wi);
+  const title = await vscode.window.showInputBox({
+    prompt: `Title for work item #${wi}` + (existing?.titleAuto ? ' (currently taken from its branch name)' : ''),
+    placeHolder: 'Empty = use the branch name when only one branch is linked',
+    value: existing?.title ?? ''
+  });
+  if (title === undefined) return false;
+  db.upsertWorkItem(wi, { title: title.trim() ? title.trim() : null });
+  return true;
+}
+
+/** Rename a work item from the dashboard (#157). */
+async function renameWorkItem(workItemId?: string) {
+  const wi = workItemId || await pickWorkItem('Rename which work item?');
+  if (!wi || !await promptWorkItemTitle(wi)) return;
   refreshDashboard();
 }
 

@@ -1273,7 +1273,7 @@ function renderWorkItemDetail(){
   });
   if(!branchRows.length)branchRows=['<tr class="empty-row"><td colspan="5">No branches roll up into this work item yet.</td></tr>'];
   el.innerHTML='<button class="back" data-action="proj" data-value="'+esc(backTarget)+'">\\u2190 Back</button>'
-    +'<div class="sg"><div class="st"><div class="lbl">Work Item</div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+'</div><div class="t-sm muted">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
+    +'<div class="sg"><div class="st"><div class="lbl">Work Item <button class="dtab" data-action="wiRename" data-id="'+esc(w.workItemId)+'" title="Rename work item" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val" style="font-size:.95em;word-break:break-word">'+esc(w.title||('#'+w.workItemId))+(w.titleAuto?' <span class="badge bp" title="Taken from the branch name \\u2014 rename to set your own title">from branch</span>':'')+'</div><div class="t-sm muted">#'+esc(w.workItemId)+(w.status==='done'?' <span class="badge bh" title="Done'+(w.doneAt?' '+esc(new Date(w.doneAt).toLocaleDateString()):'')+'">\\u2713 done</span>':'')+'</div></div>'
     +'<div class="st tip" title="'+esc(T.estimate)+'"><div class="lbl">Estimate <button class="dtab" data-action="estSet" data-id="'+esc(w.workItemId)+'" title="Edit estimate" style="padding:0 5px;line-height:1.4">\\u270E</button></div><div class="val">'+est+'</div></div>'
     +sc('Actual'+confBadge(WC.time,'Time','ms'),fmt(activeMsOf(w)),'inherit',T.actual)
     +sc('Net ROI / AI gain'+confBadge(WC.roi,'ROI','ms'),fmtMoney(I.netGain,I.currency),moneyColor(I.netGain),T.netGain)+'</div>'
@@ -2248,6 +2248,7 @@ document.addEventListener('click',function(e){
   else if(a==='estSet')vscode.postMessage({type:'cmd',value:'setWorkItemEstimate',arg:t.dataset.id});
   else if(a==='budSet')vscode.postMessage({type:'cmd',value:'setWorkItemBudget',arg:t.dataset.id});
   else if(a==='wiDone')vscode.postMessage({type:'cmd',value:'markWorkItemDone',arg:t.dataset.id});
+  else if(a==='wiRename')vscode.postMessage({type:'cmd',value:'renameWorkItem',arg:t.dataset.id});
   else if(a==='wiReopen')vscode.postMessage({type:'cmd',value:'reopenWorkItem',arg:t.dataset.id});
   else if(a==='wiOpen'){e.preventDefault();selWi=t.dataset.id;projView='workitem';showTab('projects');}
   else if(a==='estRefresh')requestEstimates();

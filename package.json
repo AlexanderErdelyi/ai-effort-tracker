@@ -240,6 +240,10 @@
         "title": "AI Effort Tracker: Edit Work Item"
       },
       {
+        "command": "aiEffortTracker.renameWorkItem",
+        "title": "AI Effort Tracker: Rename Work Item"
+      },
+      {
         "command": "aiEffortTracker.assignWorkItemToProject",
         "title": "AI Effort Tracker: Assign Work Item to Project"
       },

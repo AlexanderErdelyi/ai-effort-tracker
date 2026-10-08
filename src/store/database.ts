@@ -603,6 +603,12 @@ type Store = Record<string, BranchData>;
 export interface WorkItem {
   id: string;
   title: string | null;
+  /**
+   * True while {@link title} was derived from the single linked branch name
+   * (#157). Any manual title edit clears it, and an auto title never replaces
+   * a manual one (also not when concurrent windows merge).
+   */
+  titleAuto?: boolean;
   projectId: string | null;
   estimate: number | null;
   externalRef: string | null;
@@ -772,6 +778,7 @@ export interface PersistedStore {
 export interface WorkItemSummary {
   workItemId: string;
   title: string | null;
+  titleAuto?: boolean;
   projectId: string | null;
   estimate: number | null;
   /** Per-category estimate breakdown, if one was entered (issue #16). */
@@ -1038,11 +1045,11 @@ const NON_WORK_ITEM_IDS = new Set<string>(['unknown', UNASSIGNED_WORK_ITEM_ID]);
  * This is the SAME detection the live tracker applies on branch switch — the
  * tracker's `GitTracker.extractWorkItemId` delegates here so the regex lives in
  * exactly ONE place and migration + live tracking can never drift. Matches
- * `feature/1234-something`, `bugfix/1234`, `1234-auth`, etc. Pure.
+ * `feature/1234-something`, `bugfix/1234`, `1234-auth`, `#1234-fix`,
+ * `feature/#1234-x` and Azure Boards style `AB#1234-x` (#158). Pure.
  */
 export function extractWorkItemId(branch: string): string | undefined {
-  // Matches patterns like: feature/1234-something, bugfix/1234, 1234-something
-  const match = branch.match(/(?:^|[/_-])(\d{3,6})(?:[_-]|$)/);
+  const match = branch.match(/(?:^|[/_#-])(\d{3,6})(?:[_-]|$)/);
   return match?.[1];
 }
 
@@ -1091,7 +1098,11 @@ export function backfillWorkItems(
  *  3. otherwise park it in the {@link UNASSIGNED_WORK_ITEM_ID} holding work item
  *     (created lazily with a clear 'Unassigned' title) so its effort stays visible.
  *
- * Strictly additive and idempotent: it only ever SETS a previously-null
+ * A branch that was auto-PARKED in the holding item (not a manual choice) is
+ * re-detected too, so an improved `detect` (#158: `#1234-…`) later adopts it;
+ * those branch names are returned so their credit rows can follow.
+ *
+ * Strictly additive and idempotent: it only ever SETS a null or auto-parked
  * `workItemId` (and may create a work item), never clears, overwrites or drops
  * any branch field. A branch already mapped — manual or auto — is skipped, so a
  * second run changes nothing. Pure over the passed structures (the `detect`
@@ -1101,14 +1112,18 @@ export function assignUnmappedBranches(
   branches: Store,
   workItems: Record<string, WorkItem>,
   detect: (branch: string) => string | undefined
-): void {
+): string[] {
+  const adopted: string[] = [];
   for (const [name, data] of Object.entries(branches)) {
-    if (!data || typeof data !== 'object') continue;
-    // Only touch orphaned branches; never override an existing (manual OR auto) mapping.
-    if (data.workItemId != null || data.workItemIdManual) continue;
+    if (!data || typeof data !== 'object' || data.workItemIdManual) continue;
+    const parked = data.workItemId === UNASSIGNED_WORK_ITEM_ID;
+    // Only touch orphaned or auto-parked branches; never override a real mapping.
+    if (data.workItemId != null && !parked) continue;
 
     const detected = detect(name);
+    if (parked && (!detected || NON_WORK_ITEM_IDS.has(detected))) continue;
     if (detected && !NON_WORK_ITEM_IDS.has(detected)) {
+      if (parked) adopted.push(name);
       data.workItemId = detected;
       if (!workItems[detected]) {
         workItems[detected] = {
@@ -1138,6 +1153,68 @@ export function assignUnmappedBranches(
         createdAt: Date.now()
       };
     }
+  }
+  return adopted;
+}
+
+/**
+ * Readable work item title from a branch name (#157): drops the path prefix
+ * (`feature/`, `users/x/`) and the id token (`#2134`, `AB#2134`, `2134`), then
+ * turns dashes/underscores into spaces. Undefined when nothing is left.
+ */
+export function deriveWorkItemTitle(branch: string, id: string): string | undefined {
+  const leaf = branch.slice(branch.lastIndexOf('/') + 1);
+  const title = leaf
+    .replace(new RegExp(`(^|[_-])(?:AB)?#?${id}(?=[_-]|$)`, 'i'), '$1')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return title || undefined;
+}
+
+/**
+ * Give untitled (or still auto-titled) work items the name of their ONLY
+ * linked branch (#157). Items with several branches keep what they have, and
+ * a manual title is never touched. Returns whether anything changed.
+ */
+export function autoTitleWorkItems(branches: Store, workItems: Record<string, WorkItem>): boolean {
+  const linked = new Map<string, string[]>();
+  for (const [name, data] of Object.entries(branches)) {
+    const id = data?.workItemId;
+    if (!id || NON_WORK_ITEM_IDS.has(id)) continue;
+    const list = linked.get(id);
+    if (list) list.push(name); else linked.set(id, [name]);
+  }
+  let changed = false;
+  for (const wi of Object.values(workItems)) {
+    if (NON_WORK_ITEM_IDS.has(wi.id) || (wi.title != null && !wi.titleAuto)) continue;
+    const names = linked.get(wi.id);
+    if (names?.length !== 1) continue;
+    const title = deriveWorkItemTitle(names[0], wi.id);
+    if (!title || (title === wi.title && wi.titleAuto)) continue;
+    wi.title = title;
+    wi.titleAuto = true;
+    changed = true;
+  }
+  return changed;
+}
+
+/** Credit rows of branches adopted out of the holding item follow the branch (#158). */
+export function relinkAdoptedLedger(
+  adopted: string[],
+  branches: Store,
+  workItems: Record<string, WorkItem>,
+  ledger: LedgerEntry[]
+): void {
+  if (!adopted.length) return;
+  const set = new Set(adopted);
+  for (const e of ledger) {
+    if (!e.branch || !set.has(e.branch)) continue;
+    if (e.workItemId && e.workItemId !== UNASSIGNED_WORK_ITEM_ID) continue;
+    const id = branches[e.branch]?.workItemId;
+    if (!id) continue;
+    e.workItemId = id;
+    e.projectId = workItems[id]?.projectId ?? null;
   }
 }
 export function newLedgerId(): string {
@@ -1288,8 +1365,10 @@ export function migrateStore(parsed: unknown): PersistedStore {
   sanitizeBranchTimeAdjustments(branches);
   // #12: adopt or park orphaned (null-mapped) branches BEFORE folding credits so
   // their legacy credit log is attributed to the resolved/holding work item.
-  assignUnmappedBranches(branches, workItems, extractWorkItemId);
+  const adopted = assignUnmappedBranches(branches, workItems, extractWorkItemId);
   foldCreditsLogIntoLedger(branches, workItems, creditLedger);
+  relinkAdoptedLedger(adopted, branches, workItems, creditLedger);
+  autoTitleWorkItems(branches, workItems);
   const writer = isEnvelope(parsed) && typeof (parsed as PersistedStore).writer === 'string'
     ? (parsed as PersistedStore).writer : undefined;
   return {
@@ -3068,6 +3147,7 @@ export class Database {
         }
       }
     }
+    autoTitleWorkItems(this.store, this.workItems);
     this.save();
   }
 
@@ -3136,6 +3216,7 @@ export class Database {
       this.reassignments.push(rec);
       records.push(rec);
     }
+    autoTitleWorkItems(this.store, this.workItems);
     this.save();
     return records;
   }
@@ -3212,7 +3293,12 @@ export class Database {
     fields: Partial<Omit<WorkItem, 'id' | 'createdAt'>> = {}
   ): WorkItem {
     const wi = this.ensureWorkItem(id);
-    if (fields.title !== undefined) wi.title = fields.title;
+    if (fields.title !== undefined) {
+      wi.title = fields.title;
+      // A title typed by the user is sticky; an empty one may be derived again.
+      if (fields.titleAuto) wi.titleAuto = true; else delete wi.titleAuto;
+      if (wi.title == null) autoTitleWorkItems(this.store, { [id]: wi });
+    }
     if (fields.projectId !== undefined) wi.projectId = fields.projectId;
     if (fields.estimate !== undefined) wi.estimate = fields.estimate;
     if (fields.externalRef !== undefined) wi.externalRef = fields.externalRef;
@@ -3446,6 +3532,7 @@ export class Database {
     return {
       workItemId: wi.id,
       title: wi.title ?? null,
+      ...(wi.titleAuto ? { titleAuto: true } : {}),
       projectId: wi.projectId ?? null,
       // `estimate` is the canonical TOTAL: sum of the breakdown when present,
       // otherwise the scalar (issue #16).
