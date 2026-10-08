@@ -35,6 +35,7 @@
 | `AI Effort Tracker: Link Current Repo to Project` | Adds the open repository to a project; a project can have several (see [Repositories](#repositories)) |
 | `AI Effort Tracker: Unlink Repository from Project` | Removes a repository from a project after confirmation. Tracked data is kept |
 | `AI Effort Tracker: Assign Older Branches to a Repository` | Moves branches tracked before per-repository tracking under a repository (see [Branches per repository](#branches-per-repository)) |
+| `AI Effort Tracker: Assign a Branch to a Repository` | Assigns one older branch without a repository to a repository; asks first when that repository already has the branch, and can be undone |
 | `AI Effort Tracker: Move Entries to Another Branch` | Moves time, lines and credits of a time range (or chosen ledger rows) from one branch to another, e.g. work done on `main` before the feature branch existed (see [Moving entries between branches](#moving-entries-between-branches)) |
 | `AI Effort Tracker: Undo Entry Move` | Moves the entries of an earlier move back, or splits a merged branch out again |
 | `AI Effort Tracker: Merge Branch Into Another…` | Merges all data of a duplicate branch (e.g. same name, different case) into another branch (see [Merging duplicate branches](#merging-duplicate-branches)) |
@@ -158,6 +159,16 @@ lets you choose branches and the repository at any time. If the repository
 already has that branch, the totals are added together. Credit, time-log and
 reassignment rows move along, and nothing is merged automatically.
 
+To assign a single branch, use **📦 Repo…** on its row under "Unknown
+repository" in the Repositories overview, **📦 Assign to a repository…** on its
+detail page, or **AI Effort Tracker: Assign a Branch to a Repository**. The
+picker lists the current repository first, then every tracked or
+project-linked repository, and marks those that already track a branch with
+that name. If one does, you confirm before the data is added to it. A single
+assignment is listed under **Entry moves** and can be undone with **↺ Undo**.
+Only branches without a repository can be assigned this way; to combine two
+repository branches, use **Merge** (see below).
+
 ### Moving entries between branches
 
 Work often starts on `main` (a call, a new user story, the spec) before the
@@ -209,7 +220,8 @@ repository with its projects, branch count, active time, lines, credits and
 cost; the totals are the sum of its branches. Click a row to see its branches,
 and click a branch for its details. **Filter** narrows every tab to that
 repository, and **🔗 Project** links it to a project. The "Unknown repository"
-row holds older branches and offers **Assign to a repository…**.
+row holds older branches and offers **Assign to a repository…** for all of them,
+or **📦 Repo…** on a single branch row.
 
 A project can have several repositories. The project page lists each linked
 repository with its totals, plus repositories where the project's branches ran

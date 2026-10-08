@@ -104,6 +104,10 @@
         "title": "AI Effort Tracker: Assign Older Branches to a Repository"
       },
       {
+        "command": "aiEffortTracker.assignBranchToRepo",
+        "title": "AI Effort Tracker: Assign a Branch to a Repository"
+      },
+      {
         "command": "aiEffortTracker.moveEntries",
         "title": "AI Effort Tracker: Move Entries to Another Branch"
       },

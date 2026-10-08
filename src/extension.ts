@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { TimeTracker } from './trackers/timeTracker';
 import { GitTracker } from './trackers/gitTracker';
-import { branchLabel, branchNameOf, LEGACY_REPO, repoLabel, repoOfKey } from './util/branchKey';
+import { branchKey, branchLabel, branchNameOf, LEGACY_REPO, repoLabel, repoOfKey } from './util/branchKey';
 import { buildRepoOverview } from './analysis/repoOverview';
 import { CopilotTracker } from './trackers/copilotTracker';
 import { ChatUsageTracker } from './trackers/chatUsageTracker';
@@ -369,6 +369,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('aiEffortTracker.assignLegacyBranches', () =>
       assignLegacyBranches()
     ),
+    // #164: assign one branch without a repository to a repository.
+    vscode.commands.registerCommand('aiEffortTracker.assignBranchToRepo', (arg?: string | { branch?: string; repoId?: string }) =>
+      assignBranchToRepoCmd(arg)
+    ),
     // #156: move entries tracked on one branch (e.g. main) to another branch.
     vscode.commands.registerCommand('aiEffortTracker.moveEntries', (arg?: string | { branch?: string; ledgerIds?: string[] }) =>
       moveEntriesCmd(arg)
@@ -647,7 +651,7 @@ async function assignLegacyBranches(): Promise<void> {
     return;
   }
   const current = await GitTracker.getRepoId();
-  const repos = [...new Set([current, ...db.getAllBranches().map(repoOfKey)].filter((r): r is string => !!r))];
+  const repos = knownRepos(current);
   if (!repos.length) {
     vscode.window.showWarningMessage('AI Effort Tracker: open a folder in a git repository first.');
     return;
@@ -672,6 +676,81 @@ async function assignLegacyBranches(): Promise<void> {
   const moved = db.assignBranchesToRepo(branches.map(b => b.key), repoId);
   vscode.window.showInformationMessage(`AI Effort Tracker: ${moved} branch(es) assigned to ${repoLabel(repoId)}.`);
   refreshDashboard();
+}
+
+/** Repositories to offer as targets: the current one first, then tracked and project-linked ones. */
+function knownRepos(current: string | null | undefined): string[] {
+  const all = [current, ...db.getAllBranches().map(repoOfKey), ...db.getAllProjects().flatMap(p => p.repos)];
+  return [...new Set(all.filter((r): r is string => !!r && r !== LEGACY_REPO))];
+}
+
+/**
+ * #164: assign one branch without a repository to a repository. `arg` is the
+ * branch key (dashboard row) or `{ branch, repoId }`. When the repository
+ * already tracks that branch name, its data is added to it after a confirm.
+ * Either way it runs as a merge, so it can be undone.
+ */
+async function assignBranchToRepoCmd(arg?: string | { branch?: string; repoId?: string }): Promise<void> {
+  const payload = typeof arg === 'object' && arg ? arg : typeof arg === 'string' && arg ? { branch: arg } : {};
+  const legacy = db.getLegacyBranches();
+  if (payload.branch && repoOfKey(payload.branch) !== null) {
+    vscode.window.showWarningMessage(`AI Effort Tracker: "${branchLabel(payload.branch)}" already belongs to a repository. Use "Merge Branches" to combine it with another branch.`);
+    return;
+  }
+  let key = payload.branch && legacy.includes(payload.branch) ? payload.branch : undefined;
+  if (!key) {
+    if (!legacy.length) {
+      vscode.window.showInformationMessage('AI Effort Tracker: every tracked branch already belongs to a repository.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(legacy.map(k => {
+      const wi = db.getWorkItemForBranch(k);
+      return { label: k, description: wi ? '#' + wi : 'no work item', key: k };
+    }), { placeHolder: 'Which branch without a repository?' });
+    if (!picked) return;
+    key = picked.key;
+  }
+  const current = await GitTracker.getRepoId();
+  const repos = knownRepos(current);
+  let repoId = payload.repoId && repos.includes(payload.repoId) ? payload.repoId : undefined;
+  if (!repoId) {
+    if (!repos.length) {
+      vscode.window.showWarningMessage('AI Effort Tracker: open a folder in a git repository first.');
+      return;
+    }
+    const name = key;
+    const picked = await vscode.window.showQuickPick(repos.map(r => {
+      const has = db.getAllBranches().includes(branchKey(r, name));
+      return {
+        label: repoLabel(r),
+        description: (r === current ? 'current \u00b7 ' : '') + r,
+        detail: has ? `already tracks "${name}" \u2014 the data is added to it` : undefined,
+        repoId: r
+      };
+    }), { placeHolder: `Repository "${name}" belongs to`, matchOnDescription: true });
+    if (!picked) return;
+    repoId = picked.repoId;
+  }
+  const plan = db.previewAssignBranchToRepo(key, repoId);
+  if (!plan) {
+    vscode.window.showWarningMessage(`AI Effort Tracker: "${key}" cannot be assigned to ${repoLabel(repoId)}.`);
+    return;
+  }
+  if (plan.exists) {
+    const ok = await vscode.window.showWarningMessage(
+      `${repoLabel(repoId)} already has a branch "${key}". Add the older data to it?`,
+      {
+        modal: true,
+        detail: `Moves ${moveSummary(plan.stats)} into "${branchLabel(plan.target)}" and removes the older "${key}" from the branch list.\n\nYou can undo this.`
+      },
+      'Add to it'
+    );
+    if (ok !== 'Add to it') return;
+  }
+  const rec = db.assignBranchToRepo(key, repoId);
+  refreshDashboard();
+  if (setupDeps) void updateSetupContext(setupDeps);
+  if (rec) await offerMoveUndo(rec.id, `Assigned "${key}" to ${repoLabel(repoId)} (${moveSummary(plan.stats)}).`);
 }
 
 function moveSummary(s: EntryMoveStats): string {

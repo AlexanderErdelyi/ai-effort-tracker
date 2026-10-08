@@ -7,7 +7,7 @@ import type { TrackingMode } from '../trackers/timeTracker';
 import { ALL_CATEGORIES, categorize, categorizeExt, countsTowardProductivity, getFileExt } from '../util/fileTypes';
 import { distribute, findChurnOutliers, type ChurnOutlier } from '../analysis/lineChurn';
 import type { FileCategory } from '../util/fileTypes';
-import { branchKey, branchNameOf, caseVariantBranchGroups, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
+import { LEGACY_REPO, branchKey, branchNameOf, caseVariantBranchGroups, parseBranchKey, repoOfKey, resolveBranchRef } from '../util/branchKey';
 import {
   resolveEffectiveRates,
   computeRoiFigures,
@@ -1458,6 +1458,8 @@ export interface BranchMergePayload {
   source: { workItemId: string | null; manual: boolean };
   /** Work item of the target before the merge (it may adopt the source's). */
   target: { workItemId: string | null; manual: boolean };
+  /** The merge created the target (#164); undo removes it again when it stays empty. */
+  createdTarget?: boolean;
 }
 
 const ACTIVE_MODES = ['humanCoding', 'aiGenerating', 'reviewing'] as const;
@@ -1979,6 +1981,8 @@ export function sanitizeReassignments(input: unknown): ReassignmentRecord[] {
       if (plainObject(m.timeAdjustment)) rec.merge.timeAdjustment = m.timeAdjustment;
       if (plainObject(m.effectiveLegacyBaseline)) rec.merge.effectiveLegacyBaseline = m.effectiveLegacyBaseline;
       if (Array.isArray(m.creditsLog)) rec.merge.creditsLog = m.creditsLog;
+      if (Array.isArray(m.lineCleanups)) rec.merge.lineCleanups = m.lineCleanups.filter((x: unknown): x is string => typeof x === 'string');
+      if (m.createdTarget === true) rec.merge.createdTarget = true;
     }
     out.push(rec);
   }
@@ -3658,6 +3662,32 @@ export class Database {
     return moved;
   }
 
+  /**
+   * Where {@link assignBranchToRepo} would put legacy branch `key` (#164):
+   * the target key, whether it already has data there, and what moves.
+   * Undefined for repository branches, reserved buckets or unknown keys.
+   */
+  previewAssignBranchToRepo(key: string, repoId: string): { target: string; exists: boolean; stats: EntryMoveStats } | undefined {
+    if (!repoId || repoId === LEGACY_REPO || repoOfKey(repoId) !== null || repoOfKey(key) !== null || RESERVED_BRANCH_BUCKETS.has(key)) return undefined;
+    const target = branchKey(repoId, key);
+    const stats = this.previewBranchMerge(key, target);
+    if (!stats) return undefined;
+    const live = this.liveKey(target);
+    return { target: live, exists: !!this.store[live], stats };
+  }
+
+  /**
+   * Assign one legacy branch to a repository (#164): `main` becomes
+   * `<repoId>::main`, added to that branch when it already has data. Runs as a
+   * branch merge, so {@link undoEntryMove} reverses it. Only branches without a
+   * repository qualify: a repository branch keeps receiving data, and moving
+   * it would redirect that future activity too.
+   */
+  assignBranchToRepo(key: string, repoId: string, note?: string): ReassignmentRecord | undefined {
+    const plan = this.previewAssignBranchToRepo(key, repoId);
+    return plan ? this.mergeBranches(key, plan.target, note) : undefined;
+  }
+
   /** Store key for a full key or plain branch name (unique match or `preferRepo`). */
   resolveBranch(ref: string, preferRepo?: string | null): string | undefined {
     return resolveBranchRef(ref, liveBranchKeys(this.store), preferRepo);
@@ -3891,11 +3921,13 @@ export class Database {
     const plan = this.planEntryMove(from, to, { fromTs: 0 });
     if (!plan) return undefined;
     const src = plan.src;
+    const createdTarget = !this.store[plan.to];
     const target = this.ensureBranch(plan.to);
     const merge: BranchMergePayload = {
       source: { workItemId: src.workItemId ?? null, manual: !!src.workItemIdManual },
       target: { workItemId: target.workItemId ?? null, manual: !!target.workItemIdManual }
     };
+    if (createdTarget) merge.createdTarget = true;
     const parked = (wi: string | null | undefined, manual?: boolean) => wi == null || (wi === UNASSIGNED_WORK_ITEM_ID && !manual);
     if (parked(target.workItemId, target.workItemIdManual) && !parked(src.workItemId, src.workItemIdManual)) {
       target.workItemId = src.workItemId;
@@ -4015,6 +4047,11 @@ export class Database {
       undoOf: id
     };
     this.reassignments.push(undo);
+    // A branch the merge created (#164) goes away again when nothing else landed on it.
+    if (m?.createdTarget && !hasEffort(target)
+      && !this.creditLedger.some(e => e.branch === to) && !this.timeEntries.some(e => e.branch === to)) {
+      delete this.store[to];
+    }
     autoTitleWorkItems(this.store, this.workItems);
     this.save();
     return undo;
