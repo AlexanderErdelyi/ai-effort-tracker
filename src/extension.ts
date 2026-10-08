@@ -16,7 +16,7 @@ import { LessonStore } from './store/lessonStore';
 import { createRule, GENERATED_MARKER, lessonGroups, updateRule, writeLessonExport, rulesForRepo, type LessonRule, type RulePatch, type RuleStatus } from './analysis/lessons';
 import { correctionsMarkdown, listCorrections } from './analysis/corrections';
 import { correctionRateReport, correctionTrackingSince, type CorrectionRateReport } from './analysis/correctionRate';
-import { acceptSuggestionsDelta, correctionsView, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta } from './analysis/correctionLabels';
+import { acceptSuggestionsDelta, CORRECTION_RULES_SNAPSHOT_FILE, correctionsView, DEFAULT_KEYWORD_RULES, DEFAULT_LESSON_CATEGORIES, labelDelta } from './analysis/correctionLabels';
 import { Database } from './store/database';
 import {
   BACKUP_FORMAT, BACKUP_VERSION, buildBundle, DATA_SETS, dataSet, listCheckpoints, listSafetyCopies, parseBackup,
@@ -541,7 +541,10 @@ export function activate(context: vscode.ExtensionContext) {
     chatUsageTracker.start(context);
   }
   context.subscriptions.push(debugLogUsageTracker, creditImportTracker);
-  budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath, () => ({ [HEALTH_SNAPSHOT_FILE]: { report: healthReport() } }));
+  budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath, () => ({
+    [HEALTH_SNAPSHOT_FILE]: { report: healthReport() },
+    [CORRECTION_RULES_SNAPSHOT_FILE]: { rules: correctionKeywordRules() }
+  }));
   context.subscriptions.push(budgetMonitor);
   context.subscriptions.push(new AwayController(db, timeTracker, context.globalStorageUri.fsPath));
   try {
@@ -634,7 +637,7 @@ async function openDashboard(db: Database, tracker: TimeTracker, context: vscode
             category: typeof m.category === 'string' ? m.category : '',
             ...(typeof m.scope === 'string' ? { scope: m.scope } : {}),
             ...(typeof m.note === 'string' ? { note: m.note } : {})
-          }, 'user'));
+          }, 'user', Date.now(), correctionKeywordRules()));
         } else if (m.type === 'acceptCorrectionSuggestions') {
           correctionStore?.apply(acceptSuggestionsDelta(correctionsPayload()));
         }
@@ -2671,16 +2674,21 @@ function withRework<T extends { workItemId: string }>(list: T[]): (T & { rework?
   });
 }
 
+/** Keyword rules for label suggestions (setting, or the defaults). */
+function correctionKeywordRules(): unknown {
+  const rules = vscode.workspace.getConfiguration('aiEffortTracker.corrections').get<unknown>('keywordRules');
+  return Array.isArray(rules) ? rules : DEFAULT_KEYWORD_RULES;
+}
+
 /** Corrections tab (#132): captured corrections with labels and suggestions, plus rules (#133). */
 function correctionsPayload() {
   const cfg = vscode.workspace.getConfiguration('aiEffortTracker.corrections');
   const categories = cfg.get<string[]>('categories');
-  const rules = cfg.get<unknown>('keywordRules');
   const data = correctionStore?.load() ?? { version: 1 as const, owned: {}, corrections: [] };
   const view = correctionsView(
     data,
     Array.isArray(categories) && categories.length ? categories : DEFAULT_LESSON_CATEGORIES,
-    Array.isArray(rules) ? rules : DEFAULT_KEYWORD_RULES
+    correctionKeywordRules()
   );
   const lcfg = vscode.workspace.getConfiguration('aiEffortTracker.lessons');
   const lessonRules = lessonStore?.load().rules ?? [];

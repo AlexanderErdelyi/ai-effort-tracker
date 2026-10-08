@@ -197,6 +197,7 @@ test('MCP list_corrections reads the store next to the effort store', () => {
     const result = callTool('list_corrections', { kind: 'move', source: 'bogus' }, {});
     assert.equal(result.total, 1);
     assert.equal(result.corrections[0].id, 'a');
+    assert.equal(result.corrections[0].suggestion.category, 'ordering/structure', 'unlabelled corrections carry a suggestion');
     assert.equal(result.owned, undefined);
     assert.equal(callTool('list_corrections', { kind: 'insert' }, {}).total, 0);
   } finally {
@@ -257,6 +258,100 @@ test('suggestions guess the category from the change or the prompt', () => {
   assert.equal(ai('the customer also wants an email field'), 'requirement change');
   assert.equal(L.suggestLabel(corr({ source: 'ai', trigger: { t: 1, sessionId: 's', text: 'yes 20 is right' }, before: ['field(13; X)'], after: ['field(20; X)'] }), rules).category, 'wrong fact', 'the change decides when no keyword matches');
   assert.equal(L.compileKeywordRules([{ pattern: '(', category: 'x' }, { pattern: 'ok', category: '' }, null, { pattern: 'ok', category: 'Naming' }]).length, 1);
+});
+
+test('more change heuristics for your own edits (#151)', () => {
+  const rules = L.compileKeywordRules(L.DEFAULT_KEYWORD_RULES);
+  const h = over => L.suggestLabel(corr(over), rules);
+  assert.equal(h({ before: ['Message(TEXT);'], after: ['message(Text);'] }).category, 'style', 'letter case');
+  assert.equal(h({ path: 'src/a.ts', ext: 'ts', before: ["const a = 'x'"], after: ['const a = "x";'] }).category, 'style', 'quotes and semicolons');
+  const reorder = h({ before: ['    DoA(Customer);', '    DoB(Vendor);'], after: ['    DoB(Vendor);', '    DoA(Customer);'] });
+  assert.equal(reorder.category, 'ordering/structure');
+  const renamed = h({ before: ['x := Calc(cust);', 'Show(cust);'], after: ['x := Calc(Customer);', 'Show(Customer);'] });
+  assert.equal(renamed.category, 'naming');
+  assert.match(renamed.reason, /cust.*Customer/);
+  assert.equal(h({ before: ['if a then'], after: ['IF a THEN'] }).category, 'style', 'keyword case is style, not a rename');
+  assert.equal(h({ path: 'test/Sales.Test.al', before: ['a := 1;'], after: ['b := Calc(a);'] }).category, 'tests');
+  assert.equal(h({ path: 'specs/feature/plan.md', ext: 'md', before: ['a b c'], after: ['a b d e'] }).category, 'documentation', 'specs/ holds documents, not tests');
+  assert.equal(h({ kind: 'insert', before: [], after: ['if not Customer.Get(No) then', "    Error('Customer %1 not found', No);"] }).category, 'error handling');
+  assert.equal(h({ path: 'docs/readme.md', ext: 'md', before: ['old text here'], after: ['new words there'] }).category, 'documentation');
+  const ai = over => L.suggestLabel(corr({ source: 'ai', trigger: { t: 1, sessionId: 's', text: 'go on' }, ...over }), rules);
+  assert.equal(ai({ path: 'test/x.al', before: ['a := 1;'], after: ['b := Calc(a);'] }).source, 'default', 'AI rework keeps the default: its prompt says why');
+  assert.equal(ai({ before: ['exit(7);'], after: ['exit(9);'] }).category, 'wrong fact', 'plain checks still apply to AI rework');
+});
+
+test('code moved between two corrections is ordering/structure (#151)', () => {
+  const block = ['    Total := Total + Line.Amount;', '    Count := Count + 1;'];
+  const list = [
+    corr({ id: 'del', kind: 'delete', line: 40, before: block, after: [], added: 0, removed: 2 }),
+    corr({ id: 'ins', kind: 'insert', t: 1500, line: 10, before: [], after: block, added: 2, removed: 0 }),
+    corr({ id: 'same', kind: 'modify', t: 1600, line: 41, before: block, after: ['x'], path: 'src/b.al' }),
+    corr({ id: 'again', kind: 'modify', t: 1700, line: 42, before: ['x'], after: block, path: 'src/b.al' })
+  ];
+  const moves = L.crossMoves(list);
+  assert.ok(moves.has('del') && moves.has('ins'));
+  assert.ok(!moves.has('same') && !moves.has('again'), 'rewriting the same spot is not a move');
+  const s = L.suggestLabel(list[0], L.compileKeywordRules(L.DEFAULT_KEYWORD_RULES), { moves });
+  assert.equal(s.category, 'ordering/structure');
+});
+
+test('suggestions follow your earlier labels of similar corrections (#149)', () => {
+  const trigger = { t: 1, sessionId: 's', text: 'mark the open points as answered' };
+  const labelled = [1, 2, 3].map(n => corr({ id: 'l' + n, source: 'ai', path: 'specs/plan.md', ext: 'md', trigger, before: ['- [ ] point ' + n], after: ['- [x] point ' + n], category: 'progress update', scope: '**/*.md', labeledBy: 'user', note: 'Status only' }));
+  const fresh = corr({ id: 'u', source: 'ai', path: 'specs/plan.md', ext: 'md', trigger, before: ['- [ ] point 4'], after: ['- [x] point 4'] });
+  const other = corr({ id: 'o', source: 'ai', path: 'src/x.al', trigger: { t: 9, sessionId: 'z', text: 'rename the procedure' }, before: ['procedure A()'], after: ['procedure B()'] });
+  const suggest = L.createSuggester([...labelled, fresh, other], L.DEFAULT_KEYWORD_RULES);
+  const s = suggest(fresh);
+  assert.equal(s.source, 'history');
+  assert.equal(s.category, 'progress update');
+  assert.equal(s.scope, '**/*.md');
+  assert.equal(s.note, 'Status only');
+  assert.match(s.reason, /3 corrections/);
+  assert.notEqual(suggest(other).source, 'history', 'a different prompt on other code does not copy the label');
+  const bulk = labelled.map(c => ({ ...c, labeledBy: 'rule' }));
+  assert.notEqual(L.createSuggester([...bulk, fresh], L.DEFAULT_KEYWORD_RULES)(fresh).source, 'history', 'bulk-accepted labels are not history');
+});
+
+test('labelling records the suggestion and accuracy is measured per source (#150)', () => {
+  const now = Date.now();
+  const data = { version: 1, owned: {}, corrections: [
+    corr({ id: 'n', t: now, before: ['exit(7);'], after: ['exit(9);'] }),
+    corr({ id: 'k', t: now, source: 'ai', trigger: { t: 1, sessionId: 's', text: 'update the status' } })
+  ] };
+  let next = C.mergeCorrectionDelta(data, L.labelDelta(data, ['n'], { category: 'wrong fact' }, 'user', now), now);
+  next = C.mergeCorrectionDelta(next, L.labelDelta(next, ['k'], { category: 'requirement change' }, 'copilot', now), now);
+  assert.deepEqual(next.corrections.find(c => c.id === 'n').suggested, { category: 'wrong fact', source: 'heuristic' });
+  assert.equal(next.corrections.find(c => c.id === 'k').suggested.source, 'keyword');
+  assert.ok(next.corrections.find(c => c.id === 'k').suggested.rule);
+  const relabel = C.mergeCorrectionDelta(next, L.labelDelta(next, ['n'], { category: 'style' }, 'user', now), now);
+  assert.equal(relabel.corrections.find(c => c.id === 'n').suggested.category, 'wrong fact', 'relabelling keeps the first suggestion');
+  const cleared = C.mergeCorrectionDelta(next, L.labelDelta(next, ['n'], { category: '' }, 'user', now), now);
+  assert.equal(cleared.corrections.find(c => c.id === 'n').suggested, undefined);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aet-corr-suggested-'));
+  try {
+    const store = new CorrectionStore(dir);
+    store.apply({ owned: {}, add: next.corrections, patch: {} });
+    assert.deepEqual(new CorrectionStore(dir).load().corrections.find(c => c.id === 'n').suggested, { category: 'wrong fact', source: 'heuristic' });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const rule = '\\b(status)\\b';
+  const judged = (id, category, source, by = 'user', extra = {}) => corr({ id, category, labeledBy: by, suggested: { category: source === 'keyword' ? 'progress update' : 'wrong fact', source, ...extra } });
+  const acc = L.suggestionAccuracy([
+    judged('1', 'wrong fact', 'heuristic'),
+    judged('2', 'style', 'heuristic'),
+    judged('3', 'logic bug', 'keyword', 'user', { rule }),
+    judged('4', 'logic bug', 'keyword', 'copilot', { rule }),
+    judged('5', 'progress update', 'keyword', 'user', { rule }),
+    judged('6', 'wrong fact', 'heuristic', 'rule'),
+    corr({ id: '7', category: 'style', labeledBy: 'user' })
+  ]);
+  assert.equal(acc.judged, 5);
+  assert.equal(acc.accepted, 2);
+  assert.equal(acc.bulk, 1);
+  assert.deepEqual(acc.bySource.map(x => [x.source, x.judged, x.accepted]), [['keyword', 3, 1], ['heuristic', 2, 1]]);
+  assert.deepEqual(acc.overriddenRules, [{ rule, category: 'progress update', judged: 3, overridden: 2, usually: 'logic bug' }]);
+  assert.equal(L.suggestionAccuracy([]).rate, null);
 });
 
 test('scope suggestions follow the AL object type or file extension', () => {

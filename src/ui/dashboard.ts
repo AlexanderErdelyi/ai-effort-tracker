@@ -1816,7 +1816,9 @@ function corrDiff(i){
   return body?'<div style="font-family:var(--vscode-editor-font-family);font-size:.85em;background:var(--vscode-textCodeBlock-background);padding:6px 8px;border-radius:4px;overflow:auto;max-height:260px;margin-top:6px">'+body+'</div>':'';
 }
 function corrItem(i){
-  var sug=!i.category&&i.suggestion?'<div class="mt1 t-md">\\uD83D\\uDCA1 Suggestion: <strong>'+esc(i.suggestion.category)+'</strong> <span class="muted">('+esc(i.suggestion.reason)+')</span> <button class="btn-sm dtab" data-action="corrAccept" data-id="'+esc(i.id)+'" data-cat="'+esc(i.suggestion.category)+'">Accept</button></div>':'';
+  var sg=i.suggestion,sug=!i.category&&sg?'<div class="mt1 t-md">\\uD83D\\uDCA1 Suggestion: <strong>'+esc(sg.category)+'</strong> <span class="muted">('+esc(sg.reason)+')</span>'
+    +(sg.note?' <span class="muted">\\u2014 note: \\u201c'+esc(sg.note)+'\\u201d</span>':'')
+    +' <button class="btn-sm dtab" data-action="corrAccept" data-id="'+esc(i.id)+'" data-cat="'+esc(sg.category)+'"'+(sg.note?' data-note="'+esc(sg.note)+'"':'')+'>Accept</button></div>':'';
   var by=i.labeledBy&&i.labeledBy!=='user'?' <span class="t-sm muted">by '+esc(i.labeledBy)+'</span>':'';
   return'<div class="corr-row" style="border-top:1px solid var(--border);padding:8px 0">'
     +'<div class="hbar">'
@@ -1856,6 +1858,7 @@ function renderCorrections(){
   var cat=CORR.byCategory.length?'<div class="mb3 card"><h3>By category</h3><table class="w100"><thead><tr><th>Category</th><th>Corrections</th><th>Yours</th><th>Episodes</th><th>Scopes</th></tr></thead><tbody>'
     +CORR.byCategory.map(function(g){return'<tr><td>'+corrCatBadge(g.category)+'</td><td>'+g.count+'</td><td>'+g.human+'</td><td>'+g.episodes+'</td><td class="t-md">'+esc(g.scopes.join(', '))+'</td></tr>';}).join('')+'</tbody></table></div>':'';
   var list=CORR.episodes.filter(corrVisible),shown=list.slice(0,corrLimit);
+  var acc=corrAccuracy(CORR.accuracy);
   var eps=shown.map(function(e){
     var open=!!corrOpen[e.id],when=new Date(e.start).toLocaleString();
     var who=e.source==='human'?'<span class="badge bd">You</span>':'<span class="badge bh">AI</span>';
@@ -1878,7 +1881,19 @@ function renderCorrections(){
   var more=list.length>shown.length?'<button class="dtab" data-action="corrMore">Show more ('+(list.length-shown.length)+')</button>':'';
   var empty=!list.length?(s.total?(corrFilter==='todo'?emptyState('\\u2705 Everything here is labelled'):emptyState('Nothing matches this filter','Pick another filter or widen the filter bar.')):emptyState('No corrections captured yet','They appear when you or Copilot change code an AI edit wrote earlier.')):'';
   el.innerHTML=ctl+'<p class="mb3 t-md muted">Say what was wrong with AI-written code and which files the lesson applies to. Lessons you label here become the input for coding rules for Copilot. Copilot can label them too through the <strong>label_correction</strong> MCP tool.</p>'
-    +kpi+cat+eps+more+empty;
+    +kpi+cat+acc+eps+more+empty;
+}
+// #150: how often label suggestions were right.
+function corrAccuracy(a){
+  if(!a||!a.judged)return'';
+  var names={history:'Like earlier labels',keyword:'Prompt keywords',heuristic:'What changed',default:'Default for AI rework'};
+  var pct=function(x){return Math.round(x*100)+'%';};
+  return'<div class="mb3 card"><h3>Suggestion accuracy</h3><p class="t-md">Suggestions were right <strong>'+pct(a.rate)+'</strong> of the time ('+a.accepted+' of '+a.judged+' labelled after a suggestion).'
+    +(a.bulk?' <span class="muted">'+a.bulk+' accepted in bulk are not counted.</span>':'')+'</p>'
+    +'<table class="w100"><thead><tr><th>Suggested from</th><th>Labelled</th><th>Right</th></tr></thead><tbody>'
+    +a.bySource.map(function(x){return'<tr><td>'+esc(names[x.source]||x.source)+'</td><td>'+x.judged+'</td><td>'+pct(x.rate)+'</td></tr>';}).join('')+'</tbody></table>'
+    +(a.overriddenRules.length?'<div class="mt1 t-md">\\u26A0 Keyword rules you usually change: '+a.overriddenRules.map(function(r){return'<code>'+esc(r.rule)+'</code> suggests \\u201c'+esc(r.category)+'\\u201d, you picked \\u201c'+esc(r.usually)+'\\u201d '+r.overridden+' of '+r.judged+' times';}).join('; ')
+      +'. Change them in the setting <code>aiEffortTracker.corrections.keywordRules</code>.</div>':'')+'</div>';
 }
 var ruleOpen={},ruleDelArm={},ruleShowClosed=false,ruleShowOther=false;
 function ruleSend(m){m.type='lessonRule';corrLoading=true;vscode.postMessage(m);}
@@ -2250,7 +2265,7 @@ document.addEventListener('click',function(e){
   else if(a==='corrSrc'){corrSrc=v;corrLimit=40;renderCorrections();}
   else if(a==='corrMore'){corrLimit+=40;renderCorrections();}
   else if(a==='corrToggle'){var cid=t.dataset.id;if(corrOpen[cid])delete corrOpen[cid];else corrOpen[cid]=true;renderCorrections();}
-  else if(a==='corrAccept'){var crow=t.closest('.corr-row'),sci=crow?crow.querySelector('.corr-scope'):null;corrLabel([t.dataset.id],t.dataset.cat,sci?sci.value:undefined);}
+  else if(a==='corrAccept'){var crow=t.closest('.corr-row'),sci=crow?crow.querySelector('.corr-scope'):null;corrLabel([t.dataset.id],t.dataset.cat,sci?sci.value:undefined,t.dataset.note||undefined);}
   else if(a==='corrAcceptEp'){var cep=corrEpisode(t.dataset.ep);if(cep)corrLabel(cep.items.filter(function(i){return!i.category;}).map(function(i){return i.id;}),t.dataset.cat);}
   else if(a==='corrAcceptAll'){corrLoading=true;vscode.postMessage({type:'acceptCorrectionSuggestions'});}
   else if(a==='handoff'){e.stopPropagation();vscode.postMessage({type:'cmd',value:'newChatWithHandoff',arg:t.dataset.id});}
