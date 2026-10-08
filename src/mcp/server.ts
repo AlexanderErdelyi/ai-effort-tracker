@@ -6,6 +6,7 @@ import {
   listSessions, optimizationFindings, sessionDetail, usageOverview, workItemUsage, type InsightFilter
 } from '../analysis/usageInsights';
 import { promptExcerpts, SessionTitleResolver, storageRoots } from '../util/sessionTitles';
+import { usageComparison, usageTrend } from '../analysis/usageTrends';
 import { BUDGET_SNAPSHOT_FILE } from '../analysis/budget';
 import { HEALTH_SNAPSHOT_FILE } from '../analysis/dataHealth';
 import { CATEGORY_RULES_SNAPSHOT_FILE, defaultClassifier, modelEfficiency, toolProfile } from '../analysis/efficiency';
@@ -114,6 +115,12 @@ export const TOOLS = [
     name: 'optimization_findings',
     title: 'Copilot optimization findings',
     description: 'Ranked, evidence-backed recommendations to reduce credit usage: model switches, prompt-cache expiry, unused/duplicate MCP tools, tool_search rounds, failing tools, expensive models on light turns, long chats, reasoning effort, subagents. Credits at stake are estimates.',
+    inputSchema: { type: 'object', properties: filterProps, additionalProperties: false }
+  },
+  {
+    name: 'usage_trends',
+    title: 'Copilot usage trends (getting better or worse?)',
+    description: 'Compares the period with the equally long period before it: credits/turn, cache hit %, avoidable cache cost (absolute and % of credits), premium-model share and volume, each with delta and a better/worse verdict; findings that are new, resolved, better or worse; plus a daily (≤31 days) or weekly trend series. Use it to answer "am I getting better?".',
     inputSchema: { type: 'object', properties: filterProps, additionalProperties: false }
   },
   {
@@ -498,7 +505,15 @@ export function listWorkItems(data: UsageData, filter: InsightFilter, snapshot =
 
 export function callTool(name: string, args: Json, data = loadData()): unknown {
   switch (name) {
-    case 'usage_overview': return usageOverview(data, parseFilter(args));
+    case 'usage_overview': {
+      const filter = parseFilter(args), now = Date.now();
+      const { metrics, hasPrevious, partial, previousPeriod, note } = usageComparison(data, filter, now, { withFindings: false });
+      return { ...usageOverview(data, filter, now), comparison: { previousPeriod, hasPrevious, partial, metrics, note } };
+    }
+    case 'usage_trends': {
+      const filter = parseFilter(args), now = Date.now();
+      return { comparison: usageComparison(data, filter, now), trend: usageTrend(data, filter, now) };
+    }
     case 'optimization_findings': {
       const findings = optimizationFindings(data, parseFilter(args));
       return findings.length ? { findings } : { findings, note: 'No optimization opportunities detected in this period, or no debug-log usage was captured yet.' };

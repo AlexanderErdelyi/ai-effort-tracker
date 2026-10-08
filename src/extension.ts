@@ -54,6 +54,7 @@ import { suggestEstimate, adjustForBias, toEstimationItem, estimateAccuracy, isF
 import { NudgeController } from './ui/nudgeController';
 import { ReviewController } from './ui/reviewController';
 import { listSessions, optimizationFindings, usageOverview, type InsightFilter } from './analysis/usageInsights';
+import { usageComparison, usageTrend } from './analysis/usageTrends';
 
 let timeTracker: TimeTracker;
 let gitTracker: GitTracker;
@@ -3360,9 +3361,14 @@ function optimizePayload(days: unknown, workItemId: unknown, projectId?: unknown
       ...(typeof repoId === 'string' && repoId ? { repoId } : {})
     };
     const data = db.getUsageData();
+    const now = Date.now();
+    const findings = optimizationFindings(data, filter, now);
+    const allTime = fromMs === undefined && (filter.days ?? 30) >= 3650;
     return {
-      overview: usageOverview(data, filter),
-      findings: optimizationFindings(data, filter),
+      overview: usageOverview(data, filter, now),
+      findings,
+      comparison: allTime ? null : usageComparison(data, filter, now, { findings }),
+      trend: usageTrend(data, filter, now),
       sessions: listSessions(data, filter, 15),
       efficiency: modelEfficiency(data, filter, defaultClassifier(readUserRules())),
       toolProfile: toolProfile(data, filter)

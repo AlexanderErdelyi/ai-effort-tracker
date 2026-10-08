@@ -411,7 +411,16 @@ debug-log usage to show where credits go and how to use fewer of them:
   duplicate MCP servers, `tool_search` rounds and failing tools;
 - ranked findings with an estimated number of credits at stake, e.g. read-only or
   question turns that ran on a premium model, chats that grew past 100K tokens,
-  mostly high reasoning effort.
+  mostly high reasoning effort;
+- **am I getting better?** every stat card shows the change against the equally
+  long period directly before (▲/▼, green = better, red = worse, grey = volume or
+  no real change, "–" when nothing was recorded before). Efficiency metrics are
+  judged: credits per turn, avoidable cache cost (absolute and % of credits) and
+  premium model share should go down, cache hit should go up. Findings are marked
+  *new*, *better*, *worse* or *same*, and findings that disappeared are listed as
+  resolved. A **trend chart** (per day up to 31 days, per week beyond) follows the
+  date filter (7d / 30d / 90d / custom). "Premium" = models priced above the
+  median of the model catalog.
 
 Savings are **estimates**: the recorded charge is scaled by Copilot's list prices
 (captured from `models.json`) for the alternative, so discounts that applied are
@@ -430,8 +439,9 @@ or *"Analyse my usage for work item 1987"*. All tools are read-only except
 
 | Tool | Returns |
 |------|---------|
-| `usage_overview` | Totals by model/agent/effort, cache misses by cause, tool sources |
+| `usage_overview` | Totals by model/agent/effort, cache misses by cause, tool sources, plus a `comparison` with the previous period |
 | `optimization_findings` | Ranked recommendations with evidence and credits at stake |
+| `usage_trends` | Better or worse? Efficiency metrics vs. the previous period (deltas + verdicts), findings new/resolved, and a per-day/per-week trend |
 | `list_work_items` | Credits per work item plus budget status (used %, projection, warning/over), to choose a scope |
 | `list_sessions` | Recent chat sessions with models, context size, avoidable cache misses; `includeTitles` adds chat titles |
 | `session_detail` | Per-turn breakdown of one chat; `includePrompts` adds short prompt excerpts |
