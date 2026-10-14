@@ -2400,6 +2400,10 @@ export function decodeEffortStore(raw: string): PersistedStore {
   return migrateStore(parsed);
 }
 
+const SAVE_DEBOUNCE_MS = 2000;
+const TIME_SAVE_MS = 15_000;
+const IDLE_TIME_SAVE_MS = 60_000;
+
 export class Database {
   private filePath: string;
   private baseline: PersistedStore;
@@ -2447,15 +2451,37 @@ export class Database {
     this.modelPrices = loaded.modelPrices;
     // Idle windows still need current totals for their next dashboard render.
     // Dirty windows use their normal save, which also rebases from disk.
+    // A cheap stat decides; the store is only re-read when another window wrote (#171).
     this.refreshTimer = setInterval(() => {
-      if (!this.dirty && fs.existsSync(this.filePath)) void this.flushAsync(true);
+      if ((!this.dirty || this.onlySlowChangesPending()) && this.diskChangedByOthers()) void this.flushAsync(true);
     }, 2000);
     this.refreshTimer.unref();
   }
 
-  /** Build the on-disk envelope from the in-memory state. */
-  private serialize(): string {
-    const envelope: PersistedStore = {
+  /** Identity of the main file as last read or written by this window (#171). */
+  private diskSig: string | undefined;
+
+  private statSig(): string | undefined {
+    try {
+      const s = fs.statSync(this.filePath, { bigint: true });
+      return `${s.mtimeNs}:${s.size}:${s.ino}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  }
+
+  /** The main file exists and is not the one this window adopted last. */
+  private diskChangedByOthers(): boolean {
+    try {
+      const sig = this.statSig();
+      return sig !== undefined && sig !== this.diskSig;
+    } catch { return true; }
+  }
+
+  /** The in-memory state as an on-disk envelope (not copied; mergeStores only reads it). */
+  private envelope(): PersistedStore {
+    return {
       schemaVersion: this.schemaVersion,
       branches: this.store,
       workItems: this.workItems,
@@ -2468,7 +2494,6 @@ export class Database {
       modelPrices: this.modelPrices,
       writer: STORE_WRITER
     };
-    return JSON.stringify(envelope, null, 2);
   }
 
   private decode(raw: string): PersistedStore {
@@ -2529,6 +2554,7 @@ export class Database {
       atomicWrite(this.filePath, data);
       syncDirectory(path.dirname(this.filePath));
       this.adopt(data);
+      this.diskSig = this.statSig();
     });
   }
 
@@ -2544,6 +2570,7 @@ export class Database {
         atomicWrite(this.filePath, serialized);
         syncDirectory(path.dirname(this.filePath));
       }
+      this.diskSig = this.statSig();
       return loaded.value;
     });
   }
@@ -2569,18 +2596,32 @@ export class Database {
     return loaded;
   }
 
-  /** Editor events only mark dirty. The bounded commit runs once per 2s batch. */
-  private save() {
+  /**
+   * Editor events only mark dirty. The bounded commit runs once per 2s batch.
+   * Plain time accrual (every 1s tick, in every window) waits longer: committing
+   * a multi-MB store every 2s from each open window made VS Code sluggish (#171).
+   */
+  private save(delayMs = SAVE_DEBOUNCE_MS) {
     this.dirty = true;
-    this.scheduleSave();
+    this.scheduleSave(delayMs);
   }
 
-  private scheduleSave() {
-    if (this.saveTimer) return;
+  private saveDueAt = 0;
+
+  private scheduleSave(delayMs = SAVE_DEBOUNCE_MS) {
+    const due = Date.now() + delayMs;
+    if (this.saveTimer && this.saveDueAt <= due) return;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveDueAt = due;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = undefined;
       void this.flushAsync();
-    }, 2000);
+    }, delayMs);
+  }
+
+  /** Only slow (time accrual) changes are pending, so other windows' saves may be adopted now. */
+  private onlySlowChangesPending(): boolean {
+    return !!this.saveTimer && this.saveDueAt - Date.now() > SAVE_DEBOUNCE_MS;
   }
 
   private async flushAsync(refresh = false): Promise<void> {
@@ -2646,9 +2687,16 @@ export class Database {
    */
   private commit(waitMs: number): void {
     withStoreLock(this.filePath, waitMs, () => {
-      const latest = this.readLatest();
+      const sig = this.statSig();
+      const unchanged = sig !== undefined && sig === this.diskSig;
+      // Nothing to write and nobody else wrote: a refresh would only re-adopt our own state.
+      if (unchanged && !this.dirty) return;
+      // Our baseline IS the file's content; only the raw bytes are needed for the .bak copy.
+      const latest = unchanged
+        ? { value: this.baseline, raw: fs.readFileSync(this.filePath, 'utf8') }
+        : this.readLatest();
       const legacy = isLegacyOverwrite(this.baseline, latest.value);
-      const merged = migrateStore(mergeStores(this.baseline, JSON.parse(this.serialize()), latest.value));
+      const merged = migrateStore(mergeStores(this.baseline, this.envelope(), latest.value));
       merged.writer = STORE_WRITER;
       const data = JSON.stringify(merged, null, 2);
       if (latest.raw !== data) {
@@ -2657,6 +2705,7 @@ export class Database {
       }
       if (legacy) this.reportLegacyWriter();
       this.adopt(data);
+      this.diskSig = this.statSig();
       syncDirectory(path.dirname(this.filePath));
     });
   }
@@ -2726,7 +2775,7 @@ export class Database {
       const hbm = bucket.hoursByMode![mode];
       if (hbm) hbm[hour] = (hbm[hour] ?? 0) + durationMs;
     }
-    this.save();
+    this.save(mode === 'idle' ? IDLE_TIME_SAVE_MS : TIME_SAVE_MS);
   }
 
   /** Records a completed uninterrupted focus session. */

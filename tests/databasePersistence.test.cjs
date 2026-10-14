@@ -342,6 +342,46 @@ test('idle windows refresh shared totals automatically, and shutdown stops their
   assert.equal(observer.refreshTimer, undefined);
 });
 
+test('idle refresh skips all store work while the file is unchanged, and still sees other writers (#171)', async t => {
+  const { open, file, read } = fixture(t);
+  const seed = open();
+  seed.recordTime('branch', 'humanCoding', 100); seed.flushSync();
+  const observer = open();
+  let reads = 0;
+  const readLatest = observer.readLatest.bind(observer);
+  observer.readLatest = () => { reads++; return readLatest(); };
+  const readFile = fs.readFileSync;
+  let mainReads = 0;
+  fs.readFileSync = (p, ...rest) => { if (p === file) mainReads++; return readFile(p, ...rest); };
+  try {
+    await observer.flush();
+    await observer.flush();
+    assert.equal(reads, 0, 'unchanged store is not decoded again');
+    assert.equal(mainReads, 0, 'unchanged store is not even read');
+    assert.equal(observer.diskChangedByOthers(), false);
+  } finally { fs.readFileSync = readFile; }
+  const writer = open();
+  writer.recordTime('branch', 'humanCoding', 200); writer.flushSync();
+  assert.equal(observer.diskChangedByOthers(), true);
+  await observer.flush();
+  assert.equal(reads, 1);
+  assert.equal(observer.getRawTime('branch').humanCoding, 300);
+  // A dirty save on an unchanged file reuses the baseline but still backs up the previous bytes.
+  const before = fs.readFileSync(file, 'utf8');
+  observer.recordTime('branch', 'humanCoding', 50);
+  observer.flushSync();
+  assert.equal(reads, 1, 'own previous write is not re-decoded');
+  assert.equal(read().branches.branch.time.humanCoding, 350);
+  assert.equal(fs.readFileSync(file + '.bak', 'utf8'), before);
+  // An external writer that bypasses the lock (e.g. a restore tool) is still detected.
+  const edited = read();
+  edited.branches.branch.time.humanCoding = 1000;
+  fs.writeFileSync(file, JSON.stringify(edited));
+  observer.recordTime('branch', 'humanCoding', 1);
+  observer.flushSync();
+  assert.equal(read().branches.branch.time.humanCoding, 1001);
+});
+
 test('public fire-and-forget checkpoint handles failures without rejecting and schedules retry', async t => {
   const { open, file, read } = fixture(t);
   const db = open();

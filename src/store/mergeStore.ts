@@ -62,7 +62,7 @@ function merge(base: any, local: any, disk: any, keys: string[] = []): any {
       remaining.splice(index, 1);
       return false;
     });
-    const retained = [...current];
+    const retained = current.map(copy);
     for (const removed of remaining) {
       const index = retained.findIndex(v => isDeepStrictEqual(v, removed));
       if (index >= 0) retained.splice(index, 1);
@@ -126,17 +126,20 @@ function normalizeDebug(entry: LedgerEntry): void {
   entry.model = [...new Set(usage.requests.map(r => r.model))].join(' + ') || 'unknown';
 }
 
-/** Align semantically identical captures before the keyed-array merge. */
+/**
+ * Align semantically identical captures before the keyed-array merge. Copy on
+ * write: only re-keyed rows are cloned, the callers' ledgers stay untouched.
+ */
 function alignCredits(base: PersistedStore, local: PersistedStore, disk: PersistedStore): void {
   const ids = new Map<string, string>();
   for (const store of [disk, base, local]) {
-    for (const entry of store.creditLedger) {
+    store.creditLedger = store.creditLedger.map(entry => {
       const identity = usageIdentity(entry);
-      if (!identity) continue;
+      if (!identity) return entry;
       const id = ids.get(identity);
-      if (id) entry.id = id;
-      else ids.set(identity, entry.id);
-    }
+      if (!id) { ids.set(identity, entry.id); return entry; }
+      return id === entry.id ? entry : { ...entry, id };
+    });
   }
 }
 
@@ -196,8 +199,11 @@ function heal(base: any, disk: any, keys: string[]): any {
 }
 
 export function mergeStores(baseline: PersistedStore, snapshot: PersistedStore, latest: PersistedStore): PersistedStore {
-  const base = copy(baseline), local = copy(snapshot);
-  const disk = isLegacyOverwrite(baseline, latest) ? healLegacyOverwrite(base, copy(latest)) : copy(latest);
+  // merge() never mutates its inputs and copies every value it returns, and
+  // alignCredits copies on write, so shallow envelopes suffice. Whole-store deep
+  // copies made each save of a multi-MB store needlessly expensive (#171).
+  const base = { ...baseline }, local = { ...snapshot };
+  const disk = isLegacyOverwrite(baseline, latest) ? healLegacyOverwrite(base, copy(latest)) : { ...latest };
   alignCredits(base, local, disk);
   const result: PersistedStore = merge(base, local, disk);
   const diskCredits = new Map(disk.creditLedger.map(e => [e.id, e]));
