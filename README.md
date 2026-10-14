@@ -352,6 +352,16 @@ extension-host restart is isolated from previous requests.
   decides which branch was checked out at the turn's start; if that is unknowable
   (detached HEAD, a switch within two seconds, no reflog), the turn is parked under
   `unknown` rather than silently assigned to the wrong work item.
+- `aiEffortTracker.captureAgentHost` (default on) captures **VS Code Agent Host
+  chats** (VS Code 1.141+, Copilot CLI sessions), which write no debug logs. Each
+  finished turn's recorded charge (`agentSessionData/<id>/session.db`) is split into
+  the main agent and subagent models; timing and tool calls come from the session's
+  `~/.copilot/session-state/<id>/events.jsonl`. A window records only sessions whose
+  working folder is inside one of its workspace folders (or the same repository,
+  e.g. an agent worktree). The branch is the one checked out at the turn's start
+  (git reflog). It runs alongside the other sources and is logged in
+  **AI Effort Tracker — Agent Host Usage**. Older VS Code chats are still captured
+  from debug logs.
 - Turns from the last **7 days** that are missing from the store (window reloaded
   mid-chat, crash, or data dropped by an older window) are recovered on start and
   attributed the same way via the reflog. Each recovery is logged in

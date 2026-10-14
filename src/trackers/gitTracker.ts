@@ -103,7 +103,19 @@ export class GitTracker implements vscode.Disposable {
     return folder ? GitTracker.branchNameIn(folder) : undefined;
   }
 
-  private static branchNameIn(folder: string): Promise<string | undefined> {
+  /** Repository identity of any folder (same rules as {@link getRepoId}). */
+  static repoIdFor(folder: string): Promise<string> {
+    return GitTracker.repoIdOf(folder);
+  }
+
+  /** HEAD branch switches of any folder's repository (oldest first), with plain names. */
+  static async branchSwitchesIn(folder: string): Promise<{ ts: number; from?: string; to?: string }[]> {
+    const out = await GitTracker.exec('git reflog show --date=unix --format=%gd%x09%gs -n 5000 HEAD', folder);
+    return out ? parseReflog(out) : [];
+  }
+
+  /** Plain git name of the branch checked out in any folder (`HEAD` when detached). */
+  static branchNameIn(folder: string): Promise<string | undefined> {
     return new Promise(resolve => {
       cp.exec('git rev-parse --abbrev-ref HEAD', { cwd: folder, timeout: 4000, windowsHide: true }, (err, stdout) => {
         resolve(err ? undefined : stdout.trim() || undefined);

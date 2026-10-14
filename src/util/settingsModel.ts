@@ -41,6 +41,7 @@ const GROUP_RULES: [string, SettingGroup][] = [
   ['credits.', 'Credits & budget'],
   ['budget.', 'Credits & budget'],
   ['captureDebugLogs', 'Credits & budget'],
+  ['captureAgentHost', 'Credits & budget'],
   ['autoCapturePollSeconds', 'Credits & budget'],
   ['autoCaptureCredits', 'Credits & budget'],
   ['autoCaptureRealCredits', 'Credits & budget'],

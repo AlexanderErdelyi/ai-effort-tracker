@@ -1,12 +1,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { StringDecoder } from 'string_decoder';
+import { agentSessionRoot, readAgentSessionTitle } from './agentHost';
 
 /**
  * Chat-session titles for the session list (issue #95). Read on demand from
  * VS Code's own local files and kept in memory only — never persisted:
  *  1. the chat title VS Code shows (chatSessions/<id>.jsonl `customTitle`),
- *  2. else the first user prompt from Copilot's debug log.
+ *  2. else the Agent Host session title (agentSessionData/<id>/session.db, #172),
+ *  3. else the first user prompt from Copilot's debug log.
  * No vscode dependency: shared by the extension and the stdio MCP server.
  */
 
@@ -16,7 +18,7 @@ const HEAD_BYTES = 8 * 1024 * 1024;
 const INDEX_TTL_MS = 60_000;
 const SAFE_ID = /^[\w.-]{1,128}$/;
 
-export interface SessionFiles { chat?: string; log?: string }
+export interface SessionFiles { chat?: string; log?: string; agent?: string }
 
 const flat = (s: string) => s.replace(/\s+/g, ' ').trim();
 const clip = (s: string, max: number) => s.length > max ? s.slice(0, max).trimEnd() + '…' : s;
@@ -140,6 +142,11 @@ export class SessionTitleResolver {
         }
       }
       chatDir(path.join(path.dirname(root), 'globalStorage', 'emptyWindowChatSessions'));
+      const agents = agentSessionRoot(path.dirname(root));
+      for (const id of list(agents)) {
+        const file = path.join(agents, id, 'session.db');
+        if (SAFE_ID.test(id) && fs.existsSync(file)) newest(id, 'agent', file);
+      }
     }
     this.index = index;
     this.indexedAt = Date.now();
@@ -160,10 +167,12 @@ export class SessionTitleResolver {
 
   title(sessionId: string): string | undefined {
     const f = this.files(sessionId);
-    const stamp = [f.chat, f.log].map(p => p ? `${p}:${mtime(p)}` : '').join('|');
+    const stamp = [f.chat, f.log, f.agent, f.agent && `${f.agent}-wal`].map(p => p ? `${p}:${mtime(p)}` : '').join('|');
     const hit = this.titles.get(sessionId);
     if (hit && hit.stamp === stamp) return hit.title ?? undefined;
-    const title = (f.chat && readChatTitle(f.chat, this.maxChars)) || (f.log && readFirstPrompt(f.log, this.maxChars)) || null;
+    const agent = f.agent ? flat(readAgentSessionTitle(f.agent) ?? '') : '';
+    const title = (f.chat && readChatTitle(f.chat, this.maxChars)) || (agent && clip(agent, this.maxChars)) ||
+      (f.log && readFirstPrompt(f.log, this.maxChars)) || null;
     this.titles.set(sessionId, { stamp, title });
     return title ?? undefined;
   }

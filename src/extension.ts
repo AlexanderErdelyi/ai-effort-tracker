@@ -12,6 +12,7 @@ import { ChatUsageTracker } from './trackers/chatUsageTracker';
 import { ChatSessionUsageTracker } from './trackers/chatSessionUsageTracker';
 import { CreditImportTracker } from './trackers/creditImportTracker';
 import { DebugLogUsageTracker } from './trackers/debugLogUsageTracker';
+import { AgentHostUsageTracker } from './trackers/agentHostUsageTracker';
 import { CorrectionTracker } from './trackers/correctionTracker';
 import { CorrectionStore } from './store/correctionStore';
 import { LessonStore } from './store/lessonStore';
@@ -63,6 +64,7 @@ let chatUsageTracker: ChatUsageTracker;
 let chatSessionUsageTracker: ChatSessionUsageTracker;
 let creditImportTracker: CreditImportTracker;
 let debugLogUsageTracker: DebugLogUsageTracker;
+let agentHostUsageTracker: AgentHostUsageTracker;
 let db: Database;
 let setupDeps: SetupDeps | undefined;
 let statusBar: StatusBarManager;
@@ -187,6 +189,10 @@ export function activate(context: vscode.ExtensionContext) {
   debugLogUsageTracker = new DebugLogUsageTracker(db, context.storageUri, () => {
     refreshDashboard();
     nudgeController?.onUsage(debugLogUsageTracker?.lastChangedSessions ?? []);
+  });
+  agentHostUsageTracker = new AgentHostUsageTracker(db, context.globalStorageUri, () => {
+    refreshDashboard();
+    nudgeController?.onUsage(agentHostUsageTracker?.lastChangedSessions ?? []);
   });
 
   context.subscriptions.push(
@@ -569,7 +575,9 @@ export function activate(context: vscode.ExtensionContext) {
   } else {
     chatUsageTracker.start(context);
   }
-  context.subscriptions.push(debugLogUsageTracker, creditImportTracker);
+  // VS Code 1.141+ Agent Host chats write none of the sources above (#172).
+  agentHostUsageTracker.start();
+  context.subscriptions.push(debugLogUsageTracker, agentHostUsageTracker, creditImportTracker);
   budgetMonitor = new BudgetMonitor(db, context.globalStorageUri.fsPath, () => ({
     [HEALTH_SNAPSHOT_FILE]: { report: healthReport() },
     [CORRECTION_RULES_SNAPSHOT_FILE]: { rules: correctionKeywordRules() }
@@ -589,6 +597,7 @@ export function activate(context: vscode.ExtensionContext) {
     const correctionTracker = new CorrectionTracker(db, corrections, () => DebugLogUsageTracker.enabled());
     copilotTracker.setEditListener(edit => correctionTracker.onEdit(edit));
     debugLogUsageTracker.onUserMessages = msgs => correctionTracker.onUserMessages(msgs);
+    agentHostUsageTracker.onUserMessages = msgs => correctionTracker.onUserMessages(msgs);
     context.subscriptions.push(correctionTracker);
   } catch (error) {
     console.error('AI Effort Tracker: correction capture failed to start', error);

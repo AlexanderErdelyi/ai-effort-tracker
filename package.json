@@ -788,6 +788,11 @@
           "default": true,
           "description": "Read recorded per-model-call AI credit charges and successful edit details from this workspace's Copilot debug-logs. Disables competing live estimators and automatic export-folder imports to prevent duplicate charges. Existing unsynced history is not auto-attributed: use Import Copilot Debug Session to choose its branch. Missing charges remain unknown, not estimated. Reload the window after changing."
         },
+        "aiEffortTracker.captureAgentHost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture recorded AI credits, tokens, tool calls and file edits of VS Code Agent Host chats (VS Code 1.141+, Copilot CLI sessions), which write no debug logs. Only sessions whose working folder belongs to this window's workspace are recorded. Runs alongside the other capture sources. Reload the window after changing."
+        },
         "aiEffortTracker.autoCapturePollSeconds": {
           "type": "number",
           "default": 15,
